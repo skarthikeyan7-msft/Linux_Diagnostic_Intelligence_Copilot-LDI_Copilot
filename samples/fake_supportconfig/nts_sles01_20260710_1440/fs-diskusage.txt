@@ -1,0 +1,5 @@
+#==[ Command ]======================================#
+# /bin/df
+Filesystem     1K-blocks      Used Available Use% Mounted on
+/dev/sda2       62914560  18874368  44040192   30% /
+/dev/sda3       20971520  19923712   1047808   96% /var/log

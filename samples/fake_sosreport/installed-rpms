@@ -1,0 +1,5 @@
+httpd-2.4.57-1.el9.x86_64
+kernel-5.14.0-284.11.1.el9_2.x86_64
+openssh-server-8.7p1-24.el9.x86_64
+selinux-policy-targeted-38.1.29-1.el9.noarch
+systemd-252-14.el9.x86_64

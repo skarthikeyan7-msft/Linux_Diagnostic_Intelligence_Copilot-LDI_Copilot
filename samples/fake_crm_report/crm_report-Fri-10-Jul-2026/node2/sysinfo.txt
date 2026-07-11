@@ -1,0 +1,14 @@
+Linux node2 5.14.21-150500.55.19-default #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux
+
+              total        used        free      shared  buff/cache   available
+Mem:          16034       15680          80          25         274          95
+Swap:          4095        4095           0
+
+Filesystem     1K-blocks      Used Available Use% Mounted on
+/dev/sda2       62914560  18874368  44040192   30% /
+
+ 15:11:50 up 199 days, 22:31,  0 users,  load average: 42.10, 38.55, 30.20
+processor	: 0
+processor	: 1
+processor	: 2
+processor	: 3

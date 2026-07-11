@@ -1,0 +1,6 @@
+Filesystem     1K-blocks      Used Available Use% Mounted on
+devtmpfs          409600         0    409600    0% /dev
+tmpfs            4096000     12345   4083655    1% /run
+/dev/sda1       104845620  99845620   4000000   96% /
+/dev/sda2        20961280   4523980  16437300   22% /var
+tmpfs            4096000         0   4096000    0% /dev/shm

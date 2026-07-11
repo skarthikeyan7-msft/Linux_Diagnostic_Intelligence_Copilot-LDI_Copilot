@@ -1,0 +1,628 @@
+// sosreport-rca-webapp frontend
+// Vanilla JS, no build step, no external CDN dependencies (including the
+// markdown renderer below) - this app is designed to work fully offline,
+// consistent with the Ollama local-model option.
+"use strict";
+
+const state = {
+  selectedFile: null,
+  jobId: null,
+  pollTimer: null,
+  jobResult: null,   // {summary, digest, findings, timeline, facts}
+  providers: {},
+};
+
+const $ = (id) => document.getElementById(id);
+
+// --------------------------------------------------------------------------
+// Tiny dependency-free Markdown -> HTML renderer (subset: headers, bold,
+// italic, inline code, fenced code blocks, lists, tables, blockquotes,
+// links, hr). Covers everything digest.md / the AI report actually emit.
+// --------------------------------------------------------------------------
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderInline(text) {
+  let t = escapeHtml(text);
+  t = t.replace(/`([^`]+)`/g, "<code>$1</code>");
+  t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  t = t.replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>");
+  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return t;
+}
+
+function markdownToHtml(md) {
+  const lines = (md || "").replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  let inList = null; // 'ul' | 'ol' | null
+
+  function closeList() {
+    if (inList) { out.push(`</${inList}>`); inList = null; }
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code block
+    if (/^```/.test(line)) {
+      closeList();
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) { codeLines.push(lines[i]); i++; }
+      i++; // skip closing fence
+      out.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    // Headers
+    let m = line.match(/^(#{1,6})\s+(.*)$/);
+    if (m) {
+      closeList();
+      const level = m[1].length;
+      out.push(`<h${level}>${renderInline(m[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^(---+|\*\*\*+)\s*$/.test(line) && !/^\|/.test(lines[i + 1] || "")) {
+      closeList();
+      out.push("<hr>");
+      i++;
+      continue;
+    }
+
+    // Table: header row + separator row (|---|---|)
+    if (/^\|.*\|\s*$/.test(line) && /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/.test(lines[i + 1] || "")) {
+      closeList();
+      const headerCells = line.split("|").slice(1, -1).map((c) => c.trim());
+      out.push("<table><thead><tr>" + headerCells.map((c) => `<th>${renderInline(c)}</th>`).join("") + "</tr></thead><tbody>");
+      i += 2;
+      while (i < lines.length && /^\|.*\|\s*$/.test(lines[i])) {
+        const cells = lines[i].split("|").slice(1, -1).map((c) => c.trim());
+        out.push("<tr>" + cells.map((c) => `<td>${renderInline(c)}</td>`).join("") + "</tr>");
+        i++;
+      }
+      out.push("</tbody></table>");
+      continue;
+    }
+
+    // Blockquote
+    if (/^>\s?/.test(line)) {
+      closeList();
+      const quoteLines = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) { quoteLines.push(lines[i].replace(/^>\s?/, "")); i++; }
+      out.push(`<blockquote>${renderInline(quoteLines.join(" "))}</blockquote>`);
+      continue;
+    }
+
+    // Unordered list item
+    m = line.match(/^(\s*)[-*]\s+(.*)$/);
+    if (m) {
+      if (inList !== "ul") { closeList(); out.push("<ul>"); inList = "ul"; }
+      out.push(`<li>${renderInline(m[2])}</li>`);
+      i++;
+      continue;
+    }
+
+    // Ordered list item
+    m = line.match(/^(\s*)\d+\.\s+(.*)$/);
+    if (m) {
+      if (inList !== "ol") { closeList(); out.push("<ol>"); inList = "ol"; }
+      out.push(`<li>${renderInline(m[2])}</li>`);
+      i++;
+      continue;
+    }
+
+    // Blank line
+    if (line.trim() === "") { closeList(); i++; continue; }
+
+    // Paragraph (collect contiguous plain lines)
+    closeList();
+    const paraLines = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() !== "" && !/^(#{1,6})\s|^```|^\||^>|^(\s*)[-*]\s|^(\s*)\d+\.\s|^(---+|\*\*\*+)\s*$/.test(lines[i])) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    out.push(`<p>${renderInline(paraLines.join(" "))}</p>`);
+  }
+  closeList();
+  return out.join("\n");
+}
+
+// --------------------------------------------------------------------------
+// Upload / dropzone
+// --------------------------------------------------------------------------
+function initDropzone() {
+  const dz = $("dropzone");
+  const fileInput = $("fileInput");
+
+  const setFile = (file) => {
+    state.selectedFile = file;
+    $("serverPath").value = "";
+    $("dropzoneFile").textContent = `${file.name} (${humanSize(file.size)})`;
+    $("dropzoneFile").classList.remove("hidden");
+    updateAnalyzeEnabled();
+  };
+
+  dz.addEventListener("click", (e) => { if (e.target.tagName !== "INPUT") fileInput.click(); });
+  fileInput.addEventListener("change", () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+
+  ["dragenter", "dragover"].forEach((evt) =>
+    dz.addEventListener(evt, (e) => { e.preventDefault(); dz.classList.add("dragover"); })
+  );
+  ["dragleave", "drop"].forEach((evt) =>
+    dz.addEventListener(evt, (e) => { e.preventDefault(); dz.classList.remove("dragover"); })
+  );
+  dz.addEventListener("drop", (e) => {
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+  });
+
+  $("serverPath").addEventListener("input", () => {
+    if ($("serverPath").value.trim()) {
+      state.selectedFile = null;
+      fileInput.value = "";
+      $("dropzoneFile").classList.add("hidden");
+    }
+    updateAnalyzeEnabled();
+  });
+}
+
+function updateAnalyzeEnabled() {
+  $("btnAnalyze").disabled = !(state.selectedFile || $("serverPath").value.trim());
+}
+
+function humanSize(n) {
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(1)}${units[i]}`;
+}
+
+// --------------------------------------------------------------------------
+// Scope mode (full / range / around)
+// --------------------------------------------------------------------------
+function initScopeToggle() {
+  document.querySelectorAll('input[name="scopeMode"]').forEach((radio) => {
+    radio.addEventListener("change", () => {
+      $("scopeRangeFields").classList.toggle("hidden", radio.value !== "range" || !radio.checked);
+      $("scopeAroundFields").classList.toggle("hidden", radio.value !== "around" || !radio.checked);
+    });
+  });
+}
+
+function getScopeMode() {
+  return document.querySelector('input[name="scopeMode"]:checked').value;
+}
+
+// --------------------------------------------------------------------------
+// Analyze flow
+// --------------------------------------------------------------------------
+async function startAnalysis() {
+  const fd = new FormData();
+  if (state.selectedFile) fd.append("file", state.selectedFile);
+  else fd.append("server_path", $("serverPath").value.trim());
+
+  fd.append("min_severity", $("optMinSeverity").value);
+  fd.append("top_per_category", $("optTopPerCategory").value);
+
+  const mode = getScopeMode();
+  if (mode === "range") {
+    if ($("optStart").value.trim()) fd.append("start", $("optStart").value.trim());
+    if ($("optEnd").value.trim()) fd.append("end", $("optEnd").value.trim());
+  } else if (mode === "around") {
+    fd.append("around", $("optAround").value.trim());
+    fd.append("window", $("optWindow").value);
+  }
+
+  $("uploadSection").classList.add("hidden");
+  $("progressSection").classList.remove("hidden");
+  $("progressError").classList.add("hidden");
+  $("progressLog").innerHTML = "";
+
+  let resp;
+  try {
+    resp = await fetch("/api/analyze", { method: "POST", body: fd });
+  } catch (err) {
+    showProgressError(`Network error: ${err.message}`);
+    return;
+  }
+  if (!resp.ok) {
+    const detail = await resp.json().catch(() => ({}));
+    showProgressError(detail.detail || `Request failed (HTTP ${resp.status})`);
+    return;
+  }
+  const data = await resp.json();
+  state.jobId = data.job_id;
+  pollJob();
+}
+
+function showProgressError(msg) {
+  $("progressError").textContent = msg;
+  $("progressError").classList.remove("hidden");
+}
+
+function pollJob() {
+  clearInterval(state.pollTimer);
+  state.pollTimer = setInterval(async () => {
+    let resp;
+    try {
+      resp = await fetch(`/api/jobs/${state.jobId}`);
+    } catch (err) {
+      return; // transient network hiccup - keep polling
+    }
+    if (!resp.ok) return;
+    const job = await resp.json();
+    renderProgressLog(job.progress);
+    if (job.status === "done") {
+      clearInterval(state.pollTimer);
+      await loadResults();
+    } else if (job.status === "error") {
+      clearInterval(state.pollTimer);
+      showProgressError(job.error || "Analysis failed for an unknown reason.");
+    }
+  }, 800);
+}
+
+function renderProgressLog(lines) {
+  const el = $("progressLog");
+  el.innerHTML = lines.map((l) => `<div class="line">${escapeHtml(l)}</div>`).join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+async function loadResults(jobIdOverride) {
+  const jobId = jobIdOverride || state.jobId;
+  state.jobId = jobId;
+  const [jobResp, digestResp, findingsResp, timelineResp, factsResp] = await Promise.all([
+    fetch(`/api/jobs/${jobId}`),
+    fetch(`/api/jobs/${jobId}/digest`),
+    fetch(`/api/jobs/${jobId}/findings`),
+    fetch(`/api/jobs/${jobId}/timeline`),
+    fetch(`/api/jobs/${jobId}/facts`),
+  ]);
+  const job = await jobResp.json();
+  const digest = await digestResp.text();
+  const findings = await findingsResp.json();
+  const timeline = await timelineResp.json();
+  const facts = await factsResp.json();
+
+  state.jobResult = { job, digest, findings, timeline, facts };
+
+  $("progressSection").classList.add("hidden");
+  $("resultsSection").classList.remove("hidden");
+
+  renderSummaryCards(job.summary, facts);
+  renderClusterStatus(job.summary, facts);
+  $("digestRender").innerHTML = markdownToHtml(digest);
+  renderFindings(findings);
+  renderTimeline(timeline);
+
+  // Reset AI tab for the (possibly new) job
+  $("aiRender").innerHTML = "";
+  $("btnDownloadReport").classList.add("hidden");
+  const existingReport = await fetch(`/api/jobs/${jobId}/ai_report`).then((r) => r.text()).catch(() => "");
+  if (existingReport) {
+    $("aiRender").innerHTML = markdownToHtml(existingReport);
+    $("btnDownloadReport").classList.remove("hidden");
+  }
+
+  loadRecentJobs();
+}
+
+function renderSummaryCards(summary, facts) {
+  if (!summary) { $("summaryCards").innerHTML = ""; return; }
+  const cards = [
+    { label: "Type", value: summary.kind },
+    { label: "Files scanned", value: summary.num_files.toLocaleString() },
+    { label: "Lines scanned", value: summary.num_lines.toLocaleString() },
+    { label: "Findings", value: summary.num_findings.toLocaleString() },
+    { label: "Duration", value: `${summary.elapsed_seconds.toFixed(1)}s` },
+  ];
+  const mem = facts.memory || {};
+  if (mem.available_pct !== undefined && mem.available_pct !== null) {
+    cards.push({ label: "Memory available", value: `${mem.available_pct}%` });
+  }
+  $("summaryCards").innerHTML = cards
+    .map((c) => `<div class="summary-card"><div class="value">${escapeHtml(String(c.value))}</div><div class="label">${escapeHtml(c.label)}</div></div>`)
+    .join("");
+}
+
+function renderClusterStatus(summary, facts) {
+  const el = $("crmClusterStatus");
+  if (!summary || summary.kind !== "crm_report" || !facts.cluster_health) {
+    el.classList.add("hidden");
+    return;
+  }
+  const ch = facts.cluster_health;
+  const parts = [];
+  if (ch.nodes_detected) parts.push(`<strong>Nodes:</strong> ${escapeHtml(ch.nodes_detected.join(", "))}`);
+  if (ch.offline_or_unclean_nodes && ch.offline_or_unclean_nodes.length) {
+    parts.push(`<strong>⚠ Offline/unclean:</strong> ${escapeHtml(ch.offline_or_unclean_nodes.join(", "))}`);
+  }
+  if (ch.failed_resource_actions_raw) parts.push(`<strong>⚠ Failed Resource Actions detected</strong> — see Findings tab`);
+  if (!parts.length) { el.classList.add("hidden"); return; }
+  el.innerHTML = parts.join(" &nbsp;·&nbsp; ");
+  el.classList.remove("hidden");
+}
+
+// --------------------------------------------------------------------------
+// Findings tab
+// --------------------------------------------------------------------------
+function renderFindings(findings) {
+  const byCat = {};
+  for (const f of findings) {
+    (byCat[f.category] = byCat[f.category] || []).push(f);
+  }
+  const sevRank = { CRITICAL: 3, ERROR: 2, WARNING: 1, INFO: 0 };
+  const cats = Object.keys(byCat).sort((a, b) => {
+    const maxA = Math.max(...byCat[a].map((f) => sevRank[f.severity] || 0));
+    const maxB = Math.max(...byCat[b].map((f) => sevRank[f.severity] || 0));
+    return maxB - maxA;
+  });
+
+  const renderList = (filterText) => {
+    const ft = (filterText || "").toLowerCase();
+    const html = cats
+      .map((cat) => {
+        const items = byCat[cat]
+          .slice()
+          .sort((a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0) || b.count - a.count)
+          .filter((f) => !ft || cat.toLowerCase().includes(ft) || f.message.toLowerCase().includes(ft));
+        if (!items.length) return "";
+        const rows = items
+          .map(
+            (f) => `<div class="finding-item">
+              <div class="msg"><span class="sev-badge sev-${f.severity}">${f.severity}</span> (${f.count}×) ${escapeHtml(f.message)}</div>
+              ${f.examples.slice(0, 2).map((ex) => `<div class="ex">${escapeHtml(ex.file)}:${ex.line}</div>`).join("")}
+            </div>`
+          )
+          .join("");
+        return `<div class="finding-group"><div class="finding-cat-head"><span>${escapeHtml(cat)}</span><span class="muted">${items.length} shown</span></div>${rows}</div>`;
+      })
+      .join("");
+    $("findingsList").innerHTML = html || `<p class="muted">No findings match "${escapeHtml(filterText)}".</p>`;
+  };
+
+  renderList("");
+  $("findingsFilter").oninput = (e) => renderList(e.target.value);
+}
+
+// --------------------------------------------------------------------------
+// Timeline tab
+// --------------------------------------------------------------------------
+function renderTimeline(timeline) {
+  if (!timeline.length) {
+    $("timelineList").innerHTML = '<p class="muted">No dated CRITICAL/high-signal events were found to place on a timeline.</p>';
+    return;
+  }
+  $("timelineList").innerHTML = timeline
+    .map(
+      (ev) => `<div class="timeline-item">
+        <div class="timeline-ts">${escapeHtml(ev.ts)} <span class="sev-badge sev-${ev.severity}">${ev.severity}</span> ${escapeHtml(ev.category)}</div>
+        <div class="timeline-text">${escapeHtml(ev.text)}</div>
+        <div class="timeline-file">${escapeHtml(ev.file)}:${ev.line}</div>
+      </div>`
+    )
+    .join("");
+}
+
+// --------------------------------------------------------------------------
+// Tabs
+// --------------------------------------------------------------------------
+function initTabs() {
+  document.querySelectorAll(".tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
+      btn.classList.add("active");
+      $(`tab-${btn.dataset.tab}`).classList.remove("hidden");
+    });
+  });
+}
+
+// --------------------------------------------------------------------------
+// AI provider config + synthesis (SSE via fetch, since EventSource can't POST)
+// --------------------------------------------------------------------------
+const AI_SETTINGS_KEY = "sosreport-rca-ai-settings";
+
+async function initAiProviders() {
+  const resp = await fetch("/api/providers");
+  state.providers = await resp.json();
+  const sel = $("aiProvider");
+  sel.innerHTML = Object.entries(state.providers)
+    .map(([key, p]) => `<option value="${key}">${escapeHtml(p.label)}${p.local ? " 🔒" : ""}</option>`)
+    .join("");
+  sel.addEventListener("change", () => renderAiFields(sel.value));
+
+  const saved = loadAiSettings();
+  if (saved && saved.provider && state.providers[saved.provider]) {
+    sel.value = saved.provider;
+  }
+  renderAiFields(sel.value, saved);
+}
+
+function fieldLabel(provider, field) {
+  const labels = {
+    api_key: "API key", model: "Model", endpoint: "Endpoint URL",
+    deployment: "Deployment name", base_url: "Base URL",
+  };
+  return labels[field] || field;
+}
+
+function renderAiFields(providerKey, saved) {
+  const p = state.providers[providerKey];
+  if (!p) return;
+  saved = saved || {};
+  $("aiFields").innerHTML = p.fields
+    .map((f) => {
+      const isSecret = f === "api_key";
+      const value =
+        (saved.provider === providerKey && saved[f]) ||
+        (f === "model" ? p.default_model : "") ||
+        (f === "base_url" ? p.default_base_url || "" : "");
+      return `<div class="field-row">
+        <label for="ai_${f}">${fieldLabel(providerKey, f)}${f === "model" ? ` <span class="muted small">(${escapeHtml(p.model_hint || "")})</span>` : ""}</label>
+        <input type="${isSecret ? "password" : "text"}" id="ai_${f}" value="${escapeHtml(String(value))}">
+      </div>`;
+    })
+    .join("");
+}
+
+function loadAiSettings() {
+  try {
+    return JSON.parse(localStorage.getItem(AI_SETTINGS_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function saveAiSettingsIfRequested() {
+  if (!$("aiRemember").checked) {
+    localStorage.removeItem(AI_SETTINGS_KEY);
+    return;
+  }
+  const providerKey = $("aiProvider").value;
+  const p = state.providers[providerKey];
+  const settings = { provider: providerKey };
+  p.fields.forEach((f) => { settings[f] = $(`ai_${f}`).value; });
+  localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(settings));
+}
+
+async function runSynthesis() {
+  const providerKey = $("aiProvider").value;
+  const p = state.providers[providerKey];
+  const payload = { provider: providerKey, extra_context: $("aiExtraContext").value };
+  let missing = [];
+  p.fields.forEach((f) => {
+    const val = $(`ai_${f}`).value.trim();
+    if (!val) missing.push(fieldLabel(providerKey, f));
+    payload[f] = val;
+  });
+
+  $("aiError").classList.add("hidden");
+  if (missing.length) {
+    $("aiError").textContent = `Missing required field(s): ${missing.join(", ")}`;
+    $("aiError").classList.remove("hidden");
+    return;
+  }
+
+  saveAiSettingsIfRequested();
+  $("btnSynthesize").disabled = true;
+  $("btnSynthesize").textContent = "Generating…";
+  $("aiRender").innerHTML = '<p class="muted">Waiting for the model to respond…</p>';
+  $("btnDownloadReport").classList.add("hidden");
+
+  let accumulated = "";
+  try {
+    const resp = await fetch(`/api/jobs/${state.jobId}/synthesize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok || !resp.body) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(detail.detail || `Request failed (HTTP ${resp.status})`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop(); // keep any incomplete trailing event
+      for (const evt of events) {
+        const line = evt.trim();
+        if (!line.startsWith("data:")) continue;
+        const parsed = JSON.parse(line.slice(5).trim());
+        if (parsed.error) throw new Error(parsed.error);
+        if (parsed.delta) {
+          accumulated += parsed.delta;
+          $("aiRender").innerHTML = markdownToHtml(accumulated);
+        }
+        if (parsed.done) {
+          $("btnDownloadReport").classList.remove("hidden");
+        }
+      }
+    }
+  } catch (err) {
+    $("aiError").textContent = `Generation failed: ${err.message}`;
+    $("aiError").classList.remove("hidden");
+  } finally {
+    $("btnSynthesize").disabled = false;
+    $("btnSynthesize").textContent = "Generate root-cause report";
+  }
+}
+
+function downloadReport() {
+  const digest = state.jobResult ? state.jobResult.digest : "";
+  const aiText = $("aiRender").innerText || "";
+  const content = `# AI Root Cause Report\n\n${aiText}\n\n---\n\n# Full Evidence Digest\n\n${digest}`;
+  const blob = new Blob([content], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `rca-report-${state.jobId || "analysis"}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// --------------------------------------------------------------------------
+// Recent jobs panel
+// --------------------------------------------------------------------------
+async function loadRecentJobs() {
+  const resp = await fetch("/api/jobs");
+  const jobs = await resp.json();
+  $("recentList").innerHTML = jobs
+    .map((j) => {
+      const statusLabel = j.status === "done" ? (j.summary ? j.summary.kind : "done") : j.status;
+      return `<div class="recent-item" data-id="${j.id}">
+        <div class="name">${escapeHtml(j.name)}</div>
+        <div class="meta"><span>${escapeHtml(statusLabel)}</span><span>${escapeHtml(new Date(j.created_at).toLocaleTimeString())}</span></div>
+      </div>`;
+    })
+    .join("") || '<p class="muted small">No analyses yet this session.</p>';
+
+  document.querySelectorAll(".recent-item").forEach((item) => {
+    item.addEventListener("click", async () => {
+      $("recentPanel").classList.add("hidden");
+      $("uploadSection").classList.add("hidden");
+      $("progressSection").classList.add("hidden");
+      $("resultsSection").classList.remove("hidden");
+      await loadResults(item.dataset.id);
+    });
+  });
+}
+
+// --------------------------------------------------------------------------
+// Wire everything up
+// --------------------------------------------------------------------------
+function resetToUpload() {
+  $("resultsSection").classList.add("hidden");
+  $("progressSection").classList.add("hidden");
+  $("uploadSection").classList.remove("hidden");
+  state.selectedFile = null;
+  state.jobId = null;
+  $("fileInput").value = "";
+  $("serverPath").value = "";
+  $("dropzoneFile").classList.add("hidden");
+  updateAnalyzeEnabled();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  initDropzone();
+  initScopeToggle();
+  initTabs();
+  initAiProviders();
+  loadRecentJobs();
+
+  $("btnAnalyze").addEventListener("click", startAnalysis);
+  $("btnNewAnalysis").addEventListener("click", resetToUpload);
+  $("btnSynthesize").addEventListener("click", runSynthesis);
+  $("btnDownloadReport").addEventListener("click", downloadReport);
+  $("btnRecent").addEventListener("click", () => { $("recentPanel").classList.toggle("hidden"); loadRecentJobs(); });
+  $("btnCloseRecent").addEventListener("click", () => $("recentPanel").classList.add("hidden"));
+});

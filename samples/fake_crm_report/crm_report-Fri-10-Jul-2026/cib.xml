@@ -1,0 +1,13 @@
+<cib crm_feature_set="3.16.0" validate-with="pacemaker-3.5" epoch="120" num_updates="3" admin_epoch="0" cib-last-written="Fri Jul 10 15:13:20 2026" update-origin="node1" update-client="crm_attribute" have-quorum="1" dc-uuid="1">
+  <configuration>
+    <crm_config/>
+    <nodes>
+      <node id="1" uname="node1"/>
+      <node id="2" uname="node2"/>
+    </nodes>
+    <resources>
+      <primitive id="stonith-sbd" class="stonith" type="external/sbd"/>
+    </resources>
+  </configuration>
+  <status/>
+</cib>

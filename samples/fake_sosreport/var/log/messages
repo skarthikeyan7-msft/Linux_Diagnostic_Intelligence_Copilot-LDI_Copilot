@@ -1,0 +1,18 @@
+Jul 10 08:00:01 web01 systemd[1]: Starting Daily cleanup...
+Jul 10 08:00:05 web01 systemd[1]: Finished Daily cleanup.
+Jul 10 10:15:00 web01 sshd[4890]: Accepted publickey for admin from 10.0.0.5 port 22222 ssh2
+Jul 10 11:28:01 web01 kernel: EXT4-fs error (device sda1): ext4_find_entry:1436: inode #131075: comm httpd: reading directory lblock 0
+Jul 10 11:28:05 web01 kernel: Buffer I/O error on device sda1, logical block 45231
+Jul 10 11:29:10 web01 kernel: Out of memory: Killed process 4021 (httpd) total-vm:512000kB, anon-rss:409600kB
+Jul 10 11:29:11 web01 kernel: Killed process 4022 (httpd) total-vm:498000kB, anon-rss:401200kB
+Jul 10 11:29:15 web01 systemd[1]: httpd.service: Main process exited, code=killed, status=9/KILL
+Jul 10 11:29:15 web01 systemd[1]: Failed to start The Apache HTTP Server.
+Jul 10 11:29:16 web01 systemd[1]: httpd.service: Failed with result 'signal'.
+Jul 10 11:30:02 web01 kernel: audit: type=1400 avc:  denied  { write } for  pid=4030 comm="httpd" name="cache" dev="sda1" ino=131080 scontext=system_u:system_r:httpd_t:s0 tcontext=system_u:object_r:var_t:s0 tclass=dir
+Jul 10 11:30:45 web01 sshd[5012]: Failed password for invalid user admin from 203.0.113.55 port 51122 ssh2
+Jul 10 11:30:46 web01 sshd[5013]: Failed password for invalid user admin from 203.0.113.55 port 51124 ssh2
+Jul 10 11:31:02 web01 kernel: EXT4-fs error (device sda1): ext4_find_entry: inode #131075 - filesystem corruption detected, remounting read-only
+Jul 10 11:31:03 web01 kernel: EXT4-fs (sda1): Remounting filesystem read-only
+Jul 10 11:31:10 web01 httpd[4050]: [error] segfault at 0 ip 00007f0000000000 sp 00007ffe00000000 error 4 in httpd
+Jul 10 11:31:40 web01 systemd[1]: disk-usage-check.service: Failed to start.
+Jul 10 11:32:00 web01 rsyslogd: [origin software="rsyslogd"] exiting on signal 15.

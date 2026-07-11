@@ -1,0 +1,22 @@
+#==[ Command ]======================================#
+# /bin/date
+Fri Jul 10 14:40:00 UTC 2026
+
+#==[ Command ]======================================#
+# /bin/hostname
+sles01
+
+#==[ Command ]======================================#
+# /bin/uname -a
+Linux sles01 5.14.21-150500.55.19-default #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux
+
+#==[ Command ]======================================#
+# /usr/bin/uptime
+ 14:40:00 up 120 days,  5:03,  3 users,  load average: 1.10, 1.05, 0.98
+
+#==[ Configuration File ]===========================#
+# /etc/os-release
+NAME="SLES"
+VERSION="15-SP5"
+ID="sles"
+VERSION_ID="15.5"

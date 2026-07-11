@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# per-job uploaded archives, extracted trees, and analysis output - can
+# contain sensitive hostnames/IPs/config data and shouldn't be committed
+backend/data/
+
+# analyzer CLI-style output directories, if ever generated locally
+*_analysis/
+extraction_skipped.json
+
+# local-only AI settings someone might export/dump for debugging
+*.env
+.env.local
+
+.DS_Store
+Thumbs.db

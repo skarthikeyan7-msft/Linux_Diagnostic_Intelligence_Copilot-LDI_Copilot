@@ -1,0 +1,5 @@
+#==[ Command ]======================================#
+# /usr/bin/free -m
+              total        used        free      shared  buff/cache   available
+Mem:          16034        4021        8500         512        3513       11200
+Swap:          4095           0        4095

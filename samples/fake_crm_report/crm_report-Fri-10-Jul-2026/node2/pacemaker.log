@@ -1,0 +1,11 @@
+Jul 10 15:00:01 node2 corosync[2400]: [TOTEM ] A new membership was formed.
+Jul 10 15:08:00 node2 kernel: db-primary[9012]: page allocation stalls for 12000ms, order:0
+Jul 10 15:09:12 node2 kernel: INFO: task db-primary:9012 blocked for more than 120 seconds.
+Jul 10 15:09:12 node2 kernel: Not tainted 5.14.21-150500.55.19-default
+Jul 10 15:10:00 node2 corosync[2400]: [TOTEM ] Token has not been received for 4200 ms
+Jul 10 15:10:30 node2 corosync[2400]: [TOTEM ] Token has not been received for 4800 ms
+Jul 10 15:11:00 node2 corosync[2400]: [TOTEM ] Token has not been received for 5000 ms
+Jul 10 15:11:30 node2 pacemaker-controld[2500]: error: Cannot receive corosync heartbeat - shutting down
+Jul 10 15:12:00 node2 sbd[2100]: WARN: pacemaker health check: UNHEALTHY
+Jul 10 15:12:10 node2 sbd[2100]: CRIT: Rebooting system - watchdog action triggered by pacemaker health failure
+Jul 10 15:12:11 node2 kernel: sbd: [2100]: watchdog trigger: reboot

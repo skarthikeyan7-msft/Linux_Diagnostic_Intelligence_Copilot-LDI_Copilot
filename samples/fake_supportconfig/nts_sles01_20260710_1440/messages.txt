@@ -1,0 +1,17 @@
+#==[ Command ]======================================#
+# /bin/date
+Fri Jul 10 14:40:00 UTC 2026
+
+#==[ Log File ]======================================#
+# /var/log/messages
+Jul 10 09:10:00 sles01 kernel: bond0: link status definitely down for interface eth1, disabling it
+Jul 10 09:10:01 sles01 kernel: bond0: making interface eth0 the new active one
+Jul 10 09:15:22 sles01 corosync[2001]:   [TOTEM ] A processor failed, forming new configuration.
+Jul 10 09:15:25 sles01 corosync[2001]:   [TOTEM ] Failed to receive the leave message. failed: 2
+Jul 10 09:15:30 sles01 pacemakerd[2050]: warning: Pacemaker daemon unable to reach corosync
+Jul 10 09:15:35 sles01 stonith-ng[2060]: notice: Client stonith_admin.2070 wants to fence (reboot) 'sles02'
+Jul 10 09:15:40 sles01 stonith-ng[2060]: notice: Requesting fencing action reboot targeting sles02
+Jul 10 09:15:55 sles01 stonith-ng[2060]: notice: Operation reboot of sles02 by sles01 for stonith_admin.2070: OK
+Jul 10 09:16:00 sles01 pacemaker-controld[2080]: notice: Peer sles02 was terminated (reboot) by sles01: OK
+Jul 10 09:20:10 sles01 kernel: bond0: link status up for interface eth1
+Jul 10 09:20:30 sles01 corosync[2001]:   [TOTEM ] A new membership was formed.

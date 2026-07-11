@@ -1,0 +1,21 @@
+Linux node1 5.14.21-150500.55.19-default #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux
+NAME="SLES"
+VERSION="15-SP5"
+
+              total        used        free      shared  buff/cache   available
+Mem:          16034        3021        9500         412        3513       12200
+Swap:          4095           0        4095
+
+Filesystem     1K-blocks      Used Available Use% Mounted on
+/dev/sda2       62914560  15874368  47040192   25% /
+/dev/sda3       20971520   4923712  16047808   24% /var/log
+
+ 15:40:02 up 200 days,  4:12,  1 user,  load average: 0.85, 0.72, 0.68
+processor	: 0
+processor	: 1
+processor	: 2
+processor	: 3
+
+pacemaker-2.1.6-150500.5.1.x86_64
+corosync-3.1.7-150500.3.9.1.x86_64
+sbd-1.5.1-150500.3.3.1.x86_64

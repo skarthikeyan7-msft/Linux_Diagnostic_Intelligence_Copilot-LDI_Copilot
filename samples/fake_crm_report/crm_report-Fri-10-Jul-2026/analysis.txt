@@ -1,0 +1,14 @@
+crm_report: Checking node1 logs for errors/warnings...
+crm_report: Checking node2 logs for errors/warnings...
+
+##### node1/pacemaker.log #####
+WARNING: pacemaker-controld[1500]: Client node2 is now UNCLEAN
+ERROR: pacemaker-fenced[1490]: Requesting fencing (reboot) of node2
+
+##### node2/pacemaker.log #####
+CRIT: pacemaker-controld[2500]: Cannot receive corosync heartbeat - shutting down
+WARNING: corosync[2400]: Token has not been received for 5000 ms
+
+Analysis complete. 2 CRIT/ERROR/WARNING lines flagged above - review node2
+for the underlying cause of the corosync token loss (possible resource
+starvation, network partition, or STONITH misconfiguration).

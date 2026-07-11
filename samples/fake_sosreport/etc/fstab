@@ -1,0 +1,2 @@
+UUID=1111-2222 /        ext4    defaults        1 1
+UUID=3333-4444 /var     ext4    defaults        1 2

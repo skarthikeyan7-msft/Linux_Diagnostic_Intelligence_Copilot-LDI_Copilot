@@ -1,0 +1,15 @@
+
+Please edit this template and describe the issue/problem you
+encountered.
+
+Date: Fri Jul 10 15:40:00 2026
+By: crm report crm_report-Fri-10-Jul-2026
+Subject: Node fenced after corosync token loss
+Severity: major
+--------------------------------------------------------
+
+Detailed description:
+
+node2 was fenced (rebooted via SBD) at approximately 15:12 after the
+corosync ring lost tokens. Investigating why node2 stopped responding
+before the fence action.

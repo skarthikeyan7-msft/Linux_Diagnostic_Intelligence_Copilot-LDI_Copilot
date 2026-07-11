@@ -1,0 +1,15 @@
+#==[ Command ]======================================#
+# /usr/bin/lscpu
+Architecture:        x86_64
+CPU(s):               4
+
+#==[ Configuration File ]===========================#
+# /proc/cpuinfo
+processor	: 0
+vendor_id	: GenuineIntel
+processor	: 1
+vendor_id	: GenuineIntel
+processor	: 2
+vendor_id	: GenuineIntel
+processor	: 3
+vendor_id	: GenuineIntel

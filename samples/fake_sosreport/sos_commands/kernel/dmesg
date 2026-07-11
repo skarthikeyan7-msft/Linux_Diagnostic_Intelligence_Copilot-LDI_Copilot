@@ -1,0 +1,11 @@
+[Fri Jul 10 11:28:01 2026] EXT4-fs error (device sda1): ext4_find_entry:1436: inode #131075: comm httpd: reading directory lblock 0
+[Fri Jul 10 11:28:05 2026] Buffer I/O error on device sda1, logical block 45231
+[Fri Jul 10 11:29:09 2026] httpd invoked oom-killer: gfp_mask=0x201da, order=0, oom_score_adj=0
+[Fri Jul 10 11:29:09 2026] Out of memory: Kill process 4021 (httpd) score 456 or sacrifice child
+[Fri Jul 10 11:29:09 2026] Killed process 4021 (httpd) total-vm:512000kB, anon-rss:409600kB, file-rss:0kB
+[Fri Jul 10 11:31:02 2026] EXT4-fs error (device sda1): ext4_find_entry: inode #131075 - filesystem corruption detected
+[Fri Jul 10 11:31:03 2026] EXT4-fs (sda1): Remounting filesystem read-only
+[Fri Jul 10 11:31:10 2026] httpd[4050]: segfault at 0 ip 00007f0000000000 sp 00007ffe00000000 error 4 in httpd[7f0000000000+1000]
+[Fri Jul 10 11:31:11 2026] Call Trace:
+[Fri Jul 10 11:31:11 2026]  [<ffffffff81234567>] ext4_find_entry+0x123/0x456
+[Fri Jul 10 11:31:11 2026]  [<ffffffff81234abc>] ext4_lookup+0x45/0x120

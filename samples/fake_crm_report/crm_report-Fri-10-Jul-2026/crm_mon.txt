@@ -1,0 +1,20 @@
+Cluster Summary:
+  * Stack: corosync
+  * Current DC: node1 (version 2.1.6) - partition with quorum
+  * Last updated: Fri Jul 10 15:40:00 2026
+  * Last change:  Fri Jul 10 15:13:20 2026 by root via crm_attribute on node1
+  * 2 nodes configured
+  * 4 resource instances configured
+
+Node List:
+  * Online: [ node1 ]
+  * OFFLINE: [ node2 ]
+
+Active Resources:
+  * vip-cluster	(ocf:heartbeat:IPaddr2):	 Started node1
+  * fs-shared	(ocf:heartbeat:Filesystem):	 Started node1
+  * db-primary	(ocf:heartbeat:pgsql):	 Started node1
+  * stonith-sbd	(stonith:external/sbd):	 Started node1
+
+Failed Resource Actions:
+  * db-primary_monitor_10000 on node2 'error' (1): call=42, status='Timed Out', exitreason='', last-rc-change='Fri Jul 10 15:11:58 2026'

@@ -1,0 +1,13 @@
+#==[ Command ]======================================#
+# /usr/sbin/crm_mon -1
+Cluster Summary:
+  * Stack: corosync
+  * Current DC: sles01 (version 2.1.2) - partition with quorum
+  * Last updated: Fri Jul 10 14:40:00 2026
+
+Node List:
+  * Node sles01: online
+  * Node sles02: UNCLEAN (offline)
+
+Failed Resource Actions:
+  * ip_cluster_start_0 on sles02 'unknown error' (1): call=15, status=Timed Out

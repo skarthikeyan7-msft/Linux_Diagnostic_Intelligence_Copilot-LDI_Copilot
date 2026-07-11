@@ -1,0 +1,4 @@
+Jul 10 15:00:01 node2 corosync[2400]: [MAIN  ] Corosync Cluster Engine starting up
+Jul 10 15:08:30 node2 kernel: CPU stuck for 23s! [db-primary:9012]
+Jul 10 15:09:00 node2 kernel: NMI watchdog: BUG: soft lockup - CPU#2 stuck for 22s!
+Jul 10 15:12:11 node2 kernel: sbd: watchdog fired - system will reboot now

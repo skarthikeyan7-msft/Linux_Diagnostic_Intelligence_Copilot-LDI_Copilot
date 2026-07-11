@@ -1,0 +1,14 @@
+Jul 10 15:00:01 node1 pacemaker-controld[1500]: notice: State transition S_IDLE -> S_POLICY_ENGINE
+Jul 10 15:05:10 node1 corosync[1400]: [KNET  ] link: host: 2 link: 0 is down
+Jul 10 15:05:10 node1 corosync[1400]: [KNET  ] host: host: 2 (passive) best link: 0 (pri: 1)
+Jul 10 15:10:15 node1 corosync[1400]: [TOTEM ] Token has not been received for 4000 ms
+Jul 10 15:11:58 node1 pacemaker-controld[1500]: error: Result of monitor operation for db-primary on node2: Timed Out
+Jul 10 15:12:00 node1 corosync[1400]: [TOTEM ] A processor failed, forming new configuration.
+Jul 10 15:12:05 node1 corosync[1400]: [TOTEM ] Failed to receive the leave message. failed: 2
+Jul 10 15:12:06 node1 pacemaker-controld[1500]: warning: Client node2 is now UNCLEAN
+Jul 10 15:12:07 node1 pacemaker-fenced[1490]: notice: Client stonith_admin.crm_mon wants to fence (reboot) 'node2'
+Jul 10 15:12:07 node1 pacemaker-fenced[1490]: error: Requesting fencing (reboot) of node2
+Jul 10 15:12:35 node1 pacemaker-fenced[1490]: notice: Operation reboot of node2 by node1 for stonith_admin.crm_mon: OK
+Jul 10 15:12:36 node1 pacemaker-controld[1500]: notice: Peer node2 was terminated (reboot) by node1: OK
+Jul 10 15:13:20 node1 pacemaker-controld[1500]: notice: Resource db-primary demoted then promoted on node1
+Jul 10 15:20:05 node1 corosync[1400]: [TOTEM ] A new membership was formed.
