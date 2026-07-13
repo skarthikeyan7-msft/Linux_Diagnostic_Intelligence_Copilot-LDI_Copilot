@@ -85,7 +85,16 @@
         <label class="checkbox-row">
           <input type="checkbox" id="aiRemember"> Remember these settings on this device (localStorage; secrets stored locally only, never uploaded anywhere but the provider you select)
         </label>
-        <p class="muted small">⚠️ This sends the evidence digest (system/cluster names, log excerpts, IPs, etc.) to the AI provider you select. Choose <strong>Ollama (local)</strong> if the bundle is sensitive and must never leave this machine.</p>
+        <p class="muted small hidden" id="ollamaPrivacyNote">🔒 Ollama runs fully offline on this machine — nothing from this bundle ever leaves it. If Ollama isn't already running, clicking Generate will start it automatically (progress shows in the activity terminal →).</p>
+        <div id="confidentialityPanel" class="confidentiality-panel hidden">
+          <p class="muted small">⚠️ This sends the evidence digest (system/cluster names, log excerpts, IPs, etc. — not the raw uploaded archive) to <strong id="confidentialityProviderName">this provider</strong>, an external service. See <a href="SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a> for this project's full data-handling guidance.</p>
+          <label class="checkbox-row">
+            <input type="checkbox" id="aiRedact" checked> 🔒 Redact known hostnames &amp; IP addresses before sending (recommended for customer data)
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="aiConfirmExternal"> I confirm I'm authorized to share this bundle's data with an external AI provider
+          </label>
+        </div>
       </div>
 
       <details class="advanced-options">
@@ -204,8 +213,16 @@
 
   <aside class="terminal-panel" id="terminalPanel">
     <div class="terminal-head">
-      <span>📟 Activity Log</span>
-      <button id="btnClearTerminal" class="btn btn-ghost btn-sm">Clear</button>
+      <div class="terminal-head-row">
+        <span>📟 Activity Log</span>
+        <button id="btnClearTerminal" class="btn btn-ghost btn-sm">Clear</button>
+      </div>
+      <div class="terminal-toolbar">
+        <span id="ollamaStatusBadge" class="ollama-status-badge status-unknown">🦙 Ollama: checking…</span>
+        <button id="btnStartOllama" class="btn btn-ghost btn-sm">▶ Start</button>
+        <button id="btnStopOllama" class="btn btn-ghost btn-sm">■ Stop</button>
+        <button id="btnRefreshOllama" class="btn btn-ghost btn-sm" title="Re-check status">⟳</button>
+      </div>
     </div>
     <div class="terminal-body" id="terminalBody"></div>
   </aside>

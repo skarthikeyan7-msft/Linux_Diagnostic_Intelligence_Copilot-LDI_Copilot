@@ -1,12 +1,12 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-2.1.1-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-2.2.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
-Describe the specific issue you're investigating, pick an AI model (and how you want to authenticate to it), drop in an archive, and get a **focused**, evidence-cited root-cause report — instead of a generic exhaustive dump. Built on the same mechanical evidence-scanning engine as the [`sosreport-rca`](../sosreport-rca) CLI tool, extended with full `crm_report` support, investigation-focused steering, Microsoft Entra ID authentication for Azure OpenAI, a persistent tabbed UI, and a live activity terminal.
+Describe the specific issue you're investigating, pick an AI model (and how you want to authenticate to it), drop in an archive, and get a **focused**, evidence-cited root-cause report — instead of a generic exhaustive dump. Built on the same mechanical evidence-scanning engine as the [`sosreport-rca`](../sosreport-rca) CLI tool, extended with full `crm_report` support, investigation-focused steering, Microsoft Entra ID authentication for Azure OpenAI, a persistent tabbed UI, a full-height activity terminal with one-click Ollama control, and automatic redaction of sensitive identifiers when using a non-local AI provider.
 
-See [CHANGELOG.md](CHANGELOG.md) for release history — this project follows [Semantic Versioning](https://semver.org/) and is tagged (`vX.Y.Z`) with a matching GitHub Release per version.
+See [CHANGELOG.md](CHANGELOG.md) for release history — this project follows [Semantic Versioning](https://semver.org/) and is tagged (`vX.Y.Z`) with a matching GitHub Release per version. See **[SECURITY.md](SECURITY.md)** for this project's full data-handling and confidentiality guidance — read this before using it with customer data at team scale.
 
 > **Formerly `sosreport-rca-webapp`.** Renamed and rebranded as **LDI Copilot** as of v2.0.0 — same project, same history, new identity.
 
@@ -15,9 +15,11 @@ See [CHANGELOG.md](CHANGELOG.md) for release history — this project follows [S
 The CLI (`sosreport-rca`) is great for scripting/automation. This project wraps the same analysis engine in a browser UI so you can:
 - **Tell it what you're actually investigating** — e.g. "find root cause of NC and IP cluster resource restart issue" — and get an answer to that question specifically, instead of every unrelated warning in the bundle competing for attention
 - Drag-and-drop a bundle instead of remembering CLI flags
-- **Choose which AI model does the reasoning, and how to authenticate to it** — OpenAI, Anthropic (Claude), Azure OpenAI (API key **or** Microsoft Entra ID app registration), or a fully local Ollama model — pick from a dropdown of known models (with a live "Check available models" option that greys out anything not actually available to your credentials), configured up front so the AI report generates automatically as soon as analysis finishes
+- **Choose which AI model does the reasoning, and how to authenticate to it** — **Ollama (local, fully offline) is the default** — or OpenAI, Anthropic (Claude), Azure OpenAI (API key **or** Microsoft Entra ID app registration) — pick from a dropdown of known models (with a live "Check available models" option that greys out anything not actually available to your credentials), configured up front so the AI report generates automatically as soon as analysis finishes
+- **Never have to remember to start Ollama** — clicking "Generate root-cause report" with Ollama selected starts `ollama serve` automatically if it isn't already running, with progress visible in the activity terminal; a toolbar also gives direct manual Start/Stop/Refresh control any time
 - **Move freely between Provide Bundle / Analyzing / Results** at any time via a persistent top tab bar, instead of being forced through a linear wizard
-- **Watch background progress from anywhere** via the always-visible activity terminal on the right — bundle selection, scan progress, AI synthesis, downloads — without needing to be on a specific tab
+- **Watch background progress from a full-height activity terminal docked along the entire right edge** — bundle selection, scan progress, AI synthesis, Ollama start/stop, downloads — without needing to be on a specific tab
+- **Reduce exposure automatically when using a public AI model** — known hostnames and IP addresses are redacted from the evidence digest before it's sent to any non-local provider, with an explicit confirmation required before any external send (see [SECURITY.md](SECURITY.md))
 - Get a live, readable dashboard (summary cards, cluster status, findings by category, chronological timeline) instead of a markdown file
 - Analyze `crm_report`/`hb_report` bundles too, with per-node attribution across a multi-node cluster
 - Keep everything on your machine — the server binds to `127.0.0.1` only by default, and bundle data is only ever sent off-box if you explicitly choose a cloud AI provider for the synthesis step
@@ -63,7 +65,11 @@ Recent analyses from the current server session are listed under "Recent analyse
 
 ### The activity terminal
 
-The panel on the right side of the page is a persistent, timestamped activity log — visible no matter which of the three tabs you're on. It mirrors background progress from every stage: bundle selection, the mechanical scan's own progress lines, AI synthesis start/completion, model-availability checks, downloads, and resets. Use "Clear" in its header to wipe it; it's session-only (not persisted), purely a live "what's happening" view.
+The panel docked along the entire right edge of the page is a persistent, timestamped activity log — visible no matter which of the three tabs you're on. It mirrors background progress from every stage: bundle selection, the mechanical scan's own progress lines, AI synthesis start/completion, Ollama start/stop, model-availability checks, downloads, and resets. Its header has an Ollama status badge plus **Start**/**Stop**/**⟳ (refresh)** buttons for direct manual control, and a **Clear** button to wipe the log. It's session-only (not persisted), purely a live "what's happening" view.
+
+### Ollama auto-start
+
+Since Ollama is the default AI provider, clicking **"Generate root-cause report"** with Ollama selected will automatically start `ollama serve` if it isn't already running — no need to remember to start it yourself first. Progress (including Ollama's own startup log lines) streams into the activity terminal while it comes up. You can also start/stop/check it manually any time via the terminal's toolbar. LDI Copilot will never spawn a duplicate instance if Ollama is already reachable (e.g. via the Ollama desktop app), and the Stop button only ever stops an instance LDI Copilot itself started — it will never terminate an Ollama process it didn't launch.
 
 ### A note on focused analysis
 
@@ -71,17 +77,19 @@ The mechanical engine's keyword matching is intentionally simple (it just tags f
 
 ## AI provider setup
 
-Pick whichever you have access to — no code changes needed, it's a dropdown in the UI (tab 1, or jump there any time via "✏️ Edit focus & AI settings" on the Results tab).
+Pick whichever you have access to — no code changes needed, it's a dropdown in the UI (tab 1, or jump there any time via "✏️ Edit focus & AI settings" on the Results tab). **Ollama is selected by default** — the safest choice for customer diagnostic data, since nothing ever leaves your machine.
 
 | Provider | Authentication | What you need | Notes |
 |---|---|---|---|
+| **Ollama (local)** — *default* | None | [Ollama](https://ollama.com) installed, with a model pulled (`ollama pull llama3.1`) | 🔒 **Fully offline** — the bundle's evidence digest never leaves your machine. Best choice for sensitive customer data. LDI Copilot starts `ollama serve` for you automatically if it isn't already running. Model is a dropdown of common Ollama model names, plus "Custom / other model…" |
 | **OpenAI** | API Key | API key from platform.openai.com | Model is a dropdown of known models (`gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4-turbo`, `gpt-3.5-turbo`, `o3`, `o3-mini`, `o1`), plus a "Custom / other model…" option for anything newer |
 | **Anthropic (Claude)** | API Key | API key from console.anthropic.com | Model is a dropdown of known Claude models, plus "Custom / other model…" |
 | **Azure OpenAI** | API Key | API key + resource endpoint URL + **deployment name** (not the base model name) | Deployment name is whatever you named it when you deployed the model in Azure AI Foundry / Azure OpenAI Studio — always free text (deployment names are user-defined, so there's no fixed list to offer) |
 | **Azure OpenAI** | Microsoft Entra ID | Directory (tenant) ID + Application (client) ID + client secret, from an app registration, plus the same endpoint + deployment name | For enterprise environments where API keys are locked down by policy. The app registration needs the **Cognitive Services OpenAI User** RBAC role (or equivalent) assigned on the target Azure OpenAI resource — see below. |
-| **Ollama (local)** | None | [Ollama](https://ollama.com) installed and running locally (`ollama serve`), with a model pulled (`ollama pull llama3.1`) | Model is a dropdown of common Ollama model names, plus "Custom / other model…" | 🔒 **Fully offline** — the bundle's evidence digest never leaves your machine. Best choice for sensitive infrastructure data. |
 
 **API key / secret handling:** credentials are entered in the browser and sent directly from your local backend to the provider you chose (or, for Entra ID, to `login.microsoftonline.com` to exchange for a short-lived access token, then to your Azure OpenAI endpoint), for that one request only. They are never written to disk unless you explicitly check "Remember these settings on this device" (which stores them in your browser's `localStorage`, not on any server).
+
+**Non-local providers require an extra confirmation.** When you pick anything other than Ollama, a confidentiality panel appears with a redaction toggle (checked by default) and a required "I confirm I'm authorized to share this bundle's data with an external AI provider" checkbox — see [SECURITY.md](SECURITY.md) for the full design and its limitations.
 
 ### Checking which models are actually available
 
@@ -104,9 +112,12 @@ If authentication succeeds but the chat call still fails, double-check step 3 �
 
 ## Privacy & data handling
 
+**See [SECURITY.md](SECURITY.md) for the full picture** — recommended team deployment model (one instance per engineer, not a shared server), exactly what data leaves the machine and when, the redaction feature and its limitations, a provider risk ordering, retention guidance, and an explicit list of what this tool does *not* provide (encryption at rest, audit logging, RBAC, DLP, formal compliance certification).
+
+Summary:
 - The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0`, which isn't recommended given what these bundles contain.
 - Uploaded archives and their extracted contents/analysis output are kept under `backend/data/jobs/<job_id>/` for the lifetime of the server process. Delete a job's data any time via the API (`DELETE /api/jobs/{id}`) or just delete the folder; nothing is auto-uploaded anywhere.
-- The AI synthesis step sends the **evidence digest** (system/cluster names, log excerpts, IPs, timestamps, etc. — not the raw uploaded archive) to whichever provider you pick. Use **Ollama** if the bundle must never leave the machine.
+- The AI synthesis step sends the **evidence digest** (system/cluster names, log excerpts, IPs, timestamps, etc. — not the raw uploaded archive) to whichever provider you pick, with known hostnames/IPs redacted by default for non-local providers. Use **Ollama** (the default) if the bundle must never leave the machine.
 - The frontend has zero external/CDN dependencies (including its own small Markdown renderer, and the Microsoft logo mark which is drawn as an inline SVG) so the UI itself works with no internet access — only the AI synthesis step (for non-Ollama providers) and the optional "Check available models" call need connectivity.
 
 ## Architecture
@@ -115,9 +126,10 @@ If authentication succeeds but the chat call still fails, double-check step 3 �
 ldi-copilot/
 ├── run.ps1                    # one-command launcher (venv + deps + server)
 ├── CHANGELOG.md
+├── SECURITY.md                 # data-handling / confidentiality guidance - read before team rollout
 ├── backend/
 │   ├── app.py                 # FastAPI server: job management, REST API, static file serving,
-│   │                          # /api/models live-availability endpoint
+│   │                          # /api/models live-availability endpoint, /api/ollama/* lifecycle
 │   ├── requirements.txt
 │   ├── engine/
 │   │   └── analyzer_core.py   # mechanical scanning engine (extraction, detection, pattern
@@ -128,23 +140,27 @@ ldi-copilot/
 │   │   ├── providers.py       # OpenAI / Anthropic / Azure OpenAI (API key + Entra ID) /
 │   │   │                      # Ollama streaming clients, known_models registry, and
 │   │   │                      # list_models() live-availability checks
-│   │   └── prompts.py         # focus-aware RCA synthesis system prompt + evidence-digest user prompt
+│   │   ├── prompts.py         # focus-aware RCA synthesis system prompt + evidence-digest user prompt
+│   │   ├── redaction.py       # hostname/IPv4 redaction for non-local providers, with a
+│   │   │                      # local-only legend
+│   │   └── ollama_manager.py  # starts/stops/monitors a local `ollama serve` process on demand
 │   └── data/jobs/<id>/         # per-analysis uploaded file + extracted tree + output (gitignored)
 ├── frontend/
 │   ├── index.html             # persistent top-level tabs (Provide Bundle/Analyzing/Results),
-│   │                          # focus+AI config panel permanently inlined in tab 1, right-side
-│   │                          # activity terminal, bottom-right Microsoft logo watermark
+│   │                          # focus+AI config panel permanently inlined in tab 1, full-height
+│   │                          # right-edge activity terminal with Ollama toolbar, bottom-right
+│   │                          # Microsoft logo+text watermark
 │   ├── app.js                 # upload, polling, rendering, SSE streaming, tiny MD renderer,
 │   │                          # top-level tab switching, auth-type-aware AI config, model
 │   │                          # dropdown + availability checks, activity-terminal logging,
-│   │                          # auto-chained synthesis
+│   │                          # Ollama start/stop/status polling, auto-chained synthesis
 │   └── styles.css
 └── samples/                    # synthetic test fixtures (fake_sosreport, fake_supportconfig,
                                  # fake_crm_report, fake_crm_report_multi) - safe, fictional
                                  # data for trying the app
 ```
 
-**Request flow:** browser uploads a bundle (+ optional focus text + optional AI config incl. auth type, all collected in tab 1) → FastAPI saves it and starts a background thread running `run_analysis(..., focus=...)` → browser polls job status (mirroring new progress lines into the activity terminal as they arrive), tab auto-advances to "2. Analyzing" → once done, browser fetches the digest/findings/facts/timeline JSON, tab auto-advances to "3. Results" and renders the dashboard, opening on the AI Root Cause Report tab → if AI settings were filled in, the browser automatically POSTs the provider credentials (+ auth type) + focus text + the job's digest to `/api/jobs/{id}/synthesize`, which (for Entra ID) first exchanges the tenant/client/secret for a bearer token, then streams the model's response back via Server-Sent Events. The focus+AI panel never moves in the DOM — the Results tab's "Edit focus & AI settings" button just switches the active top-level tab back to it, so a second analysis from tab 1 always finds its fields intact.
+**Request flow:** browser uploads a bundle (+ optional focus text + optional AI config incl. auth type, all collected in tab 1) → FastAPI saves it and starts a background thread running `run_analysis(..., focus=...)` → browser polls job status (mirroring new progress lines into the activity terminal as they arrive), tab auto-advances to "2. Analyzing" → once done, browser fetches the digest/findings/facts/timeline JSON, tab auto-advances to "3. Results" and renders the dashboard, opening on the AI Root Cause Report tab → if AI settings were filled in, the browser automatically POSTs the provider credentials (+ auth type, + redact flag) + focus text + the job's digest to `/api/jobs/{id}/synthesize` (first calling `/api/ollama/start` and polling `/api/ollama/status` if Ollama was selected and isn't already running) → the endpoint redacts known hostnames/IPs from the digest first if the provider isn't local, emits a local-only redaction-legend SSE event, and (for Entra ID) exchanges the tenant/client/secret for a bearer token before streaming the model's response back via Server-Sent Events. The focus+AI panel never moves in the DOM — the Results tab's "Edit focus & AI settings" button just switches the active top-level tab back to it, so a second analysis from tab 1 always finds its fields intact.
 
 ## Focused analysis
 
@@ -168,5 +184,6 @@ Detects the crmsh `crm report` layout (`analysis.txt`, `cib.xml`, `members.txt`,
 - This is heuristic pattern-matching plus structured fact-checks, not a certified rules engine (e.g. Red Hat Insights, SUSE's SCA tool). Treat the digest as a strong evidence base for the AI/human review step, not an infallible verdict.
 - Focus-keyword matching is intentionally literal/simple; it cannot make causal leaps between differently-worded evidence on its own (that's the AI synthesis step's job) — if the Focused Findings section looks sparse, check the AI report and the full Digest/Timeline before concluding there's no relevant evidence.
 - Microsoft Entra ID auth requires network access to `login.microsoftonline.com` and your Azure OpenAI endpoint; it is not usable fully offline the way Ollama is.
-- Single-user, single-machine tool: job state is in-memory and does not survive a server restart (uploaded files/analysis output on disk do persist under `backend/data/jobs/` until deleted).
+- The redaction feature is a best-effort mitigation, not a guarantee — it only catches known hostnames (from this analysis's own facts) and IPv4 addresses. It does not find customer/company names in free text, usernames, IPv6 addresses, or other identifiers. See [SECURITY.md](SECURITY.md) for the full picture.
+- Single-user, single-machine tool: job state is in-memory and does not survive a server restart (uploaded files/analysis output on disk do persist under `backend/data/jobs/` until deleted). Not designed to be deployed as a shared, centrally-reachable server for a team — see [SECURITY.md](SECURITY.md) for the recommended one-instance-per-engineer model.
 - No authentication on the local server itself — appropriate for local personal use; do not expose this server beyond localhost.

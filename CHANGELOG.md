@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-07-13
+
+### Added
+- **Ollama auto-start**: clicking "Generate root-cause report" with Ollama selected now automatically starts `ollama serve` if it isn't already running, streaming its startup log into the activity terminal. The terminal's header also gained a toolbar with an Ollama status badge and manual **Start**/**Stop**/**⟳ Refresh** buttons. `backend/ai/ollama_manager.py` (new) never spawns a duplicate instance if Ollama is already reachable (e.g. via the Ollama desktop app), and Stop only ever terminates a process this app itself spawned - it will never touch an externally-managed instance. New endpoints: `POST /api/ollama/start`, `POST /api/ollama/stop`, `GET /api/ollama/status`.
+- **Sensitive-data redaction for non-local providers**: whenever a non-Ollama provider is selected, the evidence digest has its known hostnames/node names (from this analysis's own facts) and IPv4 addresses replaced with stable, meaningless tokens (`HOST-1`, `IP-1`, …) before being sent externally. A local-only "legend" mapping tokens back to real values is logged to the activity terminal - this mapping is never part of the outbound request. Controlled by a new "🔒 Redact known hostnames & IP addresses before sending" checkbox (checked by default), implemented in `backend/ai/redaction.py` (new) and wired through a new optional `redact` field on `POST /api/jobs/{id}/synthesize` (default `true`).
+- **Explicit external-send confirmation gate**: a required "I confirm I'm authorized to share this bundle's data with an external AI provider" checkbox must be checked before generating a report with any non-local provider - enforced at click-time, not just as a passive warning.
+- **`SECURITY.md`**: new document covering the recommended one-instance-per-engineer deployment model for team rollout, exactly what data leaves the machine and when, the redaction feature's guarantees and limitations, a provider risk ordering (Ollama > org-governed Azure OpenAI via Entra ID > public consumer APIs), retention/cleanup guidance, and an explicit list of what this tool does not provide (encryption at rest, audit logging, RBAC, DLP, compliance certification).
+
+### Changed
+- **Ollama is now the default AI provider** - selected automatically when no saved settings exist, and listed first in the provider dropdown. It remains the only fully-offline option and requires no credentials.
+- **Layout widened**: the main content panel is noticeably wider, and the activity terminal now docks flush along the *entire* right edge of the viewport (full height, no floating-card margin or rounded outer corners) instead of a smaller floating sidebar card.
+
 ## [2.1.1] - 2026-07-13
 
 ### Changed
@@ -67,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[2.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.2.0
 [2.1.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.1.1
 [2.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.1.0
 [2.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.0.0

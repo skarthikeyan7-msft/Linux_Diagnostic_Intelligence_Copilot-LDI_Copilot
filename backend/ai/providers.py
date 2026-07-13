@@ -281,6 +281,18 @@ KNOWN_MODELS = {
 }
 
 PROVIDERS = {
+    "ollama": {
+        "label": "Ollama (local, fully offline) — recommended default",
+        "auth_types": {
+            "none": {"label": "None (local)", "fields": ["model", "base_url"]},
+        },
+        "default_auth_type": "none",
+        "default_model": "llama3.1",
+        "model_hint": "any model you've pulled locally, e.g. llama3.1, qwen2.5, mistral",
+        "known_models": KNOWN_MODELS["ollama"],
+        "default_base_url": "http://localhost:11434",
+        "local": True,
+    },
     "openai": {
         "label": "OpenAI",
         "auth_types": {
@@ -319,18 +331,6 @@ PROVIDERS = {
         "default_model": "",
         "model_hint": "your Azure OpenAI deployment name (not the base model name)",
         "local": False,
-    },
-    "ollama": {
-        "label": "Ollama (local, fully offline)",
-        "auth_types": {
-            "none": {"label": "None (local)", "fields": ["model", "base_url"]},
-        },
-        "default_auth_type": "none",
-        "default_model": "llama3.1",
-        "model_hint": "any model you've pulled locally, e.g. llama3.1, qwen2.5, mistral",
-        "known_models": KNOWN_MODELS["ollama"],
-        "default_base_url": "http://localhost:11434",
-        "local": True,
     },
 }
 

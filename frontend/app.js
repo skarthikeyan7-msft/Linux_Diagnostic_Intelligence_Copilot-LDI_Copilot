@@ -15,6 +15,8 @@ const state = {
   analyzing: false,  // true while a job is in flight; drives the Analyzing tab's placeholder vs. progress log
   activeMainTab: "upload",
   terminalProgressCount: 0, // number of progress lines already mirrored into the activity terminal for the current job
+  ollamaLogCount: 0,        // same idea, for Ollama's own subprocess log lines
+  ollamaPollTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -196,6 +198,116 @@ function initTerminal() {
     $("terminalBody").innerHTML = "";
     logTerminal("Terminal cleared.", "info");
   });
+}
+
+// --------------------------------------------------------------------------
+// Ollama lifecycle control - the terminal's toolbar (status badge +
+// Start/Stop/Refresh) gives direct manual control, and runSynthesis()
+// calls ensureOllamaRunning() automatically whenever Ollama is the
+// selected provider, so clicking "Generate root-cause report" starts
+// Ollama on demand if it isn't already up - no separate manual step
+// needed. See backend/ai/ollama_manager.py for the server-side design
+// (never spawns a duplicate instance; only stops one it started itself).
+// --------------------------------------------------------------------------
+function renderOllamaBadge(status) {
+  const badge = $("ollamaStatusBadge");
+  const labels = {
+    unknown: "🦙 Ollama: checking…",
+    stopped: "🦙 Ollama: stopped",
+    starting: "🦙 Ollama: starting…",
+    running: "🦙 Ollama: running",
+    error: "🦙 Ollama: error",
+  };
+  const cls = status ? status.status : "unknown";
+  badge.className = `ollama-status-badge status-${cls}`;
+  badge.textContent = labels[cls] || labels.unknown;
+  badge.title = status && status.error ? status.error : "";
+  $("btnStopOllama").disabled = !(status && status.managed);
+}
+
+function mirrorOllamaLogs(status) {
+  if (!status || !status.log_lines) return;
+  if (status.log_lines.length > state.ollamaLogCount) {
+    status.log_lines.slice(state.ollamaLogCount).forEach((line) => logTerminal(`🦙 ${line}`, "info"));
+    state.ollamaLogCount = status.log_lines.length;
+  }
+}
+
+async function fetchOllamaStatus() {
+  const resp = await fetch("/api/ollama/status");
+  return resp.json();
+}
+
+async function refreshOllamaStatus() {
+  const status = await fetchOllamaStatus();
+  renderOllamaBadge(status);
+  mirrorOllamaLogs(status);
+  return status;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Used both by the manual "Start" button and automatically from
+// runSynthesis() when Ollama is the selected provider. Resolves once
+// Ollama is confirmed reachable; rejects with a human-readable message
+// if it fails to start or times out - callers must not proceed to an
+// actual synthesis call in that case.
+async function ensureOllamaRunning() {
+  let status = await refreshOllamaStatus();
+  if (status.status === "running") return status;
+
+  logTerminal("🦙 Ollama isn't running yet — starting it now…", "info");
+  await fetch("/api/ollama/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+
+  const deadline = Date.now() + 65000; // a little past the backend's own ~60s readiness ceiling
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    status = await refreshOllamaStatus();
+    if (status.status === "running") return status;
+    if (status.status === "error") throw new Error(status.error || "Ollama failed to start.");
+  }
+  throw new Error("Timed out waiting for Ollama to start.");
+}
+
+async function startOllama() {
+  $("btnStartOllama").disabled = true;
+  try {
+    await ensureOllamaRunning();
+    logTerminal("✅ Ollama is running.", "success");
+  } catch (err) {
+    logTerminal(`❌ ${err.message}`, "error");
+  } finally {
+    $("btnStartOllama").disabled = false;
+  }
+}
+
+async function stopOllama() {
+  $("btnStopOllama").disabled = true;
+  try {
+    const resp = await fetch("/api/ollama/stop", { method: "POST" });
+    const result = await resp.json();
+    if (result.stopped) {
+      logTerminal("🛑 Ollama stopped.", "success");
+    } else {
+      logTerminal(`ℹ️ ${result.reason || "Ollama was not stopped."}`, "warn");
+    }
+  } catch (err) {
+    logTerminal(`⚠ Failed to stop Ollama: ${err.message}`, "warn");
+  }
+  await refreshOllamaStatus();
+}
+
+function initOllamaControls() {
+  $("btnStartOllama").addEventListener("click", startOllama);
+  $("btnStopOllama").addEventListener("click", stopOllama);
+  $("btnRefreshOllama").addEventListener("click", refreshOllamaStatus);
+  refreshOllamaStatus();
+  // Light periodic refresh so the badge/log stay accurate even if the
+  // user starts/stops Ollama from outside this app (e.g. the desktop
+  // tray icon) while this page is open.
+  state.ollamaPollTimer = setInterval(refreshOllamaStatus, 15000);
 }
 
 // --------------------------------------------------------------------------
@@ -586,8 +698,24 @@ async function initAiProviders() {
   state.savedAiSettings = loadAiSettings();
   if (state.savedAiSettings && state.savedAiSettings.provider && state.providers[state.savedAiSettings.provider]) {
     sel.value = state.savedAiSettings.provider;
+  } else if (state.providers.ollama) {
+    // Ollama is the recommended default: fully offline, safest choice
+    // for customer diagnostic data, and nothing to configure besides
+    // picking a model - explicit rather than relying on dict/option
+    // order alone.
+    sel.value = "ollama";
   }
   renderAuthTypeSelector(sel.value);
+}
+
+function updateConfidentialityUI(providerKey) {
+  const p = state.providers[providerKey];
+  const isLocal = !!(p && p.local);
+  $("confidentialityPanel").classList.toggle("hidden", isLocal);
+  $("ollamaPrivacyNote").classList.toggle("hidden", !isLocal);
+  if (!isLocal && p) {
+    $("confidentialityProviderName").textContent = p.label.replace(/\s*—.*$/, "");
+  }
 }
 
 function fieldLabel(field) {
@@ -615,6 +743,7 @@ function renderAuthTypeSelector(providerKey) {
   $("authTypeRow").classList.toggle("hidden", authTypes.length <= 1);
   const wanted = (saved && saved.provider === providerKey && saved.auth_type) || p.default_auth_type;
   if (authTypes.some(([key]) => key === wanted)) sel.value = wanted;
+  updateConfidentialityUI(providerKey);
   renderAiFields(providerKey, sel.value);
 }
 
@@ -777,6 +906,7 @@ function collectAiPayload() {
     auth_type: authType,
     extra_context: $("aiExtraContext").value,
     focus_text: $("focusInput") ? $("focusInput").value.trim() : "",
+    redact: $("aiRedact").checked,
   };
   const missing = [];
   if (!p) {
@@ -794,10 +924,17 @@ function collectAiPayload() {
 
 async function runSynthesis() {
   const { payload, missing } = collectAiPayload();
+  const provider = state.providers[payload.provider];
+  const isLocal = !!(provider && provider.local);
 
   $("aiError").classList.add("hidden");
   if (missing.length) {
     $("aiError").textContent = `Missing required field(s): ${missing.join(", ")}`;
+    $("aiError").classList.remove("hidden");
+    return;
+  }
+  if (!isLocal && !$("aiConfirmExternal").checked) {
+    $("aiError").textContent = "Please check \"I confirm I'm authorized to share this bundle's data with an external AI provider\" above before generating with a non-local provider.";
     $("aiError").classList.remove("hidden");
     return;
   }
@@ -807,6 +944,19 @@ async function runSynthesis() {
   $("btnSynthesize").textContent = "Generating…";
   $("aiRender").innerHTML = '<p class="muted">Waiting for the model to respond…</p>';
   $("btnDownloadReport").classList.add("hidden");
+
+  if (payload.provider === "ollama") {
+    try {
+      await ensureOllamaRunning();
+    } catch (err) {
+      $("aiError").textContent = `Ollama startup failed: ${err.message}`;
+      $("aiError").classList.remove("hidden");
+      logTerminal(`❌ Ollama startup failed: ${err.message}`, "error");
+      $("btnSynthesize").disabled = false;
+      $("btnSynthesize").textContent = "Generate root-cause report";
+      return;
+    }
+  }
 
   const providerLabel = (state.providers[payload.provider] || {}).label || payload.provider;
   const authCfg = ((state.providers[payload.provider] || {}).auth_types || {})[payload.auth_type];
@@ -837,6 +987,9 @@ async function runSynthesis() {
         if (!line.startsWith("data:")) continue;
         const parsed = JSON.parse(line.slice(5).trim());
         if (parsed.error) throw new Error(parsed.error);
+        if (parsed.redaction) {
+          logTerminal(`🔒 ${parsed.redaction.summary}`, "info");
+        }
         if (parsed.delta) {
           accumulated += parsed.delta;
           $("aiRender").innerHTML = markdownToHtml(accumulated);
@@ -916,6 +1069,7 @@ function resetToUpload() {
 
 document.addEventListener("DOMContentLoaded", () => {
   initTerminal();
+  initOllamaControls();
   initDropzone();
   initScopeToggle();
   initTabs();

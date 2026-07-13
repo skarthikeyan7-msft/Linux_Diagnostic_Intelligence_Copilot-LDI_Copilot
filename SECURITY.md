@@ -1,0 +1,75 @@
+# Security & confidential customer data handling
+
+LDI Copilot is built to analyze real customer Linux VM diagnostics (sosreport, supportconfig, crm_report/hb_report) — bundles that routinely contain hostnames, internal IPs, usernames, and sometimes application-specific data. This document describes, honestly and specifically, what the tool technically does and does not do with that data, so you can make an informed decision about using it for customer work and about sharing it with your team.
+
+> **This is not a compliance attestation.** It describes technical behavior only. Before using this tool with customer data at team scale, confirm with your own organization's data-governance, privacy, and compliance contacts that this usage pattern is acceptable for the customer engagements you support. Nothing here should be read as a claim that this tool satisfies any specific regulatory framework, certification, or internal Microsoft policy.
+
+## Recommended deployment model: one instance per engineer
+
+**LDI Copilot is a single-user, localhost-only tool by design** — not a shared, centrally-hosted service:
+- The server binds to `127.0.0.1` by default; nothing on your network can reach it unless you explicitly pass `--host 0.0.0.0` (or `.\run.ps1 -HostAddress 0.0.0.0`), which is **strongly discouraged** for exactly this reason.
+- Job state (uploaded bundles, extracted files, analysis output) lives in-memory and under `backend/data/jobs/<id>/` **on the machine running the server** — there is no shared database, no multi-tenant job store, and no user accounts.
+
+**The recommended way to roll this out to your entire CSS team is for each engineer to clone the repo and run their own local instance on their own machine** (`.\run.ps1`), the same way they'd run a local dev tool. This means:
+- No single point of failure or single repository of customer bundles across the team.
+- No new network-accessible attack surface — each instance is exactly as exposed as the engineer's own laptop already is.
+- No additional authentication/authorization system needs to be built or trusted, because there isn't a shared service to authenticate against.
+
+Do **not** deploy this as a shared server reachable by the team over a network. That would turn a "run it on your own machine" tool into an unauthenticated multi-tenant service holding multiple customers' diagnostic data — a fundamentally different (and much riskier) architecture that this codebase was not built for.
+
+## What data leaves the machine, and when
+
+Nothing leaves the machine **except** the evidence digest sent to an AI provider for root-cause synthesis, and only when you explicitly click "Generate root-cause report" (or it auto-runs because you pre-filled AI settings before starting analysis):
+
+- **Ollama (local, fully offline) — the default provider as of v2.2.0.** The model runs on your own machine; the evidence digest never leaves it. If Ollama isn't already running, LDI Copilot starts it for you (`ollama serve`), visible in the activity terminal.
+- **OpenAI / Anthropic / Azure OpenAI** — the evidence digest (not the raw uploaded archive) is sent to that provider's API over HTTPS, for that one request. Credentials are used only for that request and are never written to disk unless you explicitly opt in to "Remember these settings on this device" (browser `localStorage` only).
+
+The raw uploaded archive itself is **never** sent anywhere — only the mechanically-produced Markdown digest (pattern-matched findings, structured fact-checks, a chronological timeline) is ever transmitted, and only to the provider you explicitly chose.
+
+## Redaction: reducing exposure even when using a public AI model
+
+As of v2.2.0, whenever a **non-local** provider is selected, LDI Copilot automatically redacts the evidence digest before sending it:
+- **Known hostnames/node names** (pulled from this analysis's own facts — e.g. the sosreport/supportconfig's captured hostname, or crm_report's detected cluster node names) are replaced with stable tokens (`HOST-1`, `HOST-2`, …).
+- **IPv4 addresses** are replaced with stable tokens (`IP-1`, `IP-2`, …), consistently per unique address, so the AI can still reason about repetition (e.g. "the same node appears in three unrelated log lines") without ever seeing the real identifier.
+- A **local-only legend** mapping each token back to its real value is shown in the activity terminal — this mapping is generated *after* redaction and is never part of the outbound request.
+- The checkbox controlling this ("🔒 Redact known hostnames & IP addresses before sending") is **checked by default** whenever a non-local provider is selected, and hidden entirely for Ollama (nothing to redact — nothing leaves the machine).
+
+**Limitations — read before relying on this for genuinely sensitive engagements:**
+- This is a **best-effort mitigation, not a guarantee**. It only catches the two most mechanically reliable categories (known hostnames from this analysis's own facts, and IPv4 addresses). It does **not** find or redact: customer/company names mentioned in free text, usernames, email addresses, application-specific identifiers, IPv6 addresses, MAC addresses, file paths containing customer names, or anything else that isn't one of the two categories above.
+- If a bundle is sensitive enough that *any* residual identifying detail reaching a public AI provider would be unacceptable, **use Ollama** (fully offline) instead of relying on redaction with a cloud provider.
+
+## An explicit confirmation gate before any external send
+
+Before generating a report with any non-local provider, you must check **"I confirm I'm authorized to share this bundle's data with an external AI provider"** — this is enforced at generate-time (not just as a passive warning), so sending data externally is always a deliberate, acknowledged action rather than an accidental default.
+
+## Provider risk ordering (least to most exposure)
+
+1. **Ollama (local, fully offline)** — nothing leaves the machine. The default provider as of v2.2.0. Best choice for any bundle you're not fully comfortable sending to a third party.
+2. **Azure OpenAI via Microsoft Entra ID, using your organization's own Azure tenant/subscription** — data is processed within your org's own governed Azure environment rather than a public consumer API. If your organization already has an approved Azure OpenAI deployment for handling customer-derived data, this is generally a better fit for CSS work than a personal API key with a public provider.
+3. **OpenAI / Anthropic public consumer APIs, or Azure OpenAI via a personal API key** — treat these as "public AI model" in every sense: only use them for customer data if your organization has explicitly cleared that practice, and use the redaction toggle every time.
+
+This ordering reflects data-locality and organizational-governance properties only — it is not a statement about model quality or accuracy for RCA purposes.
+
+## Retention and cleanup
+
+- Uploaded archives and analysis output persist under `backend/data/jobs/<job_id>/` for the lifetime of the server process (and on disk after that, until deleted).
+- Delete a specific job's data any time via `DELETE /api/jobs/{id}` (or by deleting its folder directly).
+- Recommended practice for customer engagements: delete a job's data once you've captured what you need from the report, rather than accumulating a long-lived local archive of customer bundles.
+- Job metadata (which bundles were analyzed, when) is in-memory only and does not survive a server restart; the underlying files on disk are unaffected by a restart and must be cleaned up separately.
+
+## Sharing this repository with your team
+
+The GitHub repository itself is private. To share it with your CSS team:
+- Add teammates as collaborators (or, for larger rollouts, transfer/mirror it into a team-owned GitHub organization with its own access controls) via the repository's **Settings → Collaborators and teams**.
+- Each teammate then clones the repo and runs their **own** local instance (`.\run.ps1`) — see "Recommended deployment model" above. Nothing about cloning the repo shares any customer data; customer bundles and analysis output are never committed to the repository (`backend/data/` is gitignored) and should stay that way.
+
+## What this tool does **not** provide
+
+Be clear-eyed about the gaps before treating this as a complete solution for handling regulated or highly sensitive customer data:
+- No encryption at rest for uploaded bundles or analysis output on disk.
+- No audit logging of who analyzed what, when.
+- No role-based access control, authentication, or multi-user support (by design — see "Recommended deployment model").
+- No data-loss-prevention (DLP) scanning beyond the hostname/IP redaction described above.
+- No formal compliance certification of any kind.
+
+If your team's work requires any of the above, treat this tool as a productivity aid layered on top of your organization's existing data-handling controls and policies — not a replacement for them.

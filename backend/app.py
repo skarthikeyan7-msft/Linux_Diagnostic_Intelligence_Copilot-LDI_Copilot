@@ -35,14 +35,17 @@ from fastapi.staticfiles import StaticFiles
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # allow `import engine`, `import ai` when run directly
 
 from engine import run_analysis, AnalysisError
-from ai import PROVIDERS, stream_chat, ProviderError, build_messages, list_models
+from ai import (
+    PROVIDERS, stream_chat, ProviderError, build_messages, list_models,
+    collect_known_hostnames, redact_text, build_redaction_summary, ollama_manager,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="2.1.1")
+app = FastAPI(title="LDI Copilot", version="2.2.0")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -291,7 +294,15 @@ async def synthesize(job_id: str, payload: dict):
     text supplied at analysis time (Step 1) is reused automatically, so
     the AI report stays steered around the same question the mechanical
     scan was steered around. Credentials are used only for this one
-    request and are never written to disk or to the job store."""
+    request and are never written to disk or to the job store.
+
+    `redact` (bool, default True) - when the selected provider is not
+    local (i.e. not Ollama), the evidence digest has its known
+    hostnames/node names and IPv4 addresses replaced with stable,
+    meaningless tokens (HOST-1, IP-1, ...) before it's sent externally.
+    A "legend" SSE event is emitted first (local-only - this mapping is
+    never part of the outbound request) so the browser can show what
+    was redacted."""
     job = _get_job_or_404(job_id)
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail=f"job status is {job['status']}, not done yet")
@@ -311,13 +322,23 @@ async def synthesize(job_id: str, payload: dict):
     focus_text = payload.get("focus_text")
     if focus_text is None:
         focus_text = job.get("focus_text")
+
+    digest_markdown = job["result"]["digest_markdown"]
+    redact_legend = []
+    should_redact = bool(payload.get("redact", True)) and not provider_cfg.get("local")
+    if should_redact:
+        hostnames = collect_known_hostnames(job["result"].get("facts") or {})
+        digest_markdown, redact_legend = redact_text(digest_markdown, hostnames)
+
     messages = build_messages(
-        job["result"]["kind"], job["result"]["digest_markdown"],
+        job["result"]["kind"], digest_markdown,
         extra_context=payload.get("extra_context"), focus_text=focus_text,
     )
-    provider_kwargs = {k: v for k, v in payload.items() if k not in ("provider", "extra_context", "focus_text")}
+    provider_kwargs = {k: v for k, v in payload.items() if k not in ("provider", "extra_context", "focus_text", "redact")}
 
     def event_stream():
+        if should_redact:
+            yield f"data: {json.dumps({'redaction': {'summary': build_redaction_summary(redact_legend), 'legend': redact_legend}})}\n\n"
         accumulated = []
         try:
             for chunk in stream_chat(provider, messages, **provider_kwargs):
@@ -332,6 +353,30 @@ async def synthesize(job_id: str, payload: dict):
             yield f"data: {json.dumps({'done': True})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------------
+# API: Ollama lifecycle control - lets "Generate root-cause report" (or the
+# activity terminal's toolbar) start a local `ollama serve` process on
+# demand instead of requiring the user to remember to start it themselves
+# first. See backend/ai/ollama_manager.py for the full design notes -
+# in short: never spawns a duplicate if Ollama is already reachable, and
+# will only ever stop a process this app itself spawned.
+# --------------------------------------------------------------------------
+@app.post("/api/ollama/start")
+def start_ollama_endpoint(payload: dict = None):
+    base_url = (payload or {}).get("base_url") or "http://localhost:11434"
+    return ollama_manager.start_ollama(base_url)
+
+
+@app.post("/api/ollama/stop")
+def stop_ollama_endpoint():
+    return ollama_manager.stop_ollama()
+
+
+@app.get("/api/ollama/status")
+def ollama_status_endpoint():
+    return ollama_manager.get_ollama_status()
 
 
 @app.get("/api/jobs/{job_id}/ai_report")
