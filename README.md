@@ -1,4 +1,4 @@
-# LDI Copilot — Linux Diagnostic Intelligence Copilot
+# Linux Diagnostic Intelligence Copilot - LDI Copilot
 
 [![Version](https://img.shields.io/badge/version-2.0.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
