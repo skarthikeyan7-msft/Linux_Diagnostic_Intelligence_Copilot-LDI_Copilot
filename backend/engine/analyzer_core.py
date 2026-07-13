@@ -58,7 +58,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -389,6 +389,93 @@ HEX_RE = re.compile(r"0x[0-9a-fA-F]+")
 PID_RE = re.compile(r"\[\d+\]")
 DF_LINE_RE = re.compile(r"^(?P<fs>\S+)\s+(?P<blocks>\d+)\s+(?P<used>\d+)\s+(?P<avail>\d+)\s+(?P<pct>\d+)%\s+(?P<mount>.+)$")
 FAILED_UNIT_RE = re.compile(r"^(?P<unit>\S+\.(?:service|socket|timer|mount|path))\s+\S+\s+failed\s+failed", re.IGNORECASE)
+
+# --------------------------------------------------------------------------
+# Focused-analysis support: a support engineer can describe what they're
+# actually investigating (e.g. "find root cause of NC and IP cluster
+# resource restart issue") and have the mechanical scan surface a
+# dedicated section of matching evidence, ahead of the full exhaustive
+# scan - instead of every finding being weighted purely by severity
+# regardless of relevance to the question actually being asked.
+# --------------------------------------------------------------------------
+FOCUS_STOPWORDS = {
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "to", "of", "in",
+    "on", "at", "by", "for", "and", "or", "but", "not", "this", "that", "these", "those",
+    "it", "its", "with", "from", "as", "if", "so", "no", "do", "does", "did", "doing",
+    "we", "us", "i", "you", "your", "our", "me", "my", "find", "finding", "root", "cause",
+    "causes", "issue", "issues", "problem", "problems", "problematic", "analysis",
+    "analyze", "analyse", "please", "help", "investigate", "investigating",
+    "investigation", "focus", "focused", "related", "about", "why", "what", "when",
+    "where", "how", "happening", "happened", "happens", "occur", "occurs", "occurred",
+    "occurring", "restart", "restarts", "restarting", "restarted", "cluster", "resource",
+    "resources", "log", "logs", "report", "reports", "see", "check", "checking",
+    "looking", "look", "need", "want", "would", "like", "also", "just", "only", "seems",
+}
+FOCUS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]*")
+FOCUS_QUOTED_RE = re.compile(r'"([^"]+)"|\'([^\']+)\'')
+
+
+def extract_focus_keywords(focus_text):
+    """Turn a free-text investigation focus (e.g. "find root cause of NC
+    and IP cluster resource restart issue") into a list of keywords used
+    to identify relevant findings. Deliberately inclusive: a keyword
+    that's too broad just highlights a finding that didn't strictly need
+    it; a keyword that's missing silently drops exactly the thing the
+    engineer asked about, which is the worse failure mode. Short
+    all-caps-style tokens (NC, IP, DC, HA...) are exactly the kind of
+    resource/subsystem identifiers a support engineer would use, so
+    length alone is not a filter - only a stopword list is."""
+    if not focus_text or not focus_text.strip():
+        return []
+    text = focus_text.strip()
+    keywords = set()
+    for m in FOCUS_QUOTED_RE.finditer(text):
+        kw = (m.group(1) or m.group(2)).strip().lower()
+        if kw:
+            keywords.add(kw)
+    for tok in FOCUS_TOKEN_RE.findall(text):
+        low = tok.lower()
+        if low in FOCUS_STOPWORDS or len(low) < 2:
+            continue
+        keywords.add(low)
+    return sorted(keywords)
+
+
+def compile_focus_patterns(keywords):
+    # A plain \b...\b boundary treats underscore as a "word" character,
+    # so it fails to match e.g. "ip" inside the extremely common
+    # Pacemaker/crm resource-naming convention "rsc_ip_cluster". Real
+    # support bundles name resources with underscores/hyphens joining
+    # short identifiers (rsc_ip_cluster, rsc-nc-share, rsc_st_azure...),
+    # so treat underscore and hyphen as separators too: only require
+    # that the character immediately before/after the keyword isn't
+    # itself alphanumeric.
+    return [
+        re.compile(r"(?<![A-Za-z0-9])" + re.escape(kw) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+        for kw in keywords
+    ]
+
+
+def _finding_focus_haystack(finding):
+    parts = [finding.get("message", ""), finding.get("category", ""), finding.get("pattern", "")]
+    for ex in finding.get("examples", []):
+        parts.append(ex.get("file", ""))
+        parts.append(ex.get("text", ""))
+    return " ".join(parts)
+
+
+def finding_matches_focus(finding, focus_patterns):
+    if not focus_patterns:
+        return False
+    haystack = _finding_focus_haystack(finding)
+    return any(p.search(haystack) for p in focus_patterns)
+
+
+def event_matches_focus(event, focus_patterns):
+    if not focus_patterns:
+        return False
+    haystack = f"{event.get('text', '')} {event.get('file', '')} {event.get('category', '')}"
+    return any(p.search(haystack) for p in focus_patterns)
 
 
 # --------------------------------------------------------------------------
@@ -1165,6 +1252,29 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
     lines.append(f"- **Analysis duration:** {elapsed:.1f}s")
     lines.append("")
 
+    focus_text = getattr(args, "focus_text", None)
+    focus_keywords = getattr(args, "focus_keywords", None) or []
+    if focus_text:
+        lines.append("## 🎯 Focused Findings — matching your investigation")
+        lines.append(f'> You asked this analysis to focus on: "{focus_text}"')
+        if focus_keywords:
+            lines.append(f"> Keywords derived from this focus: {', '.join(f'`{k}`' for k in focus_keywords)}")
+        lines.append("")
+        matching = [f for f in findings_list if f.get("focus_match")]
+        if matching:
+            matching_sorted = sorted(matching, key=lambda f: (-SEVERITY_RANK[f["severity"]], -f["count"]))
+            for f in matching_sorted[:40]:
+                lines.append(f"- **[{f['severity']}]** ({f['count']}x) [{f['category']}] {f['message']}")
+                for ex in f["examples"][:2]:
+                    lines.append(f"  - `{ex['file']}:{ex['line']}`")
+            if len(matching) > 40:
+                lines.append(f"- _(+{len(matching) - 40} more focus-matching findings — see findings.json, filter on \"focus_match\": true)_")
+            lines.append("")
+            lines.append(f"_{len(matching)} of {len(findings_list)} total findings matched your stated focus. Every finding is still listed in full below under \"Findings by Category\" for completeness — matches are marked with 🎯 there too._")
+        else:
+            lines.append("_No findings directly matched keywords derived from your focus text. This could mean: (a) the issue you're investigating didn't trip any of the engine's pattern rules, (b) it's described differently in the source logs than your wording, or (c) it needs detail this evidence digest doesn't fully capture. Check `inventory.json` for relevant files and open them directly, or try re-phrasing the focus with more specific resource/host names._")
+        lines.append("")
+
     if stats.get("window_active"):
         lines.append("## Time Window Filter")
         ws = args.start_dt.isoformat() if args.start_dt else "(no lower bound)"
@@ -1260,7 +1370,8 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
         sev_summary = ", ".join(f"{n} {s}" for s, n in sorted(sev_counts.items(), key=lambda kv: -SEVERITY_RANK[kv[0]]))
         lines.append(f"### {cat}  ({sev_summary})")
         for f in cat_findings[: args.top_per_category]:
-            lines.append(f"- **[{f['severity']}]** ({f['count']}x) {f['message']}")
+            marker = "🎯 " if f.get("focus_match") else ""
+            lines.append(f"- {marker}**[{f['severity']}]** ({f['count']}x) {f['message']}")
             for ex in f["examples"][:2]:
                 lines.append(f"  - `{ex['file']}:{ex['line']}`")
         if len(cat_findings) > args.top_per_category:
@@ -1280,7 +1391,8 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
             if key == prev_key:
                 continue
             prev_key = key
-            lines.append(f"- `{ev['ts']}` **[{ev['severity']}/{ev['category']}]** {ev['text']}  (`{ev['file']}:{ev['line']}`)")
+            marker = "🎯 " if ev.get("focus_match") else ""
+            lines.append(f"- {marker}`{ev['ts']}` **[{ev['severity']}/{ev['category']}]** {ev['text']}  (`{ev['file']}:{ev['line']}`)")
             shown += 1
             if shown >= 120:
                 lines.append(f"- _(+{total - shown} more timeline events — see findings.json / raw logs)_")
@@ -1312,16 +1424,18 @@ class _DigestArgs:
     """Lightweight stand-in for the argparse.Namespace that build_digest()
     expects, so the CLI and the library entrypoint can share one digest
     renderer without build_digest() needing to know which caller it has."""
-    def __init__(self, min_severity, top_per_category, start_dt, end_dt):
+    def __init__(self, min_severity, top_per_category, start_dt, end_dt, focus_text=None, focus_keywords=None):
         self.min_severity = min_severity
         self.top_per_category = top_per_category
         self.start_dt = start_dt
         self.end_dt = end_dt
+        self.focus_text = focus_text
+        self.focus_keywords = focus_keywords or []
 
 
 def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_category=25,
                   max_examples=3, start=None, end=None, around=None, window=60.0,
-                  progress_cb=None):
+                  focus=None, progress_cb=None):
     """
     Library entrypoint - run a full analysis and return a result dict:
         {kind, root, input_path, output_dir, inventory, findings, facts,
@@ -1334,6 +1448,15 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
     formats the CLI --start/--end/--around flags accept ('YYYY-MM-DD' or
     'YYYY-MM-DD HH:MM[:SS]'). window is minutes of total padding around
     'around', split evenly on both sides.
+
+    focus is an optional free-text description of what the engineer is
+    actually investigating (e.g. "find root cause of NC and IP cluster
+    resource restart issue"). When given, every finding and timeline
+    event is tagged with whether it matches keywords derived from this
+    text, and the digest gets a dedicated "Focused Findings" section
+    ahead of the full exhaustive scan - this is what lets the tool
+    answer a specific question instead of just surfacing whatever is
+    highest-severity regardless of relevance.
 
     progress_cb(message: str), if given, is called with human-readable
     progress strings instead of printing to stdout - used by the web
@@ -1444,6 +1567,19 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
 
     findings_list = sorted(ctx["findings"].values(), key=lambda f: (-SEVERITY_RANK[f["severity"]], -f["count"]))
 
+    focus_text = (focus or "").strip() or None
+    focus_keywords = extract_focus_keywords(focus_text) if focus_text else []
+    focus_patterns = compile_focus_patterns(focus_keywords)
+    num_focus_matches = 0
+    if focus_patterns:
+        for f in findings_list:
+            f["focus_match"] = finding_matches_focus(f, focus_patterns)
+            if f["focus_match"]:
+                num_focus_matches += 1
+        for ev in ctx["timeline"]:
+            ev["focus_match"] = event_matches_focus(ev, focus_patterns)
+        report(f"Focus applied: {len(focus_keywords)} keyword(s) derived from focus text, {num_focus_matches} of {len(findings_list)} findings matched")
+
     facts["analyzer_version"] = __version__
     facts["scan_window"] = {
         "active": window_active,
@@ -1452,12 +1588,17 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         "lines_in_window": stats["lines_in_window"],
         "lines_out_of_window": stats["lines_out_of_window"],
     }
+    facts["focus"] = {
+        "text": focus_text,
+        "keywords": focus_keywords,
+        "num_matching_findings": num_focus_matches,
+    }
 
     (output_dir / "inventory.json").write_text(json.dumps(inventory, indent=2), encoding="utf-8")
     (output_dir / "findings.json").write_text(json.dumps(findings_list, indent=2), encoding="utf-8")
     (output_dir / "facts.json").write_text(json.dumps(facts, indent=2, default=str), encoding="utf-8")
 
-    digest_args = _DigestArgs(min_severity, top_per_category, start_dt, end_dt)
+    digest_args = _DigestArgs(min_severity, top_per_category, start_dt, end_dt, focus_text=focus_text, focus_keywords=focus_keywords)
     elapsed = time.time() - t0
     digest = build_digest(kind, root, input_path, inventory, findings_list, facts, ctx["timeline"], ctx["log_spans"], stats, digest_args, elapsed)
     (output_dir / "digest.md").write_text(digest, encoding="utf-8")
@@ -1495,6 +1636,7 @@ def main():
     ap.add_argument("--end", help="Only scan chronological logs up to this time. Same format as --start.")
     ap.add_argument("--around", help="Convenience: center the window on this time instead of giving --start/--end. Combine with --window.")
     ap.add_argument("--window", type=float, default=60.0, help="Minutes of padding on each side of --around (default 60 = +/-1h total 2h window). Ignored without --around.")
+    ap.add_argument("--focus", help="Free text describing what you're actually investigating (e.g. 'find root cause of NC and IP cluster resource restart issue'). Adds a dedicated Focused Findings section to the digest ahead of the full scan.")
     args = ap.parse_args()
 
     try:
@@ -1502,6 +1644,7 @@ def main():
             args.input, output_dir=args.output, min_severity=args.min_severity,
             top_per_category=args.top_per_category, max_examples=args.max_examples,
             start=args.start, end=args.end, around=args.around, window=args.window,
+            focus=args.focus,
         )
     except AnalysisError as e:
         die(str(e))

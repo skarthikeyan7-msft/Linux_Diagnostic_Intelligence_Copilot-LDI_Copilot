@@ -175,6 +175,22 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   font-size: 13px;
 }
 .callout strong { color: var(--warning); }
+.callout-focus {
+  background: rgba(77, 163, 255, 0.08);
+  border-color: rgba(77, 163, 255, 0.35);
+}
+.callout-focus strong { color: var(--accent); }
+
+.focus-ai-panel {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px;
+  margin: 16px 0;
+}
+.focus-ai-panel h3 { margin: 0 0 6px; font-size: 14px; }
+.focus-ai-panel hr { border: none; border-top: 1px solid var(--border); margin: 18px 0; }
+#runHint { margin-top: 8px; }
 
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
 .tab-btn {
@@ -184,8 +200,9 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
 .tab-panel { }
 
-.findings-toolbar { margin-bottom: 12px; }
-.findings-toolbar input { width: 100%; }
+.findings-toolbar { margin-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
+.findings-toolbar input[type="text"] { width: 100%; }
+.findings-toolbar .checkbox-row { margin: 0; }
 
 .finding-group {
   border: 1px solid var(--border);
@@ -202,6 +219,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   justify-content: space-between;
 }
 .finding-item { padding: 10px 14px; border-top: 1px solid var(--border); font-size: 13px; }
+.finding-item.focus-match { background: rgba(77, 163, 255, 0.05); border-left: 3px solid var(--accent); }
 .finding-item .msg { margin-bottom: 4px; }
 .finding-item .ex { color: var(--text-muted); font-family: Consolas, monospace; font-size: 11.5px; margin-left: 4px; }
 
@@ -217,11 +235,11 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   content: ""; position: absolute; left: -21px; top: 5px; width: 9px; height: 9px;
   border-radius: 50%; background: var(--accent);
 }
+.timeline-item.focus-match::before { background: var(--critical); }
 .timeline-ts { font-family: Consolas, monospace; font-size: 12px; color: var(--text-muted); }
 .timeline-text { font-size: 13px; margin-top: 2px; }
 .timeline-file { font-size: 11px; color: var(--text-muted); font-family: Consolas, monospace; }
 
-.ai-config { background: var(--bg-panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
 .ai-actions { display: flex; gap: 10px; margin-top: 10px; }
 
 .markdown-body { font-size: 14px; }

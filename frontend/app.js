@@ -10,6 +10,7 @@ const state = {
   pollTimer: null,
   jobResult: null,   // {summary, digest, findings, timeline, facts}
   providers: {},
+  autoSynthesizeNext: false, // set true right before submitting a fresh analysis; consumed (and reset) the next time results load
 };
 
 const $ = (id) => document.getElementById(id);
@@ -134,6 +135,27 @@ function markdownToHtml(md) {
 }
 
 // --------------------------------------------------------------------------
+// Focus + AI config panel relocation. The panel (focus textarea + AI
+// provider/model config) is defined once as a <template> and lives
+// physically in Step 1 initially; it's moved (not cloned) into the AI
+// Root Cause Report tab once results are shown, so the same settings
+// used for the initial auto-run can be tweaked afterward to regenerate
+// without re-running the mechanical scan.
+// --------------------------------------------------------------------------
+function initFocusAiPanel() {
+  const tpl = $("focusAiPanelTemplate");
+  $("focusAiPanelMountStep1").appendChild(tpl.content.cloneNode(true));
+}
+
+function relocateFocusAiPanel(toResults) {
+  const panel = document.getElementById("focusAiPanel");
+  const mount = document.getElementById(toResults ? "focusAiPanelMountResults" : "focusAiPanelMountStep1");
+  if (panel && mount && panel.parentElement !== mount) {
+    mount.appendChild(panel);
+  }
+}
+
+// --------------------------------------------------------------------------
 // Upload / dropzone
 // --------------------------------------------------------------------------
 function initDropzone() {
@@ -206,6 +228,7 @@ async function startAnalysis() {
   if (state.selectedFile) fd.append("file", state.selectedFile);
   else fd.append("server_path", $("serverPath").value.trim());
 
+  fd.append("focus", $("focusInput").value.trim());
   fd.append("min_severity", $("optMinSeverity").value);
   fd.append("top_per_category", $("optTopPerCategory").value);
 
@@ -217,6 +240,13 @@ async function startAnalysis() {
     fd.append("around", $("optAround").value.trim());
     fd.append("window", $("optWindow").value);
   }
+
+  // If AI settings are already filled in, automatically generate the
+  // root-cause report as soon as the mechanical scan finishes - the
+  // whole point of moving AI config into Step 1. Consumed (and reset)
+  // the next time results load, so it never fires again for this job
+  // and never fires when merely revisiting a "Recent analysis".
+  state.autoSynthesizeNext = true;
 
   $("uploadSection").classList.add("hidden");
   $("progressSection").classList.remove("hidden");
@@ -293,8 +323,11 @@ async function loadResults(jobIdOverride) {
 
   $("progressSection").classList.add("hidden");
   $("resultsSection").classList.remove("hidden");
+  relocateFocusAiPanel(true);
+  activateTab("ai"); // always land on the AI report for fresh results
 
   renderSummaryCards(job.summary, facts);
+  renderFocusCallout(job.summary);
   renderClusterStatus(job.summary, facts);
   $("digestRender").innerHTML = markdownToHtml(digest);
   renderFindings(findings);
@@ -302,11 +335,29 @@ async function loadResults(jobIdOverride) {
 
   // Reset AI tab for the (possibly new) job
   $("aiRender").innerHTML = "";
+  $("aiError").classList.add("hidden");
   $("btnDownloadReport").classList.add("hidden");
   const existingReport = await fetch(`/api/jobs/${jobId}/ai_report`).then((r) => r.text()).catch(() => "");
   if (existingReport) {
     $("aiRender").innerHTML = markdownToHtml(existingReport);
     $("btnDownloadReport").classList.remove("hidden");
+    $("btnSynthesize").textContent = "Regenerate root-cause report";
+  } else {
+    $("btnSynthesize").textContent = "Generate root-cause report";
+  }
+
+  // Auto-chain: if AI settings were filled in back in Step 1, kick off
+  // synthesis automatically now that the mechanical scan is done -
+  // this only fires once per fresh "Run analysis" submission, and never
+  // when merely revisiting a Recent analysis that already has a report.
+  if (state.autoSynthesizeNext) {
+    state.autoSynthesizeNext = false;
+    if (!existingReport) {
+      const { missing } = collectAiPayload();
+      if (missing.length === 0) {
+        runSynthesis();
+      }
+    }
   }
 
   loadRecentJobs();
@@ -328,6 +379,21 @@ function renderSummaryCards(summary, facts) {
   $("summaryCards").innerHTML = cards
     .map((c) => `<div class="summary-card"><div class="value">${escapeHtml(String(c.value))}</div><div class="label">${escapeHtml(c.label)}</div></div>`)
     .join("");
+}
+
+function renderFocusCallout(summary) {
+  const el = $("focusCallout");
+  const focus = summary && summary.focus;
+  if (!focus || !focus.text) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  const kwHtml = focus.keywords && focus.keywords.length
+    ? ` &nbsp;·&nbsp; keywords: ${focus.keywords.map((k) => `<code>${escapeHtml(k)}</code>`).join(", ")}`
+    : "";
+  el.innerHTML = `🎯 <strong>Focused on:</strong> "${escapeHtml(focus.text)}" &nbsp;·&nbsp; ${focus.num_matching_findings} finding(s) matched${kwHtml}`;
+  el.classList.remove("hidden");
 }
 
 function renderClusterStatus(summary, facts) {
@@ -352,6 +418,9 @@ function renderClusterStatus(summary, facts) {
 // Findings tab
 // --------------------------------------------------------------------------
 function renderFindings(findings) {
+  const hasFocus = findings.some((f) => Object.prototype.hasOwnProperty.call(f, "focus_match"));
+  $("findingsFocusOnlyRow").classList.toggle("hidden", !hasFocus);
+
   const byCat = {};
   for (const f of findings) {
     (byCat[f.category] = byCat[f.category] || []).push(f);
@@ -365,17 +434,19 @@ function renderFindings(findings) {
 
   const renderList = (filterText) => {
     const ft = (filterText || "").toLowerCase();
+    const focusOnly = hasFocus && $("findingsFocusOnly").checked;
     const html = cats
       .map((cat) => {
         const items = byCat[cat]
           .slice()
           .sort((a, b) => (sevRank[b.severity] || 0) - (sevRank[a.severity] || 0) || b.count - a.count)
-          .filter((f) => !ft || cat.toLowerCase().includes(ft) || f.message.toLowerCase().includes(ft));
+          .filter((f) => !ft || cat.toLowerCase().includes(ft) || f.message.toLowerCase().includes(ft))
+          .filter((f) => !focusOnly || f.focus_match);
         if (!items.length) return "";
         const rows = items
           .map(
-            (f) => `<div class="finding-item">
-              <div class="msg"><span class="sev-badge sev-${f.severity}">${f.severity}</span> (${f.count}×) ${escapeHtml(f.message)}</div>
+            (f) => `<div class="finding-item ${f.focus_match ? "focus-match" : ""}">
+              <div class="msg">${f.focus_match ? "🎯 " : ""}<span class="sev-badge sev-${f.severity}">${f.severity}</span> (${f.count}×) ${escapeHtml(f.message)}</div>
               ${f.examples.slice(0, 2).map((ex) => `<div class="ex">${escapeHtml(ex.file)}:${ex.line}</div>`).join("")}
             </div>`
           )
@@ -383,11 +454,18 @@ function renderFindings(findings) {
         return `<div class="finding-group"><div class="finding-cat-head"><span>${escapeHtml(cat)}</span><span class="muted">${items.length} shown</span></div>${rows}</div>`;
       })
       .join("");
-    $("findingsList").innerHTML = html || `<p class="muted">No findings match "${escapeHtml(filterText)}".</p>`;
+    if (html) {
+      $("findingsList").innerHTML = html;
+    } else if (focusOnly) {
+      $("findingsList").innerHTML = `<p class="muted">No findings matched your focus text${ft ? ` and filter "${escapeHtml(ft)}"` : ""}. Uncheck "Show only findings matching my focus" to see everything.</p>`;
+    } else {
+      $("findingsList").innerHTML = `<p class="muted">No findings match "${escapeHtml(ft)}".</p>`;
+    }
   };
 
   renderList("");
   $("findingsFilter").oninput = (e) => renderList(e.target.value);
+  $("findingsFocusOnly").onchange = () => renderList($("findingsFilter").value);
 }
 
 // --------------------------------------------------------------------------
@@ -400,8 +478,8 @@ function renderTimeline(timeline) {
   }
   $("timelineList").innerHTML = timeline
     .map(
-      (ev) => `<div class="timeline-item">
-        <div class="timeline-ts">${escapeHtml(ev.ts)} <span class="sev-badge sev-${ev.severity}">${ev.severity}</span> ${escapeHtml(ev.category)}</div>
+      (ev) => `<div class="timeline-item ${ev.focus_match ? "focus-match" : ""}">
+        <div class="timeline-ts">${escapeHtml(ev.ts)} <span class="sev-badge sev-${ev.severity}">${ev.severity}</span> ${escapeHtml(ev.category)}${ev.focus_match ? " 🎯" : ""}</div>
         <div class="timeline-text">${escapeHtml(ev.text)}</div>
         <div class="timeline-file">${escapeHtml(ev.file)}:${ev.line}</div>
       </div>`
@@ -412,14 +490,14 @@ function renderTimeline(timeline) {
 // --------------------------------------------------------------------------
 // Tabs
 // --------------------------------------------------------------------------
+function activateTab(tabName) {
+  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tabName));
+  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("hidden", p.id !== `tab-${tabName}`));
+}
+
 function initTabs() {
   document.querySelectorAll(".tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-      document.querySelectorAll(".tab-panel").forEach((p) => p.classList.add("hidden"));
-      btn.classList.add("active");
-      $(`tab-${btn.dataset.tab}`).classList.remove("hidden");
-    });
+    btn.addEventListener("click", () => activateTab(btn.dataset.tab));
   });
 }
 
@@ -491,16 +569,29 @@ function saveAiSettingsIfRequested() {
   localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(settings));
 }
 
-async function runSynthesis() {
+function collectAiPayload() {
   const providerKey = $("aiProvider").value;
   const p = state.providers[providerKey];
-  const payload = { provider: providerKey, extra_context: $("aiExtraContext").value };
-  let missing = [];
+  const payload = {
+    provider: providerKey,
+    extra_context: $("aiExtraContext").value,
+    focus_text: $("focusInput") ? $("focusInput").value.trim() : "",
+  };
+  const missing = [];
+  if (!p) {
+    missing.push("provider");
+    return { payload, missing };
+  }
   p.fields.forEach((f) => {
     const val = $(`ai_${f}`).value.trim();
     if (!val) missing.push(fieldLabel(providerKey, f));
     payload[f] = val;
   });
+  return { payload, missing };
+}
+
+async function runSynthesis() {
+  const { payload, missing } = collectAiPayload();
 
   $("aiError").classList.add("hidden");
   if (missing.length) {
@@ -554,7 +645,7 @@ async function runSynthesis() {
     $("aiError").classList.remove("hidden");
   } finally {
     $("btnSynthesize").disabled = false;
-    $("btnSynthesize").textContent = "Generate root-cause report";
+    $("btnSynthesize").textContent = accumulated ? "Regenerate root-cause report" : "Generate root-cause report";
   }
 }
 
@@ -604,15 +695,22 @@ function resetToUpload() {
   $("resultsSection").classList.add("hidden");
   $("progressSection").classList.add("hidden");
   $("uploadSection").classList.remove("hidden");
+  relocateFocusAiPanel(false);
   state.selectedFile = null;
   state.jobId = null;
+  state.autoSynthesizeNext = false;
   $("fileInput").value = "";
   $("serverPath").value = "";
   $("dropzoneFile").classList.add("hidden");
+  // Deliberately NOT clearing focusInput / AI provider settings - a
+  // support engineer often analyzes a second bundle (e.g. another
+  // node's crm_report) for the very same investigation, and retyping
+  // the focus + API key every time would be needless friction.
   updateAnalyzeEnabled();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  initFocusAiPanel();
   initDropzone();
   initScopeToggle();
   initTabs();

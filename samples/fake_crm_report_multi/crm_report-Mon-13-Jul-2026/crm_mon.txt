@@ -1,0 +1,25 @@
+Cluster Summary:
+  * Stack: corosync
+  * Current DC: node1 (version 2.1.6) - partition with quorum
+  * Last updated: Mon Jul 13 10:00:00 2026
+  * 2 nodes configured
+  * 5 resource instances configured
+
+Node List:
+  * Online: [ node1 node2 ]
+
+Active Resources:
+  * rsc_ip_cluster	(ocf:heartbeat:IPaddr2):	 Started node1
+  * rsc_nc_share	(ocf:heartbeat:Filesystem):	 Started node1
+  * db-primary	(ocf:heartbeat:pgsql):	 Started node1
+  * rsc_st_azure	(stonith:fence_azure_arm):	 Started node2
+  * stonith-sbd	(stonith:external/sbd):	 Started node1
+
+Migration Summary:
+  * Node: node1:
+    * rsc_ip_cluster: migration-threshold=1000000 fail-count=6 last-failure='Mon Jul 13 09:42:10 2026'
+    * rsc_nc_share: migration-threshold=1000000 fail-count=6 last-failure='Mon Jul 13 09:42:15 2026'
+
+Failed Resource Actions:
+  * rsc_ip_cluster_monitor_20000 on node1 'error' (1): call=88, status='error', exitreason='', last-rc-change='Mon Jul 13 09:42:10 2026'
+  * rsc_nc_share_monitor_20000 on node1 'error' (1): call=90, status='error', exitreason='', last-rc-change='Mon Jul 13 09:42:15 2026'

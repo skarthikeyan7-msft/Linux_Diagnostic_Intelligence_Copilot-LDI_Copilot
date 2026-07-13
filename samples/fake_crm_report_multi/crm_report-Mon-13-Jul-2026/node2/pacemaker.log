@@ -1,0 +1,6 @@
+Jul 13 09:00:01 node2 corosync[2400]: [MAIN  ] Corosync Cluster Engine starting up
+Jul 13 09:15:00 node2 pacemaker-fenced[2490]: notice: rsc_st_azure: Monitoring Azure ARM fence agent
+Jul 13 09:20:10 node2 pacemaker-fenced[2490]: warning: rsc_st_azure: Azure ARM API rate-limited (HTTP 429), retrying
+Jul 13 09:20:40 node2 pacemaker-fenced[2490]: warning: rsc_st_azure: Azure ARM API rate-limited (HTTP 429), retrying
+Jul 13 09:50:12 node2 pacemaker-fenced[2490]: warning: rsc_st_azure: Azure ARM API rate-limited (HTTP 429), retrying
+Jul 13 09:55:00 node2 pacemaker-fenced[2490]: notice: rsc_st_azure: Azure ARM API check succeeded

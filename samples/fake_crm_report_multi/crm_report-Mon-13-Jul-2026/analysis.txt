@@ -1,0 +1,13 @@
+crm_report: Checking node1 logs for errors/warnings...
+crm_report: Checking node2 logs for errors/warnings...
+
+##### node1/pacemaker.log #####
+WARNING: pacemaker-controld[1500]: rsc_ip_cluster_monitor_20000 process (PID 8821) timed out
+ERROR: pacemaker-controld[1500]: rsc_ip_cluster monitor on node1 returned 'error'
+WARNING: pacemaker-controld[1500]: rsc_nc_share_monitor_20000 process (PID 8830) timed out
+ERROR: pacemaker-controld[1500]: rsc_nc_share monitor on node1 returned 'error'
+
+##### node2/pacemaker.log #####
+WARNING: pacemaker-fenced[2490]: rsc_st_azure: Azure ARM API rate-limited (HTTP 429), retrying
+
+Analysis complete. 5 CRIT/ERROR/WARNING lines flagged above.

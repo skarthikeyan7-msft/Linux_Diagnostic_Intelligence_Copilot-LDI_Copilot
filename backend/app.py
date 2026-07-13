@@ -38,7 +38,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="sosreport-rca-webapp", version="1.0.0")
+app = FastAPI(title="sosreport-rca-webapp", version="1.1.0")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -51,7 +51,7 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 
-def _new_job(name):
+def _new_job(name, focus_text=None):
     job_id = uuid.uuid4().hex[:12]
     job_dir = DATA_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -66,6 +66,7 @@ def _new_job(name):
             "created_at": datetime.utcnow().isoformat(),
             "dir": job_dir,
             "ai_report": "",
+            "focus_text": focus_text,
         }
     return job_id
 
@@ -98,6 +99,7 @@ def _run_job(job_id, input_path, kwargs):
                 "num_files": result["stats"]["files_scanned"],
                 "num_lines": result["stats"]["lines_scanned"],
                 "elapsed_seconds": result["elapsed_seconds"],
+                "focus": result["facts"].get("focus"),
             }
     except AnalysisError as e:
         with JOBS_LOCK:
@@ -124,6 +126,7 @@ def _get_job_or_404(job_id):
 async def analyze(
     file: UploadFile | None = File(None),
     server_path: str | None = Form(None),
+    focus: str | None = Form(None),
     min_severity: str = Form("WARNING"),
     top_per_category: int = Form(25),
     start: str | None = Form(None),
@@ -134,18 +137,25 @@ async def analyze(
     """Start a new analysis job. Accepts EITHER an uploaded archive/file
     (drag-and-drop from the browser) OR a server_path already on disk
     (handy for re-analyzing a large bundle you've already downloaded,
-    without uploading it a second time). Returns immediately with a
-    job_id; poll GET /api/jobs/{job_id} for progress."""
+    without uploading it a second time). `focus` is optional free text
+    describing what the engineer is actually investigating (e.g. "find
+    root cause of NC and IP cluster resource restart issue") - when
+    given, both the mechanical scan (keyword-tagged findings) and the
+    later AI synthesis for this job are steered around answering that
+    specific question instead of a generic exhaustive report. Returns
+    immediately with a job_id; poll GET /api/jobs/{job_id} for progress."""
     if not file and not server_path:
         raise HTTPException(status_code=400, detail="provide either a file upload or a server_path")
+
+    focus = (focus or "").strip() or None
 
     if server_path:
         input_path = Path(server_path)
         if not input_path.exists():
             raise HTTPException(status_code=400, detail=f"server_path does not exist on this machine: {server_path}")
-        job_id = _new_job(input_path.name)
+        job_id = _new_job(input_path.name, focus_text=focus)
     else:
-        job_id = _new_job(file.filename)
+        job_id = _new_job(file.filename, focus_text=focus)
         job_dir = JOBS[job_id]["dir"]
         upload_path = job_dir / "upload" / file.filename
         upload_path.parent.mkdir(parents=True, exist_ok=True)
@@ -160,6 +170,7 @@ async def analyze(
     kwargs = dict(
         min_severity=min_severity, top_per_category=top_per_category,
         start=start or None, end=end or None, around=around or None, window=window,
+        focus=focus,
     )
     thread = threading.Thread(target=_run_job, args=(job_id, input_path, kwargs), daemon=True)
     thread.start()
@@ -171,7 +182,8 @@ def list_jobs():
     with JOBS_LOCK:
         return [
             {"id": j["id"], "name": j["name"], "status": j["status"],
-             "created_at": j["created_at"], "summary": j["result_summary"]}
+             "created_at": j["created_at"], "summary": j["result_summary"],
+             "focus_text": j.get("focus_text")}
             for j in sorted(JOBS.values(), key=lambda x: x["created_at"], reverse=True)
         ]
 
@@ -182,7 +194,7 @@ def get_job(job_id: str):
     return {
         "id": job["id"], "name": job["name"], "status": job["status"],
         "progress": job["progress"], "error": job["error"],
-        "summary": job["result_summary"],
+        "summary": job["result_summary"], "focus_text": job.get("focus_text"),
     }
 
 
@@ -249,9 +261,12 @@ async def synthesize(job_id: str, payload: dict):
     """Stream an AI-generated root-cause report for a completed job via
     Server-Sent Events. `payload` carries the provider choice and its
     credentials (api_key/endpoint/deployment/model/base_url as required
-    by that provider) plus optional free-text extra_context. Credentials
-    are used only for this one request and are never written to disk or
-    to the job store."""
+    by that provider) plus optional free-text extra_context and an
+    optional focus_text override. If focus_text is omitted, the focus
+    text supplied at analysis time (Step 1) is reused automatically, so
+    the AI report stays steered around the same question the mechanical
+    scan was steered around. Credentials are used only for this one
+    request and are never written to disk or to the job store."""
     job = _get_job_or_404(job_id)
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail=f"job status is {job['status']}, not done yet")
@@ -263,8 +278,14 @@ async def synthesize(job_id: str, payload: dict):
     if missing:
         raise HTTPException(status_code=400, detail=f"missing required field(s) for {provider}: {', '.join(missing)}")
 
-    messages = build_messages(job["result"]["kind"], job["result"]["digest_markdown"], payload.get("extra_context"))
-    provider_kwargs = {k: v for k, v in payload.items() if k not in ("provider", "extra_context")}
+    focus_text = payload.get("focus_text")
+    if focus_text is None:
+        focus_text = job.get("focus_text")
+    messages = build_messages(
+        job["result"]["kind"], job["result"]["digest_markdown"],
+        extra_context=payload.get("extra_context"), focus_text=focus_text,
+    )
+    provider_kwargs = {k: v for k, v in payload.items() if k not in ("provider", "extra_context", "focus_text")}
 
     def event_stream():
         accumulated = []

@@ -1,0 +1,14 @@
+
+Please edit this template and describe the issue/problem you
+encountered.
+
+Date: Mon Jul 13 10:00:00 2026
+By: crm report crm_report-Mon-13-Jul-2026
+Subject: Various cluster warnings
+Severity: normal
+--------------------------------------------------------
+
+Detailed description:
+
+Grabbing a general report for the two-node DB cluster - saw various
+warnings in monitoring and want a general look-over.

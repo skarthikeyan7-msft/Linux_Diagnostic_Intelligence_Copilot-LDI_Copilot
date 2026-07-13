@@ -1,0 +1,21 @@
+Jul 13 09:00:01 node1 systemd[1]: Started Daily cleanup.
+Jul 13 09:30:00 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Down
+Jul 13 09:30:01 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Up 1000 Mbps Full Duplex
+Jul 13 09:35:12 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Down
+Jul 13 09:35:14 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Up 1000 Mbps Full Duplex
+Jul 13 09:41:50 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Down
+Jul 13 09:42:05 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Down
+Jul 13 09:42:08 node1 pacemaker-controld[1500]: warning: rsc_ip_cluster_monitor_20000 process (PID 8821) timed out
+Jul 13 09:42:09 node1 pacemaker-controld[1500]: error: Result of monitor operation for rsc_ip_cluster on node1: Timed Out
+Jul 13 09:42:10 node1 pacemaker-controld[1500]: notice: rsc_ip_cluster_monitor_20000:8821 [ Could not bind IP address 10.0.1.100: Cannot assign requested address ]
+Jul 13 09:42:12 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Up 1000 Mbps Full Duplex
+Jul 13 09:42:13 node1 pacemaker-controld[1500]: warning: rsc_nc_share_monitor_20000 process (PID 8830) timed out
+Jul 13 09:42:15 node1 pacemaker-controld[1500]: error: Result of monitor operation for rsc_nc_share on node1: Timed Out
+Jul 13 09:42:15 node1 pacemaker-controld[1500]: notice: rsc_nc_share_monitor_20000:8830 [ mount.nfs: Network is unreachable ]
+Jul 13 09:42:20 node1 pacemaker-controld[1500]: notice: Restarting rsc_ip_cluster on node1
+Jul 13 09:42:22 node1 pacemaker-controld[1500]: notice: Restarting rsc_nc_share on node1
+Jul 13 09:42:25 node1 pacemaker-controld[1500]: notice: rsc_ip_cluster started on node1
+Jul 13 09:42:27 node1 pacemaker-controld[1500]: notice: rsc_nc_share started on node1
+Jul 13 09:50:00 node1 kernel: e1000e 0000:00:19.0 eth0: Detected Hardware Unit Hang
+Jul 13 09:50:01 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Down
+Jul 13 09:50:03 node1 kernel: e1000e 0000:00:19.0 eth0: NIC Link is Up 1000 Mbps Full Duplex

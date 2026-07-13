@@ -1,16 +1,19 @@
 # sosreport-rca-webapp
 
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+
 A local, browser-based AI agent for deep root-cause analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles.
 
-Drop an archive in the browser, pick an AI model, and get a ranked, evidence-cited root-cause report — built on the same mechanical evidence-scanning engine as the [`sosreport-rca`](../sosreport-rca) CLI tool, extended with full `crm_report` support and wrapped in a local web UI with pluggable AI providers.
+Describe the specific issue you're investigating, pick an AI model, drop in an archive, and get a **focused**, evidence-cited root-cause report — instead of a generic exhaustive dump. Built on the same mechanical evidence-scanning engine as the [`sosreport-rca`](../sosreport-rca) CLI tool, extended with full `crm_report` support, investigation-focused steering, and wrapped in a local web UI with pluggable AI providers.
 
-![type](https://img.shields.io/badge/status-personal%20tool-informational) ![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)
+See [CHANGELOG.md](CHANGELOG.md) for release history — this project follows [Semantic Versioning](https://semver.org/) and is tagged (`vX.Y.Z`) with a matching GitHub Release per version.
 
 ## Why a webapp on top of the CLI tool
 
 The CLI (`sosreport-rca`) is great for scripting/automation. This project wraps the same analysis engine in a browser UI so you can:
+- **Tell it what you're actually investigating** — e.g. "find root cause of NC and IP cluster resource restart issue" — and get an answer to that question specifically, instead of every unrelated warning in the bundle competing for attention
 - Drag-and-drop a bundle instead of remembering CLI flags
-- **Choose which AI model does the reasoning** — OpenAI, Anthropic (Claude), Azure OpenAI, or a fully local Ollama model — per analysis, right from the UI
+- **Choose which AI model does the reasoning** — OpenAI, Anthropic (Claude), Azure OpenAI, or a fully local Ollama model — configured up front, so the AI report generates automatically as soon as analysis finishes
 - Get a live, readable dashboard (summary cards, cluster status, findings by category, chronological timeline) instead of a markdown file
 - Analyze `crm_report`/`hb_report` bundles too, with per-node attribution across a multi-node cluster
 - Keep everything on your machine — the server binds to `127.0.0.1` only by default, and bundle data is only ever sent off-box if you explicitly choose a cloud AI provider for the synthesis step
@@ -43,16 +46,22 @@ python -m venv .venv
 ## Using it
 
 1. **Provide a bundle** — drag & drop an archive (`.tar.xz`, `.tgz`, `.tar.bz2`, `.zip`, …), or paste a path already on disk (file or an already-extracted folder). Format (sosreport/supportconfig/crm_report) is auto-detected.
-2. **(Optional) scope the analysis** — expand "Analysis options" to restrict the scan to a specific date/time range or a time ± window, instead of the whole archive. Useful when you already know roughly when an incident happened.
-3. **Run analysis** — watch live progress, then review the results dashboard: summary cards, cluster status (for `crm_report`), the full evidence **Digest**, a filterable **Findings** list by category/severity, and a cross-file **Timeline**.
-4. **Generate an AI root-cause report** — go to the "AI Root Cause Report" tab, pick a provider, fill in credentials, and click Generate. The evidence digest is sent to the model as context; the model reasons over it (root cause vs. cascading symptoms vs. noise) and streams back a structured report.
-5. **Download** the combined AI report + evidence digest as a single Markdown file.
+2. **Say what you're investigating** — in the "🎯 What are you investigating?" box, describe the specific issue, e.g. *"find root cause of NC and IP cluster resource restart issue"*. This steers both the mechanical scan (a dedicated Focused Findings section, keyword-tagged results) and the AI report (which answers that question directly and demotes unrelated findings to a short closing section). Leave it blank for a generic full-bundle analysis.
+3. **Configure your AI model** — right below, in the same panel: pick a provider, fill in the API key/model (or Ollama's local endpoint), optionally check "Remember these settings on this device". Filling this in now means a full AI-reasoned report generates **automatically** as soon as the scan finishes — no extra click. You can also leave it blank and configure it later from the same panel (it moves into the AI tab after analysis).
+4. **(Optional) scope the analysis** — expand "Advanced options" to restrict the scan to a specific date/time range or a time ± window, instead of the whole archive. Useful when you already know roughly when an incident happened.
+5. **Run analysis** — watch live progress. Results open on the **AI Root Cause Report** tab by default, streaming in automatically if you configured a model in step 3 (or click "Generate root-cause report" there if you didn't). Other tabs: the full evidence **Digest**, a filterable **Findings** list (with a "show only findings matching my focus 🎯" toggle), and a cross-file **Timeline**.
+6. **Regenerate or refine** — tweak the focus text or switch AI providers right there in the AI tab and click again to regenerate, without re-running the mechanical scan.
+7. **Download** the combined AI report + evidence digest as a single Markdown file.
 
 Recent analyses from the current server session are listed under "Recent analyses" (top right) so you can revisit results without re-uploading.
 
+### A note on focused analysis
+
+The mechanical engine's keyword matching is intentionally simple (it just tags findings that literally contain your focus words), while the AI layer does the actual causal reasoning across the *entire* evidence base — so it can, for example, connect a flapping NIC (`NIC Link is Down`) to a restart of a resource named `rsc_ip_cluster` even though "NIC" and "IP" don't share a literal keyword. If you ask about "NC and IP" and the mechanical Focused Findings section looks sparse, that's expected — the AI report is where the deeper connection gets made. Use the Findings tab's focus filter to see exactly what was keyword-matched, and the Digest/Timeline to see everything else the AI had available to reason over.
+
 ## AI provider setup
 
-Pick whichever you have access to — no code changes needed, it's a dropdown in the UI.
+Pick whichever you have access to — no code changes needed, it's a dropdown in the UI (Step 1, or the AI tab after analysis).
 
 | Provider | What you need | Notes |
 |---|---|---|
@@ -75,26 +84,39 @@ Pick whichever you have access to — no code changes needed, it's a dropdown in
 ```
 sosreport-rca-webapp/
 ├── run.ps1                    # one-command launcher (venv + deps + server)
+├── CHANGELOG.md
 ├── backend/
 │   ├── app.py                 # FastAPI server: job management, REST API, static file serving
 │   ├── requirements.txt
 │   ├── engine/
 │   │   └── analyzer_core.py   # mechanical scanning engine (extraction, detection, pattern
-│   │                          # matching, fact-checks, timeline, digest) - sosreport +
-│   │                          # supportconfig + crm_report, with a run_analysis() library API
+│   │                          # matching, fact-checks, timeline, digest, focus-keyword
+│   │                          # tagging) - sosreport + supportconfig + crm_report, with a
+│   │                          # run_analysis() library API
 │   ├── ai/
 │   │   ├── providers.py       # OpenAI / Anthropic / Azure OpenAI / Ollama streaming clients
-│   │   └── prompts.py         # RCA synthesis system prompt + evidence-digest user prompt
+│   │   └── prompts.py         # focus-aware RCA synthesis system prompt + evidence-digest user prompt
 │   └── data/jobs/<id>/         # per-analysis uploaded file + extracted tree + output (gitignored)
 ├── frontend/
-│   ├── index.html
-│   ├── app.js                 # upload, polling, rendering, SSE streaming, tiny MD renderer
+│   ├── index.html             # Step 1 focus+AI panel (relocatable <template>), results tabs
+│   ├── app.js                 # upload, polling, rendering, SSE streaming, tiny MD renderer,
+│   │                          # focus/AI panel relocation, auto-chained synthesis
 │   └── styles.css
 └── samples/                    # synthetic test fixtures (fake_sosreport, fake_supportconfig,
-                                 # fake_crm_report) - safe, fictional data for trying the app
+                                 # fake_crm_report, fake_crm_report_multi) - safe, fictional
+                                 # data for trying the app
 ```
 
-**Request flow:** browser uploads a bundle → FastAPI saves it and starts a background thread running `run_analysis()` → browser polls job status → once done, browser fetches the digest/findings/facts/timeline JSON and renders the dashboard → on "Generate root-cause report", the browser POSTs provider credentials + the job's digest to `/api/jobs/{id}/synthesize`, which streams the model's response back via Server-Sent Events.
+**Request flow:** browser uploads a bundle (+ optional focus text + optional AI config, all collected in Step 1) → FastAPI saves it and starts a background thread running `run_analysis(..., focus=...)` → browser polls job status → once done, browser fetches the digest/findings/facts/timeline JSON and renders the dashboard, opening on the AI Root Cause Report tab → if AI settings were filled in, the browser automatically POSTs the provider credentials + focus text + the job's digest to `/api/jobs/{id}/synthesize`, which streams the model's response back via Server-Sent Events. The same focus+AI panel then relocates into the AI tab so settings can be tweaked and regenerated without re-running the mechanical scan.
+
+## Focused analysis
+
+Point the tool at one specific problem instead of getting a generic report:
+- The "🎯 What are you investigating?" field in Step 1 accepts free text like *"find root cause of NC and IP cluster resource restart issue"*.
+- `extract_focus_keywords()` tokenizes this into meaningful identifiers (filtering generic words like "find"/"root"/"cause"/"issue"), and every finding/timeline event gets tagged `focus_match: true/false`. Matching treats `_`/`-` as separators, so short identifiers like `ip`/`nc` correctly match inside real resource names such as `rsc_ip_cluster`/`rsc_nc_share`.
+- `digest.md` gets a `## 🎯 Focused Findings` section ahead of the full category breakdown, listing only keyword-matched evidence.
+- The AI synthesis prompt restructures around the focus: the Executive Summary and Root Cause Analysis sections answer the stated focus directly, and the model is explicitly instructed to reason *beyond* the literal keyword matches (e.g. connecting a flapping NIC to an IP-resource restart) since mechanical keyword matching alone cannot make that causal leap. Anything unrelated to the focus is demoted to a short closing "Other Observations" section instead of competing for attention.
+- The Findings tab's "Show only findings matching my focus 🎯" toggle lets you flip between the focused view and the full exhaustive list at any time, without re-running anything.
 
 ## crm_report / hb_report support
 
@@ -102,10 +124,11 @@ Detects the crmsh `crm report` layout (`analysis.txt`, `cib.xml`, `members.txt`,
 - Per-node categorization (a `pacemaker.log`/`corosync.log` inside any node's subfolder is recognized regardless of which node it's under)
 - A dedicated **Cluster Status** summary: nodes detected, offline/unclean nodes (parsed from `crm_mon.txt`), and Failed Resource Actions
 - `analysis.txt` (crm_report's own built-in CRIT:/ERROR:/WARNING: scan) is surfaced verbatim as an independent cross-check against this tool's own findings
-- The AI synthesis prompt is specifically primed to use per-node evidence (e.g. CPU/memory exhaustion or kernel soft-lockups on the node that got fenced) to explain *why* a fencing/STONITH event happened, not just report that it happened
+- The AI synthesis prompt is specifically primed to use per-node evidence (e.g. CPU/memory exhaustion, kernel soft-lockups, or NIC flaps on the affected node) to explain *why* a fencing/STONITH event or resource restart happened, not just report that it happened
 
 ## Limitations
 
 - This is heuristic pattern-matching plus structured fact-checks, not a certified rules engine (e.g. Red Hat Insights, SUSE's SCA tool). Treat the digest as a strong evidence base for the AI/human review step, not an infallible verdict.
+- Focus-keyword matching is intentionally literal/simple; it cannot make causal leaps between differently-worded evidence on its own (that's the AI synthesis step's job) — if the Focused Findings section looks sparse, check the AI report and the full Digest/Timeline before concluding there's no relevant evidence.
 - Single-user, single-machine tool: job state is in-memory and does not survive a server restart (uploaded files/analysis output on disk do persist under `backend/data/jobs/` until deleted).
 - No authentication — appropriate for local personal use; do not expose this server beyond localhost.

@@ -1,0 +1,26 @@
+<cib crm_feature_set="3.16.0" validate-with="pacemaker-3.5" epoch="88" num_updates="1" admin_epoch="0" cib-last-written="Mon Jul 13 09:42:15 2026" update-origin="node1" update-client="crmd" have-quorum="1" dc-uuid="1">
+  <configuration>
+    <resources>
+      <primitive id="rsc_ip_cluster" class="ocf" provider="heartbeat" type="IPaddr2">
+        <instance_attributes id="rsc_ip_cluster-attrs">
+          <nvpair name="ip" value="10.0.1.100"/>
+          <nvpair name="nic" value="eth0"/>
+        </instance_attributes>
+        <operations>
+          <op id="rsc_ip_cluster-monitor" name="monitor" interval="20s" timeout="20s"/>
+        </operations>
+      </primitive>
+      <primitive id="rsc_nc_share" class="ocf" provider="heartbeat" type="Filesystem">
+        <instance_attributes id="rsc_nc_share-attrs">
+          <nvpair name="device" value="10.0.1.100:/export/nc_share"/>
+          <nvpair name="fstype" value="nfs"/>
+        </instance_attributes>
+        <operations>
+          <op id="rsc_nc_share-monitor" name="monitor" interval="20s" timeout="20s"/>
+        </operations>
+      </primitive>
+      <primitive id="rsc_st_azure" class="stonith" type="fence_azure_arm"/>
+    </resources>
+  </configuration>
+  <status/>
+</cib>
