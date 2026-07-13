@@ -1,4 +1,4 @@
-# LDI Copilot (Linux Diagnostic Intelligence Copilot)
+# Linux Diagnostic Intelligence Copilot - LDI Copilot
 # One-command local launcher: creates/uses a local venv, installs
 # dependencies if needed, then starts the server and opens the browser.
 param(

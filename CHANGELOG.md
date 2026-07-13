@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-07-13
+
+### Added
+- **Activity terminal**: a persistent, timestamped log panel on the right side of the page, visible no matter which of the three main tabs (Provide Bundle / Analyzing / Results) is active. Mirrors background progress across every stage - bundle selection, the mechanical scan's own progress lines (as they arrive from polling), AI synthesis start/streaming completion, model-availability checks, downloads, and resets - with level-based coloring (info/success/warn/error) and a "Clear" button. Complements, rather than replaces, the existing detailed progress log inside the Analyzing tab.
+- **Model dropdown with live availability checking**: the free-text "Model" field for OpenAI, Anthropic, and Ollama (Azure OpenAI's "deployment" field is unaffected - deployment names are user-defined) is now a `<select>` populated from a curated `known_models` list per provider, plus a "Custom / other model…" fallback for anything not yet in the list. A new **"🔎 Check available models"** button calls the new `POST /api/models` endpoint, which live-queries the provider (OpenAI `GET /v1/models`, Anthropic's Models API, or Ollama's `GET /api/tags` for whatever's actually pulled locally) and **greys out (disables)** any known model not confirmed available - without silently changing your current selection. The check is best-effort and non-blocking: missing credentials, invalid keys, or network failures simply leave every option selectable with an explanatory status message, never a hard error.
+- `backend/ai/providers.py` gained `list_models()` / `list_models_openai()` / `list_models_anthropic()` / `list_models_ollama()` and a `KNOWN_MODELS` registry; `backend/app.py` gained `POST /api/models` (always returns HTTP 200 with `{available, error}`, never raises, for a failed live check).
+
+### Changed
+- **Microsoft logo relocated**: moved from the header (next to the app name) to a small fixed watermark in the bottom-right corner of the viewport.
+- **Project name standardized** to "Linux Diagnostic Intelligence Copilot - LDI Copilot" in prominent branding spots (page title, README, source file headers); the compact "LDI Copilot" form remains in the header nav, console/log output, and buttons.
+- Two-column page layout: main content on the left, the new activity terminal on the right (stacks vertically below on narrow viewports).
+
 ## [2.0.0] - 2026-07-13
 
 ### Changed - BREAKING
@@ -50,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[2.1.0]: https://github.com/skarthikeyan7-msft/ldi-copilot/releases/tag/v2.1.0
 [2.0.0]: https://github.com/skarthikeyan7-msft/ldi-copilot/releases/tag/v2.0.0
 [1.1.0]: https://github.com/skarthikeyan7-msft/ldi-copilot/releases/tag/v1.1.0
 [1.0.0]: https://github.com/skarthikeyan7-msft/ldi-copilot/releases/tag/v1.0.0

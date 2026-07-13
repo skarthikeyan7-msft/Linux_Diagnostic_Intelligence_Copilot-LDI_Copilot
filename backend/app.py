@@ -1,5 +1,5 @@
 """
-LDI Copilot (Linux Diagnostic Intelligence Copilot) backend
+Linux Diagnostic Intelligence Copilot - LDI Copilot backend
 =============================================================
 AI-powered analysis of sosreport, supportconfig, and cluster diagnostics
 (crm_report/hb_report) to deliver automated issue detection, root cause
@@ -35,14 +35,14 @@ from fastapi.staticfiles import StaticFiles
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # allow `import engine`, `import ai` when run directly
 
 from engine import run_analysis, AnalysisError
-from ai import PROVIDERS, stream_chat, ProviderError, build_messages
+from ai import PROVIDERS, stream_chat, ProviderError, build_messages, list_models
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="2.0.0")
+app = FastAPI(title="LDI Copilot", version="2.1.0")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -258,6 +258,27 @@ def delete_job(job_id: str):
 @app.get("/api/providers")
 def get_providers():
     return PROVIDERS
+
+
+@app.post("/api/models")
+def list_available_models(payload: dict):
+    """Best-effort live model-availability check backing the model
+    picker's "grey out unavailable models" behavior. Always returns
+    HTTP 200 with {available, error} rather than raising - a failed or
+    not-yet-possible check (e.g. no credentials entered yet, offline,
+    invalid key) must never block manual model selection; the frontend
+    falls back to showing every known_models entry as selectable when
+    available is null."""
+    provider = payload.get("provider")
+    if provider not in PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"unknown provider: {provider!r}")
+    try:
+        available = list_models(provider, **{k: v for k, v in payload.items() if k != "provider"})
+        return {"available": available, "error": None}
+    except ProviderError as e:
+        return {"available": None, "error": str(e)}
+    except KeyError as e:
+        return {"available": None, "error": f"missing required field: {e}"}
 
 
 @app.post("/api/jobs/{job_id}/synthesize")

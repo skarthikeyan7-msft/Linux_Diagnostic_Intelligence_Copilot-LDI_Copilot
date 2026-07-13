@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LDI Copilot — Linux Diagnostic Intelligence Copilot</title>
+<title>Linux Diagnostic Intelligence Copilot - LDI Copilot</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,12 +11,6 @@
 
   <header class="topbar">
     <div class="brand">
-      <svg class="ms-logo" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
-        <rect x="0" y="0" width="11" height="11" fill="#F25022"/>
-        <rect x="13" y="0" width="11" height="11" fill="#7FBA00"/>
-        <rect x="0" y="13" width="11" height="11" fill="#00A4EF"/>
-        <rect x="13" y="13" width="11" height="11" fill="#FFB900"/>
-      </svg>
       <span class="brand-mark">LDI</span>
       <span class="brand-name">LDI Copilot</span>
       <span class="brand-sub">Linux Diagnostic Intelligence Copilot · sosreport · supportconfig · crm_report</span>
@@ -35,6 +29,7 @@
     <div id="recentList" class="recent-list"></div>
   </aside>
 
+  <div class="layout">
   <main class="main">
 
     <nav class="main-tabs">
@@ -206,6 +201,24 @@
     </section>
 
   </main>
+
+  <aside class="terminal-panel" id="terminalPanel">
+    <div class="terminal-head">
+      <span>📟 Activity Log</span>
+      <button id="btnClearTerminal" class="btn btn-ghost btn-sm">Clear</button>
+    </div>
+    <div class="terminal-body" id="terminalBody"></div>
+  </aside>
+  </div>
+</div>
+
+<div class="ms-logo-corner" title="Microsoft">
+  <svg class="ms-logo" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
+    <rect x="0" y="0" width="11" height="11" fill="#F25022"/>
+    <rect x="13" y="0" width="11" height="11" fill="#7FBA00"/>
+    <rect x="0" y="13" width="11" height="11" fill="#00A4EF"/>
+    <rect x="13" y="13" width="11" height="11" fill="#FFB900"/>
+  </svg>
 </div>
 
 <script src="app.js"></script>

@@ -1,4 +1,4 @@
-// LDI Copilot (Linux Diagnostic Intelligence Copilot) frontend
+// Linux Diagnostic Intelligence Copilot - LDI Copilot frontend
 // Vanilla JS, no build step, no external CDN dependencies (including the
 // markdown renderer below) - this app is designed to work fully offline,
 // consistent with the Ollama local-model option.
@@ -14,6 +14,7 @@ const state = {
   autoSynthesizeNext: false, // set true right before submitting a fresh analysis; consumed (and reset) the next time results load
   analyzing: false,  // true while a job is in flight; drives the Analyzing tab's placeholder vs. progress log
   activeMainTab: "upload",
+  terminalProgressCount: 0, // number of progress lines already mirrored into the activity terminal for the current job
 };
 
 const $ = (id) => document.getElementById(id);
@@ -170,6 +171,34 @@ function initMainTabs() {
 }
 
 // --------------------------------------------------------------------------
+// Activity terminal - a persistent, always-visible (regardless of which
+// main tab is active) timestamped log of background progress across
+// every stage: bundle selection, the mechanical scan's progress lines,
+// AI synthesis start/streaming completion, downloads, and resets. This
+// is deliberately separate from the Analyzing tab's own progress-log
+// (which still shows full detail when you're specifically on that tab)
+// - the terminal's job is cross-cutting visibility from anywhere.
+// --------------------------------------------------------------------------
+function logTerminal(message, level) {
+  const body = $("terminalBody");
+  if (!body) return;
+  const time = new Date().toLocaleTimeString([], { hour12: false });
+  const line = document.createElement("div");
+  line.className = `term-line term-${level || "info"}`;
+  line.innerHTML = `<span class="term-ts">[${escapeHtml(time)}]</span>${escapeHtml(message)}`;
+  body.appendChild(line);
+  body.scrollTop = body.scrollHeight;
+}
+
+function initTerminal() {
+  logTerminal("LDI Copilot ready. Waiting for a diagnostic bundle…", "info");
+  $("btnClearTerminal").addEventListener("click", () => {
+    $("terminalBody").innerHTML = "";
+    logTerminal("Terminal cleared.", "info");
+  });
+}
+
+// --------------------------------------------------------------------------
 // Upload / dropzone
 // --------------------------------------------------------------------------
 function initDropzone() {
@@ -239,10 +268,12 @@ function getScopeMode() {
 // --------------------------------------------------------------------------
 async function startAnalysis() {
   const fd = new FormData();
+  const bundleLabel = state.selectedFile ? state.selectedFile.name : $("serverPath").value.trim();
   if (state.selectedFile) fd.append("file", state.selectedFile);
-  else fd.append("server_path", $("serverPath").value.trim());
+  else fd.append("server_path", bundleLabel);
 
-  fd.append("focus", $("focusInput").value.trim());
+  const focusText = $("focusInput").value.trim();
+  fd.append("focus", focusText);
   fd.append("min_severity", $("optMinSeverity").value);
   fd.append("top_per_category", $("optTopPerCategory").value);
 
@@ -263,9 +294,13 @@ async function startAnalysis() {
   state.autoSynthesizeNext = true;
 
   state.analyzing = true;
+  state.terminalProgressCount = 0;
   activateMainTab("progress");
   $("progressError").classList.add("hidden");
   $("progressLog").innerHTML = "";
+
+  logTerminal(`▶ Starting analysis: ${bundleLabel || "(no bundle specified)"}`, "info");
+  logTerminal(focusText ? `🎯 Focus: ${focusText}` : "🎯 No focus specified - general full-bundle analysis", "info");
 
   let resp;
   try {
@@ -289,6 +324,7 @@ function showProgressError(msg) {
   $("progressError").classList.remove("hidden");
   state.analyzing = false;
   updatePlaceholders();
+  logTerminal(`❌ ${msg}`, "error");
 }
 
 function pollJob() {
@@ -303,6 +339,10 @@ function pollJob() {
     if (!resp.ok) return;
     const job = await resp.json();
     renderProgressLog(job.progress);
+    if (job.progress.length > state.terminalProgressCount) {
+      job.progress.slice(state.terminalProgressCount).forEach((line) => logTerminal(line, "info"));
+      state.terminalProgressCount = job.progress.length;
+    }
     if (job.status === "done") {
       clearInterval(state.pollTimer);
       await loadResults();
@@ -336,6 +376,13 @@ async function loadResults(jobIdOverride) {
   const facts = await factsResp.json();
 
   state.jobResult = { job, digest, findings, timeline, facts };
+
+  const isFreshRun = state.autoSynthesizeNext;
+  if (isFreshRun && job.summary) {
+    logTerminal(`✅ Analysis complete — ${job.summary.num_findings} findings, ${job.summary.num_files} files, ${job.summary.elapsed_seconds.toFixed(1)}s`, "success");
+  } else {
+    logTerminal(`📂 Loaded results for job ${jobId}`, "info");
+  }
 
   state.analyzing = false;
   activateMainTab("results");
@@ -576,19 +623,125 @@ function renderAiFields(providerKey, authType) {
   if (!p) return;
   const authCfg = p.auth_types[authType] || p.auth_types[p.default_auth_type];
   const saved = state.savedAiSettings || {};
-  $("aiFields").innerHTML = authCfg.fields
-    .map((f) => {
-      const isSecret = f === "api_key" || f === "client_secret";
-      const value =
-        (saved.provider === providerKey && saved.auth_type === authType && saved[f]) ||
-        (f === "model" ? p.default_model : "") ||
-        (f === "base_url" ? p.default_base_url || "" : "");
-      return `<div class="field-row">
-        <label for="ai_${f}">${fieldLabel(f)}${f === "model" ? ` <span class="muted small">(${escapeHtml(p.model_hint || "")})</span>` : ""}</label>
-        <input type="${isSecret ? "password" : "text"}" id="ai_${f}" value="${escapeHtml(String(value))}">
-      </div>`;
-    })
+  const sameSaved = saved.provider === providerKey && saved.auth_type === authType ? saved : {};
+
+  $("aiFields").innerHTML = authCfg.fields.map((f) => renderAiFieldHtml(f, p, sameSaved)).join("");
+
+  // Only fields named "model" with a curated known_models list get the
+  // dropdown + "Check available models" treatment (Azure OpenAI's
+  // "deployment" field is user-defined and stays plain text).
+  if (authCfg.fields.includes("model") && p.known_models && p.known_models.length) {
+    wireModelSelect(providerKey);
+  }
+}
+
+function renderAiFieldHtml(f, p, saved) {
+  if (f === "model" && p.known_models && p.known_models.length) {
+    return renderModelFieldHtml(p, saved);
+  }
+  const isSecret = f === "api_key" || f === "client_secret";
+  const value = saved[f] || (f === "base_url" ? p.default_base_url || "" : "");
+  return `<div class="field-row">
+    <label for="ai_${f}">${fieldLabel(f)}</label>
+    <input type="${isSecret ? "password" : "text"}" id="ai_${f}" value="${escapeHtml(String(value))}">
+  </div>`;
+}
+
+// Model field: a <select> of curated known models (from PROVIDERS[..].known_models)
+// plus a "Custom / other model…" fallback (curated lists can't be
+// exhaustive, and new models ship often). "Check available models"
+// queries /api/models with the credentials currently filled in and
+// disables (greys out, via the native disabled attribute) any known
+// option the live check didn't confirm - see checkModelAvailability().
+function renderModelFieldHtml(p, saved) {
+  const savedModel = saved.model || "";
+  const isCustom = !!savedModel && !p.known_models.includes(savedModel);
+  const selected = savedModel || p.default_model;
+  const options = p.known_models
+    .map((m) => `<option value="${escapeHtml(m)}" ${!isCustom && m === selected ? "selected" : ""}>${escapeHtml(m)}</option>`)
     .join("");
+  return `<div class="field-row">
+    <label for="ai_model">Model <span class="muted small">(${escapeHtml(p.model_hint || "")})</span></label>
+    <select id="ai_model">
+      ${options}
+      <option value="__custom__" ${isCustom ? "selected" : ""}>Custom / other model…</option>
+    </select>
+    <div class="field-row ${isCustom ? "" : "hidden"}" id="aiModelCustomRow" style="margin-top:6px;">
+      <input type="text" id="ai_model_custom" placeholder="Enter exact model name" value="${isCustom ? escapeHtml(savedModel) : ""}">
+    </div>
+    <div class="model-check-row">
+      <button type="button" id="btnCheckModels" class="btn btn-ghost btn-sm">🔎 Check available models</button>
+      <span id="modelCheckStatus" class="muted small"></span>
+    </div>
+  </div>`;
+}
+
+function wireModelSelect(providerKey) {
+  const sel = $("ai_model");
+  if (!sel) return;
+  sel.addEventListener("change", () => {
+    $("aiModelCustomRow").classList.toggle("hidden", sel.value !== "__custom__");
+  });
+  const btn = $("btnCheckModels");
+  if (btn) btn.addEventListener("click", () => checkModelAvailability(providerKey));
+}
+
+// Reads a field's current value, routing "model" through the
+// select/custom-input pair instead of a plain ai_model text box.
+function getFieldValue(f) {
+  if (f === "model") {
+    const sel = $("ai_model");
+    if (!sel) return "";
+    if (sel.value === "__custom__") {
+      const custom = $("ai_model_custom");
+      return custom ? custom.value.trim() : "";
+    }
+    return sel.value;
+  }
+  const el = $(`ai_${f}`);
+  return el ? el.value.trim() : "";
+}
+
+async function checkModelAvailability(providerKey) {
+  const p = state.providers[providerKey];
+  if (!p) return;
+  const authType = $("aiAuthType").value;
+  const authCfg = p.auth_types[authType] || p.auth_types[p.default_auth_type];
+  const payload = { provider: providerKey };
+  authCfg.fields.forEach((f) => {
+    if (f !== "model") payload[f] = getFieldValue(f);
+  });
+
+  const statusEl = $("modelCheckStatus");
+  statusEl.textContent = "Checking…";
+  logTerminal(`🔎 Checking available models for ${p.label}…`, "info");
+  try {
+    const resp = await fetch("/api/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    const sel = $("ai_model");
+    if (data.available && sel) {
+      let disabledCount = 0;
+      Array.from(sel.options).forEach((opt) => {
+        if (opt.value === "__custom__") return;
+        const isAvailable = data.available.includes(opt.value);
+        opt.disabled = !isAvailable;
+        if (!isAvailable) disabledCount++;
+      });
+      const selectedDisabled = sel.selectedOptions[0] && sel.selectedOptions[0].disabled;
+      statusEl.textContent = `✅ ${data.available.length} model(s) confirmed available` + (selectedDisabled ? " — ⚠ your current selection may be unavailable" : "");
+      logTerminal(`✅ ${p.label}: ${data.available.length} model(s) available${disabledCount ? `, ${disabledCount} known model(s) greyed out` : ""}`, "success");
+    } else {
+      statusEl.textContent = `⚠ ${data.error || "Could not verify - showing known models"}`;
+      logTerminal(`⚠ Could not verify live model availability for ${p.label}: ${data.error || "unknown reason"}`, "warn");
+    }
+  } catch (err) {
+    statusEl.textContent = "⚠ Check failed (network error)";
+    logTerminal(`⚠ Model availability check failed: ${err.message}`, "warn");
+  }
 }
 
 function loadAiSettings() {
@@ -610,7 +763,7 @@ function saveAiSettingsIfRequested() {
   const p = state.providers[providerKey];
   const authCfg = p.auth_types[authType] || p.auth_types[p.default_auth_type];
   const settings = { provider: providerKey, auth_type: authType };
-  authCfg.fields.forEach((f) => { settings[f] = $(`ai_${f}`).value; });
+  authCfg.fields.forEach((f) => { settings[f] = getFieldValue(f); });
   localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(settings));
   state.savedAiSettings = settings;
 }
@@ -632,7 +785,7 @@ function collectAiPayload() {
   }
   const authCfg = p.auth_types[authType] || p.auth_types[p.default_auth_type];
   authCfg.fields.forEach((f) => {
-    const val = $(`ai_${f}`).value.trim();
+    const val = getFieldValue(f);
     if (!val) missing.push(fieldLabel(f));
     payload[f] = val;
   });
@@ -654,6 +807,10 @@ async function runSynthesis() {
   $("btnSynthesize").textContent = "Generating…";
   $("aiRender").innerHTML = '<p class="muted">Waiting for the model to respond…</p>';
   $("btnDownloadReport").classList.add("hidden");
+
+  const providerLabel = (state.providers[payload.provider] || {}).label || payload.provider;
+  const authCfg = ((state.providers[payload.provider] || {}).auth_types || {})[payload.auth_type];
+  logTerminal(`🤖 Requesting AI root-cause report from ${providerLabel}${authCfg ? ` (${authCfg.label})` : ""}…`, "info");
 
   let accumulated = "";
   try {
@@ -689,9 +846,11 @@ async function runSynthesis() {
         }
       }
     }
+    logTerminal(`✅ AI report generated (${accumulated.length.toLocaleString()} chars)`, "success");
   } catch (err) {
     $("aiError").textContent = `Generation failed: ${err.message}`;
     $("aiError").classList.remove("hidden");
+    logTerminal(`❌ AI generation failed: ${err.message}`, "error");
   } finally {
     $("btnSynthesize").disabled = false;
     $("btnSynthesize").textContent = accumulated ? "Regenerate root-cause report" : "Generate root-cause report";
@@ -705,9 +864,11 @@ function downloadReport() {
   const blob = new Blob([content], { type: "text/markdown" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `ldi-copilot-report-${state.jobId || "analysis"}.md`;
+  const filename = `ldi-copilot-report-${state.jobId || "analysis"}.md`;
+  a.download = filename;
   a.click();
   URL.revokeObjectURL(a.href);
+  logTerminal(`⬇ Downloaded report as ${filename}`, "success");
 }
 
 // --------------------------------------------------------------------------
@@ -750,9 +911,11 @@ function resetToUpload() {
   // node's crm_report) for the very same investigation, and retyping
   // the focus + API key every time would be needless friction.
   updateAnalyzeEnabled();
+  logTerminal("🔄 Ready for a new analysis.", "info");
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  initTerminal();
   initDropzone();
   initScopeToggle();
   initTabs();

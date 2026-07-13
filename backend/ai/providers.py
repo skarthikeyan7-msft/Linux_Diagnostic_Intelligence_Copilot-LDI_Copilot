@@ -186,11 +186,100 @@ def stream_ollama(model, messages, base_url="http://localhost:11434"):
     yield from _post_stream(url, headers, body, extract, timeout=600)  # local models on modest hardware can be slow
 
 
+def _get_json(url, headers=None, timeout=15):
+    """GET url and parse the JSON response body. Raises ProviderError with
+    a clean, human-readable message on any HTTP/network/timeout/parse
+    failure. Used by the list_models_*() live-availability checks below,
+    which are inherently best-effort - the caller (backend/app.py's
+    /api/models endpoint) catches this and falls back to the static
+    known_models list rather than blocking the model picker."""
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(detail).get("error", {}).get("message", detail)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        raise ProviderError(f"HTTP {e.code}: {detail[:300]}") from e
+    except urllib.error.URLError as e:
+        raise ProviderError(f"connection error: {e.reason}") from e
+    except TimeoutError as e:
+        raise ProviderError(f"request timed out: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ProviderError(f"unexpected (non-JSON) response: {e}") from e
+
+
+def list_models_openai(api_key, base_url="https://api.openai.com/v1"):
+    """Live model list for the OpenAI account behind api_key - GET
+    {base_url}/models. Used to grey out known_models entries the
+    account doesn't actually have access to."""
+    obj = _get_json(f"{base_url.rstrip('/')}/models", {"Authorization": f"Bearer {api_key}"})
+    return sorted(m["id"] for m in obj.get("data", []) if m.get("id"))
+
+
+def list_models_anthropic(api_key):
+    """Live model list from Anthropic's Models API (same auth headers as
+    the Messages API)."""
+    obj = _get_json(
+        "https://api.anthropic.com/v1/models",
+        {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+    )
+    return sorted(m["id"] for m in obj.get("data", []) if m.get("id"))
+
+
+def list_models_ollama(base_url="http://localhost:11434"):
+    """Live model list = whatever's actually pulled locally (GET
+    {base_url}/api/tags) - the most precise "availability" signal of any
+    provider here, since an Ollama model is either present on disk or it
+    isn't."""
+    obj = _get_json(f"{base_url.rstrip('/')}/api/tags")
+    return sorted(m["name"] for m in obj.get("models", []) if m.get("name"))
+
+
+def list_models(provider, **kwargs):
+    """Best-effort live availability check dispatcher. Raises
+    ProviderError on failure (network/auth/timeout/unsupported
+    provider) - callers must catch this and fall back to the static
+    known_models list rather than blocking the model picker on a
+    failed or not-yet-possible check (e.g. credentials not filled in
+    yet)."""
+    if provider == "openai":
+        return list_models_openai(kwargs["api_key"], kwargs.get("base_url") or "https://api.openai.com/v1")
+    elif provider == "anthropic":
+        return list_models_anthropic(kwargs["api_key"])
+    elif provider == "ollama":
+        return list_models_ollama(kwargs.get("base_url") or "http://localhost:11434")
+    else:
+        raise ProviderError(f"live model listing is not supported for provider {provider!r} (Azure OpenAI deployment names are user-defined and can't be enumerated this way)")
+
+
 # Provider registry - drives the frontend's provider/model picker. Keys
 # are stable identifiers used in API requests. Every provider exposes at
 # least one entry under "auth_types" (keyed by an auth_type identifier);
 # the frontend only shows an authentication-type selector when a
 # provider has more than one option (currently just Azure OpenAI).
+#
+# KNOWN_MODELS is a curated static baseline shown in the frontend's model
+# dropdown for providers with a "model" field (Azure OpenAI uses a
+# user-defined "deployment" name instead, so it's excluded). The
+# "Check available models" button calls list_models() above to fetch
+# the live list for the account/instance behind the entered credentials
+# and greys out (disables) any known_models entry not actually present -
+# a live check failure (or not having entered credentials yet) simply
+# leaves every option selectable, since this is meant to help, not
+# block, model selection.
+KNOWN_MODELS = {
+    "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4-turbo", "gpt-3.5-turbo", "o3", "o3-mini", "o1"],
+    "anthropic": [
+        "claude-sonnet-4-5-20250929", "claude-opus-4-5", "claude-haiku-4-5",
+        "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
+    ],
+    "ollama": ["llama3.1", "llama3.2", "qwen2.5", "mistral", "phi3", "gemma2"],
+}
+
 PROVIDERS = {
     "openai": {
         "label": "OpenAI",
@@ -200,6 +289,7 @@ PROVIDERS = {
         "default_auth_type": "api_key",
         "default_model": "gpt-4o",
         "model_hint": "e.g. gpt-4o, gpt-4o-mini, o3",
+        "known_models": KNOWN_MODELS["openai"],
         "local": False,
     },
     "anthropic": {
@@ -210,6 +300,7 @@ PROVIDERS = {
         "default_auth_type": "api_key",
         "default_model": "claude-sonnet-4-5-20250929",
         "model_hint": "e.g. claude-sonnet-4-5-20250929, claude-opus-4-5",
+        "known_models": KNOWN_MODELS["anthropic"],
         "local": False,
     },
     "azure_openai": {
@@ -237,6 +328,7 @@ PROVIDERS = {
         "default_auth_type": "none",
         "default_model": "llama3.1",
         "model_hint": "any model you've pulled locally, e.g. llama3.1, qwen2.5, mistral",
+        "known_models": KNOWN_MODELS["ollama"],
         "default_base_url": "http://localhost:11434",
         "local": True,
     },
