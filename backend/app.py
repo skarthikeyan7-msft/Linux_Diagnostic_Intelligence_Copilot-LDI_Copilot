@@ -42,7 +42,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="2.1.0")
+app = FastAPI(title="LDI Copilot", version="2.1.1")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
