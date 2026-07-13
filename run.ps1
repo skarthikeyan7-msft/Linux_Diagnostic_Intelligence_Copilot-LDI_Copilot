@@ -1,4 +1,4 @@
-# sosreport-rca-webapp
+# LDI Copilot (Linux Diagnostic Intelligence Copilot)
 # One-command local launcher: creates/uses a local venv, installs
 # dependencies if needed, then starts the server and opens the browser.
 param(
@@ -22,7 +22,7 @@ Write-Host "Installing/checking dependencies..." -ForegroundColor Cyan
 
 $url = "http://${HostAddress}:${Port}"
 Write-Host ""
-Write-Host "Starting sosreport-rca-webapp at $url" -ForegroundColor Green
+Write-Host "Starting LDI Copilot at $url" -ForegroundColor Green
 Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
 Write-Host ""
 

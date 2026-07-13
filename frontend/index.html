@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>sosreport-rca — AI Root Cause Analysis</title>
+<title>LDI Copilot — Linux Diagnostic Intelligence Copilot</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,9 +11,15 @@
 
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">RCA</span>
-      <span class="brand-name">sosreport-rca</span>
-      <span class="brand-sub">sosreport · supportconfig · crm_report</span>
+      <svg class="ms-logo" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
+        <rect x="0" y="0" width="11" height="11" fill="#F25022"/>
+        <rect x="13" y="0" width="11" height="11" fill="#7FBA00"/>
+        <rect x="0" y="13" width="11" height="11" fill="#00A4EF"/>
+        <rect x="13" y="13" width="11" height="11" fill="#FFB900"/>
+      </svg>
+      <span class="brand-mark">LDI</span>
+      <span class="brand-name">LDI Copilot</span>
+      <span class="brand-sub">Linux Diagnostic Intelligence Copilot · sosreport · supportconfig · crm_report</span>
     </div>
     <div class="topbar-right">
       <span class="privacy-pill" title="This app runs entirely on your machine. Bundle data never leaves localhost unless you choose a cloud AI provider for synthesis.">🔒 Local-only</span>
@@ -30,6 +36,12 @@
   </aside>
 
   <main class="main">
+
+    <nav class="main-tabs">
+      <button class="main-tab-btn active" data-main-tab="upload">1. Provide Bundle</button>
+      <button class="main-tab-btn" data-main-tab="progress">2. Analyzing</button>
+      <button class="main-tab-btn" data-main-tab="results">3. Results</button>
+    </nav>
 
     <!-- STEP 1: Upload -->
     <section id="uploadSection" class="panel">
@@ -50,7 +62,36 @@
         <input type="text" id="serverPath" placeholder="C:\path\to\sosreport-hostname-2026-07-10.tar.xz">
       </div>
 
-      <div id="focusAiPanelMountStep1"></div>
+      <div id="focusAiPanel" class="focus-ai-panel">
+        <h3>🎯 What are you investigating?</h3>
+        <p class="muted small">Describe the specific issue you want root-caused, e.g. "find root cause of NC and IP cluster resource restart issue". This steers both the mechanical scan (a dedicated Focused Findings section) and the AI report — instead of a generic exhaustive report, you'll get an answer to this question specifically. Leave blank for a general full-bundle analysis.</p>
+        <div class="field-row">
+          <label for="focusInput">Investigation focus (optional but recommended)</label>
+          <textarea id="focusInput" rows="2" placeholder="e.g. find root cause of NC and IP cluster resource restart issue"></textarea>
+        </div>
+
+        <hr>
+
+        <h3>🤖 AI model for root-cause synthesis</h3>
+        <p class="muted small">Configure now so a full AI-reasoned report is generated automatically right after analysis — or leave blank and configure later from this same panel (use the "✏️ Edit focus &amp; AI settings" shortcut on the Results tab to jump back here any time).</p>
+        <div class="field-row">
+          <label for="aiProvider">AI provider</label>
+          <select id="aiProvider"></select>
+        </div>
+        <div class="field-row hidden" id="authTypeRow">
+          <label for="aiAuthType">Authentication type</label>
+          <select id="aiAuthType"></select>
+        </div>
+        <div id="aiFields" class="options-grid"></div>
+        <div class="field-row">
+          <label for="aiExtraContext">Extra context for the model (optional)</label>
+          <textarea id="aiExtraContext" rows="2" placeholder="e.g. this happened right after a maintenance window / patch deployment…"></textarea>
+        </div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="aiRemember"> Remember these settings on this device (localStorage; secrets stored locally only, never uploaded anywhere but the provider you select)
+        </label>
+        <p class="muted small">⚠️ This sends the evidence digest (system/cluster names, log excerpts, IPs, etc.) to the AI provider you select. Choose <strong>Ollama (local)</strong> if the bundle is sensitive and must never leave this machine.</p>
+      </div>
 
       <details class="advanced-options">
         <summary>Advanced options (time-window scoping, severity)</summary>
@@ -104,93 +145,68 @@
     <!-- STEP 2: Progress -->
     <section id="progressSection" class="panel hidden">
       <h2>2. Analyzing…</h2>
-      <div class="progress-log" id="progressLog"></div>
       <div id="progressError" class="alert alert-error hidden"></div>
+      <div id="progressPlaceholder" class="placeholder-empty">No analysis is currently running. Head to the <strong>"1. Provide Bundle"</strong> tab to start one.</div>
+      <div id="progressContent" class="hidden">
+        <div class="progress-log" id="progressLog"></div>
+      </div>
     </section>
 
     <!-- STEP 3: Results -->
     <section id="resultsSection" class="panel hidden">
       <h2>3. Results</h2>
 
-      <div class="summary-cards" id="summaryCards"></div>
+      <div id="resultsPlaceholder" class="placeholder-empty">No results yet. Run an analysis from the <strong>"1. Provide Bundle"</strong> tab, or pick a recent analysis from the top bar.</div>
 
-      <div id="focusCallout" class="callout callout-focus hidden"></div>
-      <div id="crmClusterStatus" class="callout hidden"></div>
+      <div id="resultsContent" class="hidden">
+        <div class="summary-cards" id="summaryCards"></div>
 
-      <div class="tabs">
-        <button class="tab-btn active" data-tab="ai">AI Root Cause Report</button>
-        <button class="tab-btn" data-tab="digest">Digest</button>
-        <button class="tab-btn" data-tab="findings">Findings</button>
-        <button class="tab-btn" data-tab="timeline">Timeline</button>
-      </div>
+        <div id="focusCallout" class="callout callout-focus hidden"></div>
+        <div id="crmClusterStatus" class="callout hidden"></div>
 
-      <div class="tab-panel" id="tab-ai">
-        <div id="focusAiPanelMountResults"></div>
-        <div class="ai-actions">
-          <button id="btnSynthesize" class="btn btn-primary">Generate root-cause report</button>
-          <button id="btnDownloadReport" class="btn btn-ghost hidden">Download report (.md)</button>
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="ai">AI Root Cause Report</button>
+          <button class="tab-btn" data-tab="digest">Digest</button>
+          <button class="tab-btn" data-tab="findings">Findings</button>
+          <button class="tab-btn" data-tab="timeline">Timeline</button>
         </div>
-        <div id="aiError" class="alert alert-error hidden"></div>
-        <div class="ai-render markdown-body" id="aiRender"></div>
-      </div>
 
-      <div class="tab-panel hidden" id="tab-digest">
-        <div class="digest-render markdown-body" id="digestRender"></div>
-      </div>
-
-      <div class="tab-panel hidden" id="tab-findings">
-        <div class="findings-toolbar">
-          <input type="text" id="findingsFilter" placeholder="Filter findings (category, text)…">
-          <label class="checkbox-row hidden" id="findingsFocusOnlyRow">
-            <input type="checkbox" id="findingsFocusOnly" checked> Show only findings matching my focus 🎯
-          </label>
+        <div class="tab-panel" id="tab-ai">
+          <div class="ai-tab-head">
+            <button id="btnEditFocusAi" class="btn btn-ghost btn-sm">✏️ Edit focus &amp; AI settings</button>
+          </div>
+          <div class="ai-actions">
+            <button id="btnSynthesize" class="btn btn-primary">Generate root-cause report</button>
+            <button id="btnDownloadReport" class="btn btn-ghost hidden">Download report (.md)</button>
+          </div>
+          <div id="aiError" class="alert alert-error hidden"></div>
+          <div class="ai-render markdown-body" id="aiRender"></div>
         </div>
-        <div id="findingsList" class="findings-list"></div>
-      </div>
 
-      <div class="tab-panel hidden" id="tab-timeline">
-        <div id="timelineList" class="timeline-list"></div>
-      </div>
+        <div class="tab-panel hidden" id="tab-digest">
+          <div class="digest-render markdown-body" id="digestRender"></div>
+        </div>
 
-      <button id="btnNewAnalysis" class="btn btn-ghost">Start a new analysis</button>
+        <div class="tab-panel hidden" id="tab-findings">
+          <div class="findings-toolbar">
+            <input type="text" id="findingsFilter" placeholder="Filter findings (category, text)…">
+            <label class="checkbox-row hidden" id="findingsFocusOnlyRow">
+              <input type="checkbox" id="findingsFocusOnly" checked> Show only findings matching my focus 🎯
+            </label>
+          </div>
+          <div id="findingsList" class="findings-list"></div>
+        </div>
+
+        <div class="tab-panel hidden" id="tab-timeline">
+          <div id="timelineList" class="timeline-list"></div>
+        </div>
+
+        <button id="btnNewAnalysis" class="btn btn-ghost">Start a new analysis</button>
+      </div>
     </section>
 
   </main>
 </div>
-
-<!-- Investigation focus + AI model panel. Lives in Step 1 initially and
-     is relocated (same DOM node, moved not cloned) into the AI Root
-     Cause Report tab once results are shown, so settings entered
-     up-front can also be tweaked afterward to regenerate without
-     re-running the mechanical scan. -->
-<template id="focusAiPanelTemplate">
-  <div id="focusAiPanel" class="focus-ai-panel">
-    <h3>🎯 What are you investigating?</h3>
-    <p class="muted small">Describe the specific issue you want root-caused, e.g. "find root cause of NC and IP cluster resource restart issue". This steers both the mechanical scan (a dedicated Focused Findings section) and the AI report — instead of a generic exhaustive report, you'll get an answer to this question specifically. Leave blank for a general full-bundle analysis.</p>
-    <div class="field-row">
-      <label for="focusInput">Investigation focus (optional but recommended)</label>
-      <textarea id="focusInput" rows="2" placeholder="e.g. find root cause of NC and IP cluster resource restart issue"></textarea>
-    </div>
-
-    <hr>
-
-    <h3>🤖 AI model for root-cause synthesis</h3>
-    <p class="muted small">Configure now so a full AI-reasoned report is generated automatically right after analysis — or leave blank and configure later from this same panel.</p>
-    <div class="field-row">
-      <label for="aiProvider">AI provider</label>
-      <select id="aiProvider"></select>
-    </div>
-    <div id="aiFields" class="options-grid"></div>
-    <div class="field-row">
-      <label for="aiExtraContext">Extra context for the model (optional)</label>
-      <textarea id="aiExtraContext" rows="2" placeholder="e.g. this happened right after a maintenance window / patch deployment…"></textarea>
-    </div>
-    <label class="checkbox-row">
-      <input type="checkbox" id="aiRemember"> Remember these settings on this device (localStorage; API key stored locally only, never uploaded anywhere but the provider you select)
-    </label>
-    <p class="muted small">⚠️ This sends the evidence digest (system/cluster names, log excerpts, IPs, etc.) to the AI provider you select. Choose <strong>Ollama (local)</strong> if the bundle is sensitive and must never leave this machine.</p>
-  </div>
-</template>
 
 <script src="app.js"></script>
 </body>

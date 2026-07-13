@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-07-13
+
+### Changed - BREAKING
+- **Project renamed and rebranded**: `sosreport-rca-webapp` is now **LDI Copilot (Linux Diagnostic Intelligence Copilot)**. Same project, same commit history, new identity — the GitHub repository, page title, header branding, `localStorage` settings key, and downloaded-report filename all reflect the new name. Old `localStorage` entries under the previous settings key are intentionally left orphaned rather than migrated (their shape changed anyway - see the `auth_type` restructuring below).
+- **AI provider registry restructured around authentication type**: every provider's config now lives under `auth_types: {key: {label, fields}}` instead of a flat `fields` list. This is a breaking change to the `/api/providers` response shape and the payload accepted by `/api/jobs/{id}/synthesize` (both now expect/return an `auth_type` alongside `provider`) - not backward compatible with v1.x API callers.
+- **UI navigation restructured as persistent top-level tabs**: "Provide Bundle", "Analyzing", and "Results" are now always-visible, freely-clickable tabs at the top of the page instead of a forced linear 3-step wizard. The focus + AI settings panel that used to physically relocate between step 1 and the results view now lives permanently in the "Provide Bundle" tab; the Results tab's AI section gained a "✏️ Edit focus & AI settings" button that jumps back to it instead.
+
+### Added
+- **Microsoft Entra ID authentication for Azure OpenAI**: choose "Microsoft Entra ID" as the authentication type (alongside the existing API Key option) and authenticate via an app registration (service principal) - Tenant ID, Client ID, and Client secret - instead of an API key. Uses the standard OAuth2 client-credentials flow against `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` (scope `https://cognitiveservices.azure.com/.default`), then calls Azure OpenAI with an `Authorization: Bearer` header. A fresh token is requested per synthesis call; nothing is cached or written to disk. See the README for full app-registration/RBAC setup steps.
+- An **Authentication Type** dropdown appears in the AI config panel whenever the selected provider offers more than one option (currently just Azure OpenAI); other providers are unaffected and still show only their relevant fields.
+- Empty-state placeholders on the "Analyzing" and "Results" tabs so visiting them before starting/completing an analysis shows a helpful message instead of a blank panel.
+- A small Microsoft logo mark (inline SVG, no external asset) next to the app name in the header.
+
+### Fixed
+- Fixed a design flaw in the previous panel-relocation mechanism where starting a second analysis from "Provide Bundle" after visiting "Results" could reference stale/detached DOM nodes; the new architecture (panel never moves, tabs just show/hide) eliminates that class of bug entirely.
+
 ## [1.1.0] - 2026-07-13
 
 ### Added
@@ -34,5 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
-[1.1.0]: https://github.com/skarthikeyan7-msft/sosreport-rca-webapp/releases/tag/v1.1.0
-[1.0.0]: https://github.com/skarthikeyan7-msft/sosreport-rca-webapp/releases/tag/v1.0.0
+[2.0.0]: https://github.com/skarthikeyan7-msft/ldi-copilot/releases/tag/v2.0.0
+[1.1.0]: https://github.com/skarthikeyan7-msft/ldi-copilot/releases/tag/v1.1.0
+[1.0.0]: https://github.com/skarthikeyan7-msft/ldi-copilot/releases/tag/v1.0.0

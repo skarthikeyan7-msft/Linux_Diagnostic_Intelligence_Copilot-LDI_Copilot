@@ -58,7 +58,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -1500,7 +1500,7 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
     output_dir = Path(output_dir).resolve() if output_dir else (input_path.parent / f"{default_name}_analysis")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    report(f"sosreport-rca analyzer v{__version__}")
+    report(f"LDI Copilot analysis engine v{__version__}")
     t0 = time.time()
     if input_path.is_dir():
         root = resolve_root(input_path)  # auto-descend if user pointed at a wrapper folder with one subdir

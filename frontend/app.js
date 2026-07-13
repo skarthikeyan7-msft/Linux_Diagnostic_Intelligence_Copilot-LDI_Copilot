@@ -1,4 +1,4 @@
-// sosreport-rca-webapp frontend
+// LDI Copilot (Linux Diagnostic Intelligence Copilot) frontend
 // Vanilla JS, no build step, no external CDN dependencies (including the
 // markdown renderer below) - this app is designed to work fully offline,
 // consistent with the Ollama local-model option.
@@ -10,7 +10,10 @@ const state = {
   pollTimer: null,
   jobResult: null,   // {summary, digest, findings, timeline, facts}
   providers: {},
+  savedAiSettings: null,
   autoSynthesizeNext: false, // set true right before submitting a fresh analysis; consumed (and reset) the next time results load
+  analyzing: false,  // true while a job is in flight; drives the Analyzing tab's placeholder vs. progress log
+  activeMainTab: "upload",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -135,24 +138,35 @@ function markdownToHtml(md) {
 }
 
 // --------------------------------------------------------------------------
-// Focus + AI config panel relocation. The panel (focus textarea + AI
-// provider/model config) is defined once as a <template> and lives
-// physically in Step 1 initially; it's moved (not cloned) into the AI
-// Root Cause Report tab once results are shown, so the same settings
-// used for the initial auto-run can be tweaked afterward to regenerate
-// without re-running the mechanical scan.
+// Top-level tabs: Provide Bundle / Analyzing / Results are always visible
+// and clickable - not a forced linear wizard. The focus + AI config panel
+// lives permanently in the Provide Bundle tab's DOM and is never moved;
+// hidden (display:none) tabs stay fully queryable via getElementById, so
+// starting a second analysis from Step 1 never hits stale/null field
+// references the way physically relocating the panel would. Submitting
+// an analysis / finishing one still auto-advances the active tab for a
+// guided feel, but the user can always click back and forth manually.
 // --------------------------------------------------------------------------
-function initFocusAiPanel() {
-  const tpl = $("focusAiPanelTemplate");
-  $("focusAiPanelMountStep1").appendChild(tpl.content.cloneNode(true));
+function activateMainTab(tabName) {
+  document.querySelectorAll(".main-tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.mainTab === tabName));
+  $("uploadSection").classList.toggle("hidden", tabName !== "upload");
+  $("progressSection").classList.toggle("hidden", tabName !== "progress");
+  $("resultsSection").classList.toggle("hidden", tabName !== "results");
+  state.activeMainTab = tabName;
+  updatePlaceholders();
 }
 
-function relocateFocusAiPanel(toResults) {
-  const panel = document.getElementById("focusAiPanel");
-  const mount = document.getElementById(toResults ? "focusAiPanelMountResults" : "focusAiPanelMountStep1");
-  if (panel && mount && panel.parentElement !== mount) {
-    mount.appendChild(panel);
-  }
+function updatePlaceholders() {
+  $("progressPlaceholder").classList.toggle("hidden", state.analyzing);
+  $("progressContent").classList.toggle("hidden", !state.analyzing);
+  $("resultsPlaceholder").classList.toggle("hidden", !!state.jobResult);
+  $("resultsContent").classList.toggle("hidden", !state.jobResult);
+}
+
+function initMainTabs() {
+  document.querySelectorAll(".main-tab-btn").forEach((btn) => {
+    btn.addEventListener("click", () => activateMainTab(btn.dataset.mainTab));
+  });
 }
 
 // --------------------------------------------------------------------------
@@ -248,8 +262,8 @@ async function startAnalysis() {
   // and never fires when merely revisiting a "Recent analysis".
   state.autoSynthesizeNext = true;
 
-  $("uploadSection").classList.add("hidden");
-  $("progressSection").classList.remove("hidden");
+  state.analyzing = true;
+  activateMainTab("progress");
   $("progressError").classList.add("hidden");
   $("progressLog").innerHTML = "";
 
@@ -273,6 +287,8 @@ async function startAnalysis() {
 function showProgressError(msg) {
   $("progressError").textContent = msg;
   $("progressError").classList.remove("hidden");
+  state.analyzing = false;
+  updatePlaceholders();
 }
 
 function pollJob() {
@@ -321,9 +337,8 @@ async function loadResults(jobIdOverride) {
 
   state.jobResult = { job, digest, findings, timeline, facts };
 
-  $("progressSection").classList.add("hidden");
-  $("resultsSection").classList.remove("hidden");
-  relocateFocusAiPanel(true);
+  state.analyzing = false;
+  activateMainTab("results");
   activateTab("ai"); // always land on the AI report for fresh results
 
   renderSummaryCards(job.summary, facts);
@@ -504,7 +519,12 @@ function initTabs() {
 // --------------------------------------------------------------------------
 // AI provider config + synthesis (SSE via fetch, since EventSource can't POST)
 // --------------------------------------------------------------------------
-const AI_SETTINGS_KEY = "sosreport-rca-ai-settings";
+// Renamed from "sosreport-rca-ai-settings" for the v2.0.0 rebrand + the
+// auth_type restructuring - old localStorage entries under the previous
+// key used a different (pre-auth_type) shape and are intentionally left
+// orphaned rather than migrated, to avoid loading stale/incompatible
+// saved settings under the new schema.
+const AI_SETTINGS_KEY = "ldi-copilot-ai-settings";
 
 async function initAiProviders() {
   const resp = await fetch("/api/providers");
@@ -513,36 +533,58 @@ async function initAiProviders() {
   sel.innerHTML = Object.entries(state.providers)
     .map(([key, p]) => `<option value="${key}">${escapeHtml(p.label)}${p.local ? " 🔒" : ""}</option>`)
     .join("");
-  sel.addEventListener("change", () => renderAiFields(sel.value));
+  sel.addEventListener("change", () => renderAuthTypeSelector(sel.value));
+  $("aiAuthType").addEventListener("change", () => renderAiFields(sel.value, $("aiAuthType").value));
 
-  const saved = loadAiSettings();
-  if (saved && saved.provider && state.providers[saved.provider]) {
-    sel.value = saved.provider;
+  state.savedAiSettings = loadAiSettings();
+  if (state.savedAiSettings && state.savedAiSettings.provider && state.providers[state.savedAiSettings.provider]) {
+    sel.value = state.savedAiSettings.provider;
   }
-  renderAiFields(sel.value, saved);
+  renderAuthTypeSelector(sel.value);
 }
 
-function fieldLabel(provider, field) {
+function fieldLabel(field) {
   const labels = {
     api_key: "API key", model: "Model", endpoint: "Endpoint URL",
     deployment: "Deployment name", base_url: "Base URL",
+    tenant_id: "Directory (tenant) ID", client_id: "Application (client) ID",
+    client_secret: "Client secret",
   };
   return labels[field] || field;
 }
 
-function renderAiFields(providerKey, saved) {
+// Azure OpenAI is the only provider with more than one auth_types entry
+// today (API Key vs. Microsoft Entra ID) - the dropdown only shows up
+// for providers where there's an actual choice to make; providers with
+// exactly one auth_type still work correctly since a single <option>
+// is auto-selected as the <select>'s value even while its row is hidden.
+function renderAuthTypeSelector(providerKey) {
   const p = state.providers[providerKey];
   if (!p) return;
-  saved = saved || {};
-  $("aiFields").innerHTML = p.fields
+  const saved = state.savedAiSettings;
+  const authTypes = Object.entries(p.auth_types);
+  const sel = $("aiAuthType");
+  sel.innerHTML = authTypes.map(([key, cfg]) => `<option value="${key}">${escapeHtml(cfg.label)}</option>`).join("");
+  $("authTypeRow").classList.toggle("hidden", authTypes.length <= 1);
+  const wanted = (saved && saved.provider === providerKey && saved.auth_type) || p.default_auth_type;
+  if (authTypes.some(([key]) => key === wanted)) sel.value = wanted;
+  renderAiFields(providerKey, sel.value);
+}
+
+function renderAiFields(providerKey, authType) {
+  const p = state.providers[providerKey];
+  if (!p) return;
+  const authCfg = p.auth_types[authType] || p.auth_types[p.default_auth_type];
+  const saved = state.savedAiSettings || {};
+  $("aiFields").innerHTML = authCfg.fields
     .map((f) => {
-      const isSecret = f === "api_key";
+      const isSecret = f === "api_key" || f === "client_secret";
       const value =
-        (saved.provider === providerKey && saved[f]) ||
+        (saved.provider === providerKey && saved.auth_type === authType && saved[f]) ||
         (f === "model" ? p.default_model : "") ||
         (f === "base_url" ? p.default_base_url || "" : "");
       return `<div class="field-row">
-        <label for="ai_${f}">${fieldLabel(providerKey, f)}${f === "model" ? ` <span class="muted small">(${escapeHtml(p.model_hint || "")})</span>` : ""}</label>
+        <label for="ai_${f}">${fieldLabel(f)}${f === "model" ? ` <span class="muted small">(${escapeHtml(p.model_hint || "")})</span>` : ""}</label>
         <input type="${isSecret ? "password" : "text"}" id="ai_${f}" value="${escapeHtml(String(value))}">
       </div>`;
     })
@@ -560,20 +602,26 @@ function loadAiSettings() {
 function saveAiSettingsIfRequested() {
   if (!$("aiRemember").checked) {
     localStorage.removeItem(AI_SETTINGS_KEY);
+    state.savedAiSettings = null;
     return;
   }
   const providerKey = $("aiProvider").value;
+  const authType = $("aiAuthType").value;
   const p = state.providers[providerKey];
-  const settings = { provider: providerKey };
-  p.fields.forEach((f) => { settings[f] = $(`ai_${f}`).value; });
+  const authCfg = p.auth_types[authType] || p.auth_types[p.default_auth_type];
+  const settings = { provider: providerKey, auth_type: authType };
+  authCfg.fields.forEach((f) => { settings[f] = $(`ai_${f}`).value; });
   localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(settings));
+  state.savedAiSettings = settings;
 }
 
 function collectAiPayload() {
   const providerKey = $("aiProvider").value;
   const p = state.providers[providerKey];
+  const authType = $("aiAuthType").value;
   const payload = {
     provider: providerKey,
+    auth_type: authType,
     extra_context: $("aiExtraContext").value,
     focus_text: $("focusInput") ? $("focusInput").value.trim() : "",
   };
@@ -582,9 +630,10 @@ function collectAiPayload() {
     missing.push("provider");
     return { payload, missing };
   }
-  p.fields.forEach((f) => {
+  const authCfg = p.auth_types[authType] || p.auth_types[p.default_auth_type];
+  authCfg.fields.forEach((f) => {
     const val = $(`ai_${f}`).value.trim();
-    if (!val) missing.push(fieldLabel(providerKey, f));
+    if (!val) missing.push(fieldLabel(f));
     payload[f] = val;
   });
   return { payload, missing };
@@ -656,7 +705,7 @@ function downloadReport() {
   const blob = new Blob([content], { type: "text/markdown" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `rca-report-${state.jobId || "analysis"}.md`;
+  a.download = `ldi-copilot-report-${state.jobId || "analysis"}.md`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
@@ -680,9 +729,6 @@ async function loadRecentJobs() {
   document.querySelectorAll(".recent-item").forEach((item) => {
     item.addEventListener("click", async () => {
       $("recentPanel").classList.add("hidden");
-      $("uploadSection").classList.add("hidden");
-      $("progressSection").classList.add("hidden");
-      $("resultsSection").classList.remove("hidden");
       await loadResults(item.dataset.id);
     });
   });
@@ -692,10 +738,7 @@ async function loadRecentJobs() {
 // Wire everything up
 // --------------------------------------------------------------------------
 function resetToUpload() {
-  $("resultsSection").classList.add("hidden");
-  $("progressSection").classList.add("hidden");
-  $("uploadSection").classList.remove("hidden");
-  relocateFocusAiPanel(false);
+  activateMainTab("upload");
   state.selectedFile = null;
   state.jobId = null;
   state.autoSynthesizeNext = false;
@@ -710,17 +753,19 @@ function resetToUpload() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  initFocusAiPanel();
   initDropzone();
   initScopeToggle();
   initTabs();
+  initMainTabs();
   initAiProviders();
   loadRecentJobs();
+  updatePlaceholders();
 
   $("btnAnalyze").addEventListener("click", startAnalysis);
   $("btnNewAnalysis").addEventListener("click", resetToUpload);
   $("btnSynthesize").addEventListener("click", runSynthesis);
   $("btnDownloadReport").addEventListener("click", downloadReport);
+  $("btnEditFocusAi").addEventListener("click", () => activateMainTab("upload"));
   $("btnRecent").addEventListener("click", () => { $("recentPanel").classList.toggle("hidden"); loadRecentJobs(); });
   $("btnCloseRecent").addEventListener("click", () => $("recentPanel").classList.add("hidden"));
 });

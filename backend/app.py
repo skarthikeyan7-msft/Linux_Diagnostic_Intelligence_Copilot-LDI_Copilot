@@ -1,6 +1,10 @@
 """
-sosreport-rca-webapp backend
-=============================
+LDI Copilot (Linux Diagnostic Intelligence Copilot) backend
+=============================================================
+AI-powered analysis of sosreport, supportconfig, and cluster diagnostics
+(crm_report/hb_report) to deliver automated issue detection, root cause
+analysis, and remediation guidance.
+
 Local FastAPI server that wraps the analysis engine (backend/engine) and
 the pluggable AI provider clients (backend/ai) behind a small REST API,
 and serves the browser frontend (frontend/) as static files.
@@ -38,7 +42,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="sosreport-rca-webapp", version="1.1.0")
+app = FastAPI(title="LDI Copilot", version="2.0.0")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -274,9 +278,14 @@ async def synthesize(job_id: str, payload: dict):
     provider = payload.get("provider")
     if provider not in PROVIDERS:
         raise HTTPException(status_code=400, detail=f"unknown provider: {provider!r}")
-    missing = [f for f in PROVIDERS[provider]["fields"] if not payload.get(f)]
+    provider_cfg = PROVIDERS[provider]
+    auth_type = payload.get("auth_type") or provider_cfg["default_auth_type"]
+    if auth_type not in provider_cfg["auth_types"]:
+        raise HTTPException(status_code=400, detail=f"unknown auth_type {auth_type!r} for provider {provider}")
+    auth_cfg = provider_cfg["auth_types"][auth_type]
+    missing = [f for f in auth_cfg["fields"] if not payload.get(f)]
     if missing:
-        raise HTTPException(status_code=400, detail=f"missing required field(s) for {provider}: {', '.join(missing)}")
+        raise HTTPException(status_code=400, detail=f"missing required field(s) for {provider} ({auth_cfg['label']}): {', '.join(missing)}")
 
     focus_text = payload.get("focus_text")
     if focus_text is None:
@@ -323,12 +332,12 @@ app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="fronte
 
 def main():
     import uvicorn
-    ap = argparse.ArgumentParser(description="sosreport-rca-webapp local server")
+    ap = argparse.ArgumentParser(description="LDI Copilot local server")
     ap.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1 = localhost only; use 0.0.0.0 to allow LAN access - not recommended for sensitive bundles)")
     ap.add_argument("--port", type=int, default=8756, help="Port (default 8756)")
     ap.add_argument("--reload", action="store_true", help="Auto-reload on code changes (development only)")
     args = ap.parse_args()
-    print(f"sosreport-rca-webapp starting at http://{args.host}:{args.port}")
+    print(f"LDI Copilot starting at http://{args.host}:{args.port}")
     uvicorn.run("app:app", host=args.host, port=args.port, reload=args.reload)
 
 
