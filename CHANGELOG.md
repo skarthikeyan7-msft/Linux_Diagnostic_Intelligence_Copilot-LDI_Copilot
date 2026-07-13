@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-07-13
+
+### Changed - BREAKING
+- **Reclassified as a major version.** The v2.2.0 changes below (shipped minutes earlier) introduce enough breaking behavior change to warrant a major version rather than minor:
+  - **Default AI provider changed from OpenAI to Ollama.** Anyone relying on the previous default (no saved settings + no explicit provider chosen) will now get a local Ollama call instead of a cloud OpenAI call.
+  - **A new mandatory external-send confirmation gate** now blocks any non-local `synthesize` call from the UI until the user explicitly checks "I confirm I'm authorized to share this bundle's data with an external AI provider" - a previously unconfirmed workflow (fill in credentials, click Generate) no longer completes silently for non-Ollama providers.
+  - **Redaction is now applied by default** (`redact: true`) for all non-local providers - external providers receive a modified (token-substituted) evidence digest by default where they previously received the raw digest, a meaningful change in what data actually leaves the machine for existing API integrations.
+- No functional code changes in this release beyond the version bump itself and this changelog/README entry - see the [2.2.0] entry immediately below for the full technical changelog of what shipped (Ollama auto-start/control, redaction, default-provider change, layout, SECURITY.md).
+
 ## [2.2.0] - 2026-07-13
 
 ### Added
@@ -79,6 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[3.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.0.0
 [2.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.2.0
 [2.1.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.1.1
 [2.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.1.0
