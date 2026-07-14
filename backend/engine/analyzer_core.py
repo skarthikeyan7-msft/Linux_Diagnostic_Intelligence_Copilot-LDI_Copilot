@@ -58,7 +58,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "3.1.2"
+__version__ = "4.0.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -391,6 +391,65 @@ DF_LINE_RE = re.compile(r"^(?P<fs>\S+)\s+(?P<blocks>\d+)\s+(?P<used>\d+)\s+(?P<a
 FAILED_UNIT_RE = re.compile(r"^(?P<unit>\S+\.(?:service|socket|timer|mount|path))\s+\S+\s+failed\s+failed", re.IGNORECASE)
 
 # --------------------------------------------------------------------------
+# v4.0.0 analyzers: SAR/timezone, crash, boot, SELinux/AppArmor, package
+# drift, systemd cascade, container correlation - shared regexes/tables.
+# --------------------------------------------------------------------------
+_TZ_ABBR_OFFSETS = {
+    # Best-effort common timezone abbreviation -> UTC offset in minutes.
+    # Not exhaustive, and a couple of abbreviations are inherently
+    # ambiguous (e.g. "IST" is also used for Ireland/Israel) - the raw
+    # abbreviation is always shown as-is either way; arithmetic is only
+    # attempted where the mapping is unambiguous enough to be useful.
+    "UTC": 0, "GMT": 0, "Z": 0,
+    "IST": 330,  # India Standard Time - overwhelmingly the common case here
+    "EST": -300, "EDT": -240,
+    "CST": -360, "CDT": -300,
+    "MST": -420, "MDT": -360,
+    "PST": -480, "PDT": -420,
+    "CET": 60, "CEST": 120,
+    "BST": 60, "WET": 0, "WEST": 60,
+    "AEST": 600, "AEDT": 660, "ACST": 570, "ACDT": 630, "AWST": 480,
+    "JST": 540, "KST": 540, "SGT": 480, "HKT": 480, "MSK": 180,
+}
+
+_SAR_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})(?:\s*([AaPp][Mm]))?\s+(.*)$")
+_SAR_HEADER_DATE_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
+_SAR_HEADER_HINTS = [
+    # (header columns that must ALL appear on a header line, metric group)
+    (("%user", "%idle"), "cpu"),
+    (("kbmemfree",), "memory"),
+    (("%memused",), "memory"),
+    (("tps", "bread/s"), "disk_io"),
+    (("tps", "rd_sec/s"), "disk_io"),
+    (("tps", "rkB/s"), "disk_io"),
+    (("IFACE", "rxkB/s"), "network"),
+    (("IFACE", "rxpck/s"), "network"),
+    (("ldavg-1",), "load"),
+    (("runq-sz",), "load"),
+    (("kbswpfree",), "swap"),
+    (("pgpgin/s",), "paging"),
+]
+
+_AVC_FIELD_RE = re.compile(r'(\w+)=("[^"]*"|\S+)')
+
+_DEP_FAILED_RE = re.compile(r"[Dd]ependency failed for (.+?)\.?\s*$")
+_TRIGGERING_ONFAILURE_RE = re.compile(r"Triggering OnFailure=? ?dependencies of (\S+?)\.?\s*$")
+_UNIT_FAILED_RESULT_RE = re.compile(
+    r"(?P<unit>\S+\.(?:service|socket|mount|timer|path|target))\S*:?\s+"
+    r"(?:Main process exited|Failed with result|Job for \S+ failed|start-limit-hit)")
+
+_PKG_LINE_RE = re.compile(r"^(\S+)\s+(.+?)\s*$")
+
+_EXITED_RE = re.compile(r"Exited\s*\((-?\d+)\)")
+_RESTARTING_RE = re.compile(r"Restarting\s*\((-?\d+)\)")
+_EXIT_CODE_NOTES = {
+    "137": "SIGKILL (128+9) - often OOM-killed by the kernel or a healthcheck/orchestrator force-kill",
+    "143": "SIGTERM (128+15) - graceful stop signal, likely a normal shutdown/restart",
+    "139": "SIGSEGV (128+11) - segmentation fault inside the container process",
+    "1": "generic application error exit",
+}
+
+# --------------------------------------------------------------------------
 # Focused-analysis support: a support engineer can describe what they're
 # actually investigating (e.g. "find root cause of NC and IP cluster
 # resource restart issue") and have the mechanical scan surface a
@@ -519,19 +578,43 @@ def detect_archive_kind(path: Path):
     return None
 
 
+_WINDOWS_ILLEGAL_CHARS_RE = re.compile(r'[<>:"|?*]')
+
+
+def _windows_safe_member_name(name):
+    """Real-world Linux archive member names can contain characters that
+    are illegal in Windows paths - most commonly ':', in ABRT crash
+    report directories (e.g. "ccpp-2026-07-10-11:15:22-9999") which this
+    tool's own crash analyzer specifically looks for. Without this,
+    tarfile/zipfile's extract() would raise OSError for that single
+    member (caught below and recorded in `skipped` - the run wouldn't
+    crash) but the member's content would then be silently invisible to
+    every downstream check, on the one runtime (Windows) this tool
+    actually ships on. Sanitizing case-by-case keeps the vast majority
+    of paths byte-identical to the original archive while still letting
+    the handful of otherwise-uncooperative ones land on disk.
+    """
+    if os.name != "nt":
+        return name
+    return "/".join(_WINDOWS_ILLEGAL_CHARS_RE.sub("_", part) for part in name.split("/"))
+
+
 def safe_extract_tar(tar_path, dest_dir):
     skipped = []
     dest_abs = os.path.abspath(str(dest_dir))
     with tarfile.open(tar_path, "r:*") as tf:
         for m in tf:
             try:
-                target = os.path.abspath(os.path.join(dest_abs, m.name))
+                safe_name = _windows_safe_member_name(m.name)
+                target = os.path.abspath(os.path.join(dest_abs, safe_name))
                 if not (target == dest_abs or target.startswith(dest_abs + os.sep)):
                     skipped.append((m.name, "path traversal"))
                     continue
                 if m.isdev() or m.ischr() or m.isblk() or m.isfifo():
                     skipped.append((m.name, "device/special file"))
                     continue
+                if safe_name != m.name:
+                    m.name = safe_name
                 tf.extract(m, dest_dir)
             except Exception as e:
                 skipped.append((m.name, str(e)))
@@ -544,10 +627,13 @@ def safe_extract_zip(zip_path, dest_dir):
     with zipfile.ZipFile(zip_path) as zf:
         for info in zf.infolist():
             try:
-                target = os.path.abspath(os.path.join(dest_abs, info.filename))
+                safe_name = _windows_safe_member_name(info.filename)
+                target = os.path.abspath(os.path.join(dest_abs, safe_name))
                 if not (target == dest_abs or target.startswith(dest_abs + os.sep)):
                     skipped.append((info.filename, "path traversal"))
                     continue
+                if safe_name != info.filename:
+                    info.filename = safe_name
                 zf.extract(info, dest_dir)
             except Exception as e:
                 skipped.append((info.filename, str(e)))
@@ -955,6 +1041,703 @@ def check_capture_date(root, kind, inventory):
     return text[:200], year, full_dt
 
 
+def _fmt_utc_offset(minutes):
+    sign = "+" if minutes >= 0 else "-"
+    m = abs(minutes)
+    return f"UTC{sign}{m // 60:02d}:{m % 60:02d}"
+
+
+def detect_vm_timezone(root, kind, inventory):
+    """Best-effort detection of the timezone the analyzed VM/host itself
+    was configured with at capture time, so SAR (and other) timestamps
+    can be explicitly labeled as VM-local rather than left ambiguous -
+    directly avoids a support engineer confusing "the time I'm reading
+    this in" with "the time it happened on the customer's box". Tries,
+    in priority order:
+      1. /etc/timezone - a plain-text IANA zone name (Debian/Ubuntu-
+         style). A regular file, so the most reliable signal regardless
+         of how the archive was extracted.
+      2. The captured `date` command output (sos_commands/date/date for
+         sosreport; basic-environment.txt's "/bin/date" section for
+         supportconfig; sysinfo.txt for crm_report) - looks for the
+         trailing zone abbreviation Linux `date` prints by default (e.g.
+         "Fri Jul 10 11:28:01 IST 2026").
+      3. /etc/localtime, IF it happens to still be a real symlink in the
+         extracted tree (tar/zip extraction can occasionally fail to
+         recreate symlinks depending on host OS/privileges, so this is a
+         bonus check, not the primary signal) - the zoneinfo path suffix
+         is the IANA zone name.
+    Returns None if nothing could be determined - callers must treat
+    that as "unknown", never silently assume UTC.
+    """
+    for relp in find_inventory(inventory, "etc/timezone"):
+        t = get_text(root, relp, 200).strip()
+        if t and not t.startswith("#") and "/" in t and " " not in t:
+            return {"label": f"{t} (from /etc/timezone)", "iana": t, "abbr": None, "utc_offset_minutes": None}
+
+    date_text = ""
+    if kind == "sosreport":
+        for relp in find_by_basename_prefix(inventory, "date"):
+            date_text = get_text(root, relp, 500).strip()
+            if date_text:
+                break
+    elif kind == "crm_report":
+        for relp in find_inventory(inventory, "sysinfo.txt"):
+            t = get_text(root, relp, 1_000_000)
+            m = re.search(r"^[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+[\d:]+\s+[A-Za-z]{2,5}\s+\d{4}\s*$", t, re.MULTILINE)
+            if m:
+                date_text = m.group(0).strip()
+                break
+    else:
+        for relp in find_inventory(inventory, "basic-environment.txt"):
+            t = get_text(root, relp, 300_000)
+            sec = extract_supportconfig_section(t, "/bin/date", "# date")
+            if sec:
+                date_text = "\n".join(s for s in sec if s.strip() and not s.startswith("#")).strip()
+                break
+
+    m = re.search(r"\b([A-Za-z]{2,5})\s+(\d{4})\s*$", date_text)
+    if m:
+        abbr = m.group(1)
+        offset = _TZ_ABBR_OFFSETS.get(abbr.upper())
+        label = f"{abbr} ({_fmt_utc_offset(offset)})" if offset is not None else f"{abbr} (offset unknown - unrecognized abbreviation)"
+        return {"label": label, "iana": None, "abbr": abbr, "utc_offset_minutes": offset}
+
+    for relp in find_inventory(inventory, "etc/localtime"):
+        p = root / relp
+        try:
+            if p.is_symlink():
+                target = os.readlink(str(p))
+                if "zoneinfo/" in target:
+                    iana = target.split("zoneinfo/", 1)[1]
+                    return {"label": f"{iana} (from /etc/localtime)", "iana": iana, "abbr": None, "utc_offset_minutes": None}
+        except OSError:
+            pass
+    return None
+
+
+def _is_all_numeric(tokens):
+    if not tokens:
+        return True
+    for t in tokens:
+        try:
+            float(t)
+        except ValueError:
+            return False
+    return True
+
+
+def _detect_sar_block_kind(header_cols):
+    header_set = set(header_cols)
+    for hints, group in _SAR_HEADER_HINTS:
+        if all(h in header_set for h in hints):
+            return group
+    return None
+
+
+def _parse_sar_time(hh, mm, ss, ampm):
+    h, mi, s = int(hh), int(mm), int(ss)
+    if ampm:
+        ampm = ampm.upper()
+        if ampm == "PM" and h != 12:
+            h += 12
+        if ampm == "AM" and h == 12:
+            h = 0
+    if h > 23:
+        return None
+    return h, mi, s
+
+
+def _parse_sar_text(text, fallback_date):
+    """Parses one sar-plugin text capture (sysstat's own pre-rendered
+    tables - CPU/memory/disk/network/load, possibly several back-to-back
+    in the same file) into {metric_group: [{"ts": iso, <col>: val, ...}]}.
+    Header vs. data rows are told apart generically: a header row's
+    columns (after the leading timestamp) are never all-numeric ("CPU",
+    "%user", "kbmemfree", "IFACE", ...); a data row's are (aside from a
+    possible leading label like "all"/"eth0", which is excluded from the
+    all-numeric check by design). This one heuristic handles every sar
+    table shape uniformly without hardcoding per-table column layouts.
+    Unrecognized table shapes are silently skipped - a sar capture always
+    includes several table types most callers don't need, and failing to
+    parse one must never invalidate the others. "Average:" summary rows
+    are intentionally skipped (the caller computes its own averages from
+    the parsed series instead).
+    """
+    series = defaultdict(list)
+    current_date = None
+    header_cols = None
+    block_kind = None
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            header_cols = None
+            block_kind = None
+            continue
+        low = stripped.lower()
+        if low.startswith("linux"):
+            dm = _SAR_HEADER_DATE_RE.search(stripped)
+            if dm:
+                mm, dd, yyyy = dm.groups()
+                try:
+                    current_date = datetime(int(yyyy), int(mm), int(dd)).date()
+                except ValueError:
+                    pass
+            header_cols = None
+            block_kind = None
+            continue
+        if low.startswith("average:") or low.startswith("summary:"):
+            continue
+        m = _SAR_TIME_RE.match(stripped)
+        if not m:
+            continue
+        hh, mm_, ss, ampm, rest = m.groups()
+        cols = rest.split()
+        if not cols:
+            continue
+        if not _is_all_numeric(cols[1:]):
+            header_cols = cols
+            block_kind = _detect_sar_block_kind(cols)
+            continue
+        if header_cols is None or block_kind is None:
+            continue
+        t = _parse_sar_time(hh, mm_, ss, ampm)
+        if t is None:
+            continue
+        h, mi, se = t
+        the_date = current_date or fallback_date
+        if the_date is None:
+            continue
+        ts = datetime(the_date.year, the_date.month, the_date.day, h, mi, se)
+        row = {}
+        for i, colname in enumerate(header_cols):
+            if i >= len(cols):
+                break
+            val = cols[i]
+            try:
+                row[colname] = float(val)
+            except ValueError:
+                row[colname] = val
+        series[block_kind].append({"ts": ts.isoformat(), **row})
+    return series
+
+
+def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
+    """Parses pre-rendered `sar` text captures - sysstat's own plain-text
+    table output, as bundled by the sosreport/supportconfig sar plugin -
+    NOT the raw binary /var/log/sa/saDD files (those need the sar/sadf
+    binary to decode, which can't be assumed available in this tool's
+    own runtime) - into per-metric time series plus a condensed summary.
+    Best-effort and intentionally silent when a bundle has no sar data at
+    all (common - sysstat isn't always installed on the customer's box).
+    """
+    if kind == "sosreport":
+        candidates = find_inventory(inventory, "sos_commands/sar/")
+    elif kind == "supportconfig":
+        candidates = [p for p in find_inventory(inventory, "sar") if "sar" in p.rsplit("/", 1)[-1].lower()]
+    else:
+        candidates = find_inventory(inventory, "sysstats.txt")
+
+    fallback_date = capture_dt.date() if capture_dt else None
+    all_series = defaultdict(list)
+    files_parsed = []
+    for relp in candidates:
+        text = get_text(root, relp, 3_000_000)
+        if not text.strip():
+            continue
+        parsed = _parse_sar_text(text, fallback_date)
+        if any(parsed.values()):
+            files_parsed.append(relp)
+            for group, rows in parsed.items():
+                all_series[group].extend(rows)
+
+    if not files_parsed:
+        return {}
+
+    for group in all_series:
+        all_series[group].sort(key=lambda r: r["ts"])
+
+    summary = {}
+    cpu_rows = all_series.get("cpu", [])
+    if cpu_rows:
+        # "all" is sar's own aggregate-across-cores row, always present
+        # even when a per-core breakdown (-P ALL) was also captured -
+        # using it avoids conflating one busy core with overall load.
+        idle_vals = [r["%idle"] for r in cpu_rows if isinstance(r.get("%idle"), float) and r.get("CPU", "all") == "all"]
+        if not idle_vals:
+            idle_vals = [r["%idle"] for r in cpu_rows if isinstance(r.get("%idle"), float)]
+        if idle_vals:
+            used_vals = [round(100.0 - v, 2) for v in idle_vals]
+            summary["cpu_pct_used_avg"] = round(sum(used_vals) / len(used_vals), 2)
+            summary["cpu_pct_used_peak"] = round(max(used_vals), 2)
+            summary["cpu_pct_used_peak_ts"] = cpu_rows[used_vals.index(max(used_vals))]["ts"]
+        iowait_vals = [r["%iowait"] for r in cpu_rows if isinstance(r.get("%iowait"), float)]
+        if iowait_vals:
+            summary["iowait_pct_avg"] = round(sum(iowait_vals) / len(iowait_vals), 2)
+            summary["iowait_pct_peak"] = round(max(iowait_vals), 2)
+
+    mem_rows = all_series.get("memory", [])
+    if mem_rows:
+        memused_vals = [r["%memused"] for r in mem_rows if isinstance(r.get("%memused"), float)]
+        if memused_vals:
+            summary["mem_pct_used_avg"] = round(sum(memused_vals) / len(memused_vals), 2)
+            summary["mem_pct_used_peak"] = round(max(memused_vals), 2)
+
+    load_rows = all_series.get("load", [])
+    if load_rows:
+        l1_vals = [r["ldavg-1"] for r in load_rows if isinstance(r.get("ldavg-1"), float)]
+        if l1_vals:
+            summary["load1_avg"] = round(sum(l1_vals) / len(l1_vals), 2)
+            summary["load1_peak"] = round(max(l1_vals), 2)
+
+    disk_rows = all_series.get("disk_io", [])
+    if disk_rows:
+        tps_vals = [r["tps"] for r in disk_rows if isinstance(r.get("tps"), float)]
+        if tps_vals:
+            summary["disk_tps_avg"] = round(sum(tps_vals) / len(tps_vals), 2)
+            summary["disk_tps_peak"] = round(max(tps_vals), 2)
+
+    net_rows = all_series.get("network", [])
+    if net_rows:
+        by_iface = defaultdict(list)
+        for r in net_rows:
+            iface, rx = r.get("IFACE"), r.get("rxkB/s")
+            if iface and isinstance(rx, float):
+                by_iface[iface].append(rx)
+        if by_iface:
+            busiest_iface, vals = max(by_iface.items(), key=lambda kv: sum(kv[1]) / len(kv[1]))
+            summary["busiest_iface"] = busiest_iface
+            summary["busiest_iface_rxkbps_avg"] = round(sum(vals) / len(vals), 2)
+
+    return {
+        "files_parsed": files_parsed,
+        "metric_groups_found": sorted(all_series.keys()),
+        "sample_points": {g: len(rows) for g, rows in all_series.items()},
+        "summary": summary,
+        "series": {g: rows[:2000] for g, rows in all_series.items()},
+        "vm_timezone": vm_tz,
+    }
+
+
+def check_crash_analysis(root, kind, inventory):
+    """Correlates whatever crash/coredump *evidence* is realistically
+    available inside a sosreport/supportconfig/crm_report bundle. Bundles
+    essentially never contain the actual (huge) core file, and even if
+    they did, symbolizing a raw core requires gdb plus matching debug
+    symbols for the exact kernel/binary build - infeasible in this
+    tool's own runtime. What IS realistic and genuinely useful: ABRT's
+    own already-human-readable backtrace captured at crash time, kdump/
+    kexec configuration, and vmcore presence/size (existence only).
+    """
+    result = {}
+
+    abrt_dirs = set()
+    for relp in find_inventory(inventory, "var/spool/abrt/", "abrt/ccpp-"):
+        parts = relp.split("/")
+        for i, p in enumerate(parts):
+            if p.startswith("ccpp-") or p.startswith("oops-"):
+                abrt_dirs.add("/".join(parts[: i + 1]))
+                break
+    abrt_reports = []
+    for d in sorted(abrt_dirs):
+        entry = {"dir": d}
+        for relp in find_inventory(inventory, d + "/backtrace"):
+            t = get_text(root, relp, 20000).strip()
+            if t:
+                entry["backtrace"] = t[:3000]
+        for fname, key in (("reason", "reason"), ("cmdline", "cmdline"),
+                           ("executable", "executable"), ("time", "crash_time"), ("uid", "uid")):
+            for relp in find_inventory(inventory, d + "/" + fname):
+                t = get_text(root, relp, 2000).strip()
+                if t:
+                    entry[key] = t
+        if len(entry) > 1:
+            abrt_reports.append(entry)
+    if abrt_reports:
+        result["abrt_reports"] = abrt_reports
+
+    vmcores = [{"path": it["path"], "size": it["size"], "size_human": human_size(it["size"])}
+               for it in inventory if "vmcore" in it["path"].lower() and it["size"] > 0]
+    if vmcores:
+        result["vmcore_files"] = vmcores
+
+    kdump_text = ""
+    if kind == "sosreport":
+        for relp in find_inventory(inventory, "sos_commands/kdump", "etc/kdump.conf"):
+            kdump_text += get_text(root, relp, 20000) + "\n"
+    elif kind == "supportconfig":
+        for relp in find_inventory(inventory, "kdump"):
+            kdump_text += get_text(root, relp, 20000) + "\n"
+    if kdump_text.strip():
+        m = re.search(r"^path\s+(\S+)", kdump_text, re.MULTILINE)
+        result["kdump_configured"] = bool(m) or bool(re.search(r"^\s*KDUMP_KERNELVER", kdump_text, re.MULTILINE))
+        if m:
+            result["kdump_path"] = m.group(1)
+
+    oops_count = 0
+    for relp in find_inventory(inventory, "sos_commands/kernel/dmesg", "var/log/dmesg"):
+        t = get_text(root, relp, 2_000_000)
+        oops_count += len(re.findall(r"\b(?:kernel panic|Oops:|general protection fault|BUG: unable to handle)", t, re.IGNORECASE))
+    if oops_count:
+        result["kernel_oops_signature_count"] = oops_count
+
+    return result
+
+
+def check_boot_performance(root, kind, inventory):
+    """systemd-analyze's own timing breakdown, when the bundle happens to
+    include it (sos_commands/systemd/systemd-analyze* for sosreport;
+    folded into systemd.txt/boot.txt for supportconfig) - the single
+    best "why did this box take N minutes to come up" signal available
+    without re-running anything on the customer's box.
+    """
+    result = {}
+    text = ""
+    if kind == "sosreport":
+        for relp in find_by_basename_prefix(inventory, "systemd-analyze"):
+            text += get_text(root, relp, 200000) + "\n"
+    else:
+        for relp in find_inventory(inventory, "systemd.txt", "boot.txt", "basic-environment.txt", "systemd-analyze"):
+            text += get_text(root, relp, 500000) + "\n"
+
+    if not text.strip():
+        return result
+
+    m = re.search(r"Startup finished in\s+(.+?)=\s*([\d.]+)(min|s)\b", text)
+    if m:
+        result["startup_breakdown_raw"] = m.group(0).strip()
+        total = float(m.group(2))
+        result["total_boot_seconds"] = round(total * 60 if m.group(3) == "min" else total, 2)
+
+    unit_re = re.compile(r"^\s*([\d.]+)(min|s|ms)\s+(\S+\.(?:service|target|mount|socket|timer|path|device))\s*$")
+    best = {}
+    for line in text.splitlines():
+        m2 = unit_re.match(line)
+        if not m2:
+            continue
+        val, unit, unit_name = float(m2.group(1)), m2.group(2), m2.group(3)
+        seconds = val * 60 if unit == "min" else (val / 1000.0 if unit == "ms" else val)
+        if unit_name not in best or seconds > best[unit_name]:
+            best[unit_name] = seconds
+    if best:
+        ordered = sorted(({"unit": k, "seconds": round(v, 3)} for k, v in best.items()), key=lambda r: -r["seconds"])
+        result["slowest_units"] = ordered[:15]
+
+    chain_lines = []
+    in_chain = False
+    for line in text.splitlines():
+        if not in_chain and re.match(r"^\S+\.target\s*$", line.strip()):
+            in_chain = True
+            chain_lines = [line]
+            continue
+        if in_chain:
+            if line.strip().startswith(("└─", "├─", "│")):
+                chain_lines.append(line)
+            else:
+                break
+    if len(chain_lines) > 1:
+        result["critical_chain_raw"] = "\n".join(chain_lines)[:3000]
+
+    return result
+
+
+def check_security_mac(root, kind, inventory):
+    """SELinux/AppArmor status plus a structured breakdown of access-
+    control denials (by scontext/tcontext/tclass for SELinux, by
+    profile/operation for AppArmor) - a recurring denial pattern jumps
+    out this way, versus being buried in a long list of near-identical
+    raw lines from the generic pattern scanner.
+    """
+    result = {}
+
+    status_text = ""
+    if kind == "sosreport":
+        for relp in find_by_basename_prefix(inventory, "sestatus"):
+            status_text = get_text(root, relp, 5000)
+            if status_text.strip():
+                break
+    elif kind == "supportconfig":
+        for relp in find_inventory(inventory, "security-selinux.txt", "security.txt"):
+            t = get_text(root, relp, 200000)
+            sec = extract_supportconfig_section(t, "sestatus")
+            if sec:
+                status_text = "\n".join(sec)
+                break
+    if status_text.strip():
+        m = re.search(r"SELinux status:\s*(\S+)", status_text)
+        mode = re.search(r"Current mode:\s*(\S+)", status_text)
+        if m:
+            result["selinux_status"] = m.group(1)
+        if mode:
+            result["selinux_mode"] = mode.group(1)
+
+    apparmor_text = ""
+    for relp in find_inventory(inventory, "sos_commands/apparmor", "apparmor-status", "apparmor.txt"):
+        apparmor_text += get_text(root, relp, 200000) + "\n"
+    if apparmor_text.strip():
+        m = re.search(r"(\d+)\s+profiles are in enforce mode", apparmor_text)
+        if m:
+            result["apparmor_profiles_enforce"] = int(m.group(1))
+        m = re.search(r"(\d+)\s+profiles are in complain mode", apparmor_text)
+        if m:
+            result["apparmor_profiles_complain"] = int(m.group(1))
+
+    if kind == "crm_report":
+        denial_sources = find_inventory(inventory, "sysinfo.txt")
+    else:
+        denial_sources = find_inventory(inventory, "var/log/audit", "audit.log", "var/log/messages", "messages.txt", "warn.txt")
+
+    selinux_by_context = Counter()
+    apparmor_by_profile = Counter()
+    selinux_total = apparmor_total = 0
+    for relp in denial_sources[:20]:
+        # Bounded - this tally is a best-effort summary, not exhaustive
+        # forensics; findings.json already keeps every individual
+        # matching line with file:line provenance via the generic scan.
+        text = get_text(root, relp, 3_000_000)
+        if not text:
+            continue
+        for line in text.splitlines():
+            low = line.lower()
+            if "avc:" in low and "denied" in low:
+                fields = dict(_AVC_FIELD_RE.findall(line))
+                key = (fields.get("scontext", "?").strip('"'), fields.get("tcontext", "?").strip('"'), fields.get("tclass", "?").strip('"'))
+                selinux_by_context[key] += 1
+                selinux_total += 1
+            elif 'apparmor="denied"' in low:
+                fields = dict(_AVC_FIELD_RE.findall(line))
+                key = (fields.get("profile", "?").strip('"'), fields.get("operation", "?").strip('"'))
+                apparmor_by_profile[key] += 1
+                apparmor_total += 1
+
+    if selinux_total:
+        result["selinux_denial_total"] = selinux_total
+        result["selinux_top_denials"] = [{"scontext": s, "tcontext": t, "tclass": c, "count": n}
+                                          for (s, t, c), n in selinux_by_context.most_common(10)]
+    if apparmor_total:
+        result["apparmor_denial_total"] = apparmor_total
+        result["apparmor_top_denials"] = [{"profile": p, "operation": o, "count": n}
+                                           for (p, o), n in apparmor_by_profile.most_common(10)]
+    return result
+
+
+def check_package_drift(root, kind, inventory, capture_dt=None):
+    """Surfaces packages installed/updated close to the capture time (or,
+    when a yum/dnf transaction-history log is available, actual install/
+    update/erase events with timestamps) - a very common real "what
+    changed right before this broke" RCA question. Best-effort: exact
+    availability/format varies a lot by distro and tooling version, and
+    dates that can't be confidently parsed are simply skipped rather
+    than guessed at.
+    """
+    result = {}
+    reference = capture_dt or datetime.utcnow()
+    pkg_events = []
+
+    if kind == "sosreport":
+        for relp in find_inventory(inventory, "installed-rpms"):
+            t = get_text(root, relp, 3_000_000)
+            for line in t.splitlines():
+                m = _PKG_LINE_RE.match(line)
+                if not m:
+                    continue
+                pkg, rest = m.groups()
+                dt = try_parse_full_date(rest)
+                if dt:
+                    pkg_events.append({"package": pkg, "when": dt.isoformat(), "action": "installed"})
+            break
+        for relp in find_inventory(inventory, "sos_commands/yum/history", "sos_commands/dnf/history"):
+            t = get_text(root, relp, 1_000_000)
+            for line in t.splitlines():
+                m = re.match(r"^\s*\d+\s*\|\s*(\S.*?)\s*\|\s*([\d-]+\s[\d:]+)\s*\|\s*(\S.*?)\s*\|", line)
+                if not m:
+                    continue
+                who, when_s, action = m.groups()
+                try:
+                    dt = datetime.strptime(when_s.strip(), "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+                pkg_events.append({"package": who.strip(), "when": dt.isoformat(), "action": action.strip().lower()})
+    elif kind == "supportconfig":
+        for relp in find_inventory(inventory, "rpm.txt"):
+            t = get_text(root, relp, 3_000_000)
+            sec = extract_supportconfig_section(t, "rpm -qa --last", "rpm -qa")
+            for line in (sec or t.splitlines()):
+                m = _PKG_LINE_RE.match(line.strip())
+                if not m:
+                    continue
+                pkg, rest = m.groups()
+                dt = try_parse_full_date(rest)
+                if dt:
+                    pkg_events.append({"package": pkg, "when": dt.isoformat(), "action": "installed"})
+            break
+        for relp in find_inventory(inventory, "updates.txt", "patches.txt"):
+            t = get_text(root, relp, 1_000_000)
+            for line in t.splitlines():
+                m = _PKG_LINE_RE.match(line.strip())
+                if not m:
+                    continue
+                pkg, rest = m.groups()
+                dt = try_parse_full_date(rest)
+                if dt:
+                    pkg_events.append({"package": pkg, "when": dt.isoformat(), "action": "updated"})
+
+    if not pkg_events:
+        return result
+
+    pkg_events.sort(key=lambda e: e["when"])
+    result["total_dated_packages"] = len(pkg_events)
+    result["most_recent_change"] = pkg_events[-1]
+
+    window_start_iso = (reference - timedelta(days=7)).isoformat()
+    reference_iso = reference.isoformat()
+    recent = [e for e in pkg_events if window_start_iso <= e["when"] <= reference_iso]
+    recent.sort(key=lambda e: e["when"], reverse=True)
+    if recent:
+        result["recent_changes_7d"] = recent[:50]
+        result["recent_changes_7d_count"] = len(recent)
+    return result
+
+
+def check_systemd_cascade(root, kind, inventory):
+    """Best-effort service-failure *cascade* reconstruction: instead of
+    just listing every currently-failed unit independently (already done
+    by check_failed_services), looks for boot/journal-log evidence of one
+    unit's failure triggering others - "Dependency failed for X",
+    "Triggering OnFailure= dependencies of X" - and groups failures that
+    happened within a few seconds of each other, since near-simultaneous
+    multi-unit failures are a strong signal of a shared root cause (e.g.
+    a mount or network-online target failing takes a whole dependent
+    chain down with it) rather than N independent problems.
+    """
+    result = {}
+    if kind == "sosreport":
+        sources = find_inventory(inventory, "var/log/messages", "sos_commands/logs/journalctl", "var/log/syslog")
+    elif kind == "supportconfig":
+        sources = find_inventory(inventory, "messages.txt", "boot.txt", "warn.txt")
+    else:
+        sources = find_inventory(inventory, "sysinfo.txt", "pacemaker.log", "journal.log")
+
+    events = []
+    year_hint = datetime.utcnow().year
+    for relp in sources[:15]:
+        text = get_text(root, relp, 3_000_000)
+        if not text:
+            continue
+        for line in text.splitlines():
+            low = line.lower()
+            if "dependency failed for" not in low and "triggering onfailure" not in low and not _UNIT_FAILED_RESULT_RE.search(line):
+                continue
+            ts = parse_timestamp(line, year_hint)
+            m1 = _DEP_FAILED_RE.search(line)
+            if m1:
+                events.append({"ts": ts, "subject": m1.group(1).strip(), "kind": "dependency_failed"})
+                continue
+            m2 = _TRIGGERING_ONFAILURE_RE.search(line)
+            if m2:
+                events.append({"ts": ts, "subject": m2.group(1).strip(), "kind": "onfailure_triggered"})
+                continue
+            m3 = _UNIT_FAILED_RESULT_RE.search(line)
+            if m3:
+                events.append({"ts": ts, "subject": m3.group("unit"), "kind": "unit_failed"})
+
+    if not events:
+        return result
+    result["cascade_events_found"] = len(events)
+
+    timed = sorted([e for e in events if e["ts"]], key=lambda e: e["ts"])
+    clusters, current = [], []
+    for e in timed:
+        if current and (e["ts"] - current[-1]["ts"]).total_seconds() > 5:
+            if len(current) > 1:
+                clusters.append(current)
+            current = []
+        current.append(e)
+    if len(current) > 1:
+        clusters.append(current)
+
+    cascade_summary = []
+    for cluster in clusters[:10]:
+        subjects, seen = [], set()
+        for e in cluster:
+            if e["subject"] not in seen:
+                seen.add(e["subject"])
+                subjects.append(e["subject"])
+        if len(subjects) > 1:
+            cascade_summary.append({
+                "start_ts": cluster[0]["ts"].isoformat(),
+                "end_ts": cluster[-1]["ts"].isoformat(),
+                "likely_trigger": subjects[0],
+                "cascaded_units": subjects[1:],
+            })
+    if cascade_summary:
+        result["cascades"] = cascade_summary
+    else:
+        undated = sorted({e["subject"] for e in events if not e["ts"]})
+        if undated:
+            result["dependency_failures_untimed"] = undated[:20]
+    return result
+
+
+def check_container_logs(root, kind, inventory):
+    """Correlates container-runtime state (Docker/Podman ps snapshots,
+    inventory of container-specific log files) with host-level findings -
+    e.g. surfacing containers that exited with a signal consistent with
+    an OOM-kill, or an unusually high restart count. Deliberately does
+    NOT attempt full container-log content analysis: containers can log
+    in arbitrary application-specific formats the engine has no general
+    way to interpret; this focuses on the runtime's own lifecycle signal
+    plus correlation with host-level OOM/kernel evidence instead.
+    """
+    result = {}
+    ps_text = ""
+    if kind == "sosreport":
+        for relp in find_inventory(inventory, "sos_commands/docker/docker_ps", "sos_commands/podman/podman_ps"):
+            ps_text += get_text(root, relp, 200000) + "\n"
+    elif kind == "supportconfig":
+        for relp in find_inventory(inventory, "docker.txt", "podman.txt"):
+            t = get_text(root, relp, 200000)
+            sec = extract_supportconfig_section(t, "docker ps", "podman ps")
+            ps_text += "\n".join(sec) + "\n"
+
+    total_containers = 0
+    exited_nonzero, restarting = [], []
+    for line in ps_text.splitlines():
+        s = line.strip()
+        if not s or s.upper().startswith("CONTAINER ID"):
+            continue
+        if any(tok in line for tok in ("Exited", "Restarting", "Up ")) or s.startswith(("Created", "Dead")):
+            total_containers += 1
+        m = _EXITED_RE.search(line)
+        if m and m.group(1) != "0":
+            exited_nonzero.append({"name": line.split()[-1], "exit_code": m.group(1),
+                                    "note": _EXIT_CODE_NOTES.get(m.group(1), ""), "raw": s[:200]})
+        m2 = _RESTARTING_RE.search(line)
+        if m2:
+            restarting.append({"name": line.split()[-1], "exit_code": m2.group(1), "raw": s[:200]})
+
+    if total_containers:
+        result["total_containers_seen"] = total_containers
+    if exited_nonzero:
+        result["exited_nonzero"] = exited_nonzero[:20]
+    if restarting:
+        result["currently_restarting"] = restarting[:20]
+
+    log_files = find_inventory(inventory, "var/log/containers/", "var/log/pods/")
+    if log_files:
+        result["container_log_files_found"] = len(log_files)
+
+    oom_hits = 0
+    for relp in find_inventory(inventory, "sos_commands/kernel/dmesg", "var/log/dmesg", "var/log/messages", "messages.txt", "warn.txt"):
+        t = get_text(root, relp, 2_000_000)
+        oom_hits += len(re.findall(r"oom-kill.*(?:docker|containerd|podman|libpod|runc)", t, re.IGNORECASE))
+        oom_hits += len(re.findall(r"(?:docker|containerd|podman|runc)[^\n]{0,80}(?:killed process|out of memory)", t, re.IGNORECASE))
+    if oom_hits:
+        result["host_oom_events_mentioning_containers"] = oom_hits
+
+    return result
+
+
 def check_system_info(root, kind, inventory):
     info = {}
     if kind == "sosreport":
@@ -1192,6 +1975,7 @@ def check_cluster_health(root, kind, inventory):
 
 def run_structured_checks(root, kind, inventory):
     facts = {}
+    full_dt = None
     try:
         raw, year, full_dt = check_capture_date(root, kind, inventory)
         facts["capture_date_raw"] = raw
@@ -1228,6 +2012,43 @@ def run_structured_checks(root, kind, inventory):
             facts["cluster_health"] = check_cluster_health(root, kind, inventory)
         except Exception as e:
             facts["cluster_health_error"] = str(e)
+
+    # --- v4.0.0 analyzers -------------------------------------------------
+    vm_tz = None
+    try:
+        vm_tz = detect_vm_timezone(root, kind, inventory)
+        facts["vm_timezone"] = vm_tz
+    except Exception as e:
+        facts["vm_timezone_error"] = str(e)
+    try:
+        facts["sar_performance"] = check_sar_performance(root, kind, inventory, capture_dt=full_dt, vm_tz=vm_tz)
+    except Exception as e:
+        facts["sar_performance_error"] = str(e)
+    try:
+        facts["crash_analysis"] = check_crash_analysis(root, kind, inventory)
+    except Exception as e:
+        facts["crash_analysis_error"] = str(e)
+    try:
+        facts["boot_performance"] = check_boot_performance(root, kind, inventory)
+    except Exception as e:
+        facts["boot_performance_error"] = str(e)
+    try:
+        facts["security_mac"] = check_security_mac(root, kind, inventory)
+    except Exception as e:
+        facts["security_mac_error"] = str(e)
+    try:
+        facts["package_drift"] = check_package_drift(root, kind, inventory, capture_dt=full_dt)
+    except Exception as e:
+        facts["package_drift_error"] = str(e)
+    try:
+        facts["systemd_cascade"] = check_systemd_cascade(root, kind, inventory)
+    except Exception as e:
+        facts["systemd_cascade_error"] = str(e)
+    try:
+        facts["container_logs"] = check_container_logs(root, kind, inventory)
+    except Exception as e:
+        facts["container_logs_error"] = str(e)
+
     return facts
 
 
@@ -1235,6 +2056,15 @@ def run_structured_checks(root, kind, inventory):
 # Digest rendering
 # --------------------------------------------------------------------------
 def build_digest(kind, root, input_path, inventory, findings_list, facts, timeline, log_spans, stats, args, elapsed):
+    enabled_sections = getattr(args, "enabled_sections", None)
+
+    def _section_on(key):
+        # None (the default for every pre-v4.0.0 caller) means every
+        # section is enabled - an empty/partial set only ever narrows
+        # from there, never silently hides something an old caller never
+        # knew to ask for.
+        return enabled_sections is None or key in enabled_sections
+
     lines = []
     lines.append(f"# Root-Cause Analysis Digest — {input_path.name}")
     lines.append("")
@@ -1338,9 +2168,177 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
     if facts.get("core_dumps_present"):
         any_fact = True
         lines.append("- **Core dumps / crash artifacts present:** yes — inspect `core_dumps` category")
+    sar = facts.get("sar_performance", {}) or {}
+    if _section_on("sar") and sar.get("summary", {}).get("cpu_pct_used_peak") is not None:
+        any_fact = True
+        lines.append(f"- **Peak CPU used (SAR):** {sar['summary']['cpu_pct_used_peak']}% at {sar['summary'].get('cpu_pct_used_peak_ts','?')}")
+    pkg_drift = facts.get("package_drift", {}) or {}
+    if _section_on("packages") and pkg_drift.get("recent_changes_7d_count"):
+        any_fact = True
+        lines.append(f"- **Packages changed in the 7 days before capture:** {pkg_drift['recent_changes_7d_count']} — see \"Recent Package Changes\" below")
+    sec_mac = facts.get("security_mac", {}) or {}
+    if _section_on("security") and (sec_mac.get("selinux_denial_total") or sec_mac.get("apparmor_denial_total")):
+        any_fact = True
+        bits = []
+        if sec_mac.get("selinux_denial_total"):
+            bits.append(f"{sec_mac['selinux_denial_total']} SELinux denials")
+        if sec_mac.get("apparmor_denial_total"):
+            bits.append(f"{sec_mac['apparmor_denial_total']} AppArmor denials")
+        lines.append(f"- **Access-control denials:** {', '.join(bits)} — see \"Security (SELinux/AppArmor)\" below")
+    cascade = facts.get("systemd_cascade", {}) or {}
+    if _section_on("cascade") and cascade.get("cascades"):
+        any_fact = True
+        lines.append(f"- **Service failure cascades detected:** {len(cascade['cascades'])} — see \"Service Failure Cascade\" below")
     if not any_fact:
         lines.append("- _(no structured anomalies detected by fact-checks; rely on pattern findings below)_")
     lines.append("")
+
+    sar = facts.get("sar_performance", {}) or {}
+    if _section_on("sar") and (sar.get("summary") or sar.get("metric_groups_found")):
+        lines.append("## 📊 Performance (SAR)")
+        vm_tz = sar.get("vm_timezone")
+        if vm_tz:
+            lines.append(f"_Timestamps below are VM-local time, as printed by `sar` on the analyzed host: **{vm_tz['label']}**. Keep this in mind when correlating with your own clock or the customer's stated incident time._")
+        else:
+            lines.append("_The analyzed host's timezone could not be determined from this bundle - timestamps below are shown exactly as `sar` printed them (VM-local wall clock, zone unknown). Confirm the VM's zone with the customer before correlating against externally-reported incident times._")
+        lines.append("")
+        s = sar["summary"]
+        if s.get("cpu_pct_used_avg") is not None:
+            lines.append(f"- **CPU used:** avg {s['cpu_pct_used_avg']}%, peak {s['cpu_pct_used_peak']}% (at `{s.get('cpu_pct_used_peak_ts','?')}`)")
+        if s.get("iowait_pct_avg") is not None:
+            lines.append(f"- **I/O wait:** avg {s['iowait_pct_avg']}%, peak {s['iowait_pct_peak']}%")
+        if s.get("mem_pct_used_avg") is not None:
+            lines.append(f"- **Memory used:** avg {s['mem_pct_used_avg']}%, peak {s['mem_pct_used_peak']}%")
+        if s.get("load1_avg") is not None:
+            lines.append(f"- **Load average (1min):** avg {s['load1_avg']}, peak {s['load1_peak']}")
+        if s.get("disk_tps_avg") is not None:
+            lines.append(f"- **Disk transactions/sec:** avg {s['disk_tps_avg']}, peak {s['disk_tps_peak']}")
+        if s.get("busiest_iface"):
+            lines.append(f"- **Busiest network interface:** {s['busiest_iface']} (avg {s['busiest_iface_rxkbps_avg']} kB/s received)")
+        lines.append(f"- **Data points parsed:** {sum(sar.get('sample_points', {}).values())} across {len(sar.get('files_parsed', []))} file(s); metric groups found: {', '.join(sar.get('metric_groups_found', [])) or 'none'}")
+        lines.append("- _Full time series available in `facts.json` → `sar_performance.series` for graphing (CPU/memory/disk/network/load, each timestamped in VM-local time)._")
+        lines.append("")
+
+    crash = facts.get("crash_analysis", {}) or {}
+    if _section_on("crash") and crash:
+        lines.append("## 💥 Crash Analysis")
+        if crash.get("abrt_reports"):
+            lines.append(f"- ⚠️ **{len(crash['abrt_reports'])} ABRT crash report(s) found:**")
+            for r in crash["abrt_reports"][:10]:
+                exe = r.get("executable", "?")
+                reason = r.get("reason", "?")
+                when = r.get("crash_time", "?")
+                lines.append(f"  - `{exe}` crashed ({reason}) at {when} — see `{r['dir']}/backtrace`")
+        if crash.get("vmcore_files"):
+            lines.append(f"- ⚠️ **Kernel crash dump (vmcore) present:** " + ", ".join(f"{v['path']} ({v['size_human']})" for v in crash["vmcore_files"][:5]))
+        if "kdump_configured" in crash:
+            lines.append(f"- **kdump configured:** {'yes' if crash['kdump_configured'] else 'no'}" + (f" (path: {crash['kdump_path']})" if crash.get("kdump_path") else ""))
+        if crash.get("kernel_oops_signature_count"):
+            lines.append(f"- ⚠️ **Kernel panic/oops signatures in dmesg:** {crash['kernel_oops_signature_count']} — see `core_dumps`/`kernel_boot` findings below")
+        if not any(k in crash for k in ("abrt_reports", "vmcore_files", "kernel_oops_signature_count")):
+            lines.append("- No ABRT reports, vmcore files, or kernel oops signatures found in this bundle.")
+        lines.append("")
+
+    boot = facts.get("boot_performance", {}) or {}
+    if _section_on("boot") and boot:
+        lines.append("## 🥾 Boot Performance")
+        if boot.get("startup_breakdown_raw"):
+            lines.append(f"- **Startup breakdown:** {boot['startup_breakdown_raw']}")
+        if boot.get("slowest_units"):
+            lines.append("- **Slowest units to start:**")
+            for u in boot["slowest_units"][:10]:
+                lines.append(f"  - {u['unit']}: {u['seconds']}s")
+        if boot.get("critical_chain_raw"):
+            lines.append("- **Critical chain (systemd-analyze critical-chain, verbatim):**")
+            lines.append("```")
+            lines.append(boot["critical_chain_raw"])
+            lines.append("```")
+        lines.append("")
+
+    if _section_on("security") and sec_mac:
+        lines.append("## 🛡️ Security (SELinux/AppArmor)")
+        if sec_mac.get("selinux_status"):
+            lines.append(f"- **SELinux status:** {sec_mac['selinux_status']}" + (f" ({sec_mac['selinux_mode']})" if sec_mac.get("selinux_mode") else ""))
+        if "apparmor_profiles_enforce" in sec_mac or "apparmor_profiles_complain" in sec_mac:
+            lines.append(f"- **AppArmor profiles:** {sec_mac.get('apparmor_profiles_enforce', 0)} enforce, {sec_mac.get('apparmor_profiles_complain', 0)} complain")
+        if sec_mac.get("selinux_top_denials"):
+            lines.append(f"- ⚠️ **Top SELinux denials** (of {sec_mac['selinux_denial_total']} total):")
+            for d in sec_mac["selinux_top_denials"][:10]:
+                lines.append(f"  - ({d['count']}x) `{d['scontext']}` → `{d['tcontext']}` [{d['tclass']}]")
+        if sec_mac.get("apparmor_top_denials"):
+            lines.append(f"- ⚠️ **Top AppArmor denials** (of {sec_mac['apparmor_denial_total']} total):")
+            for d in sec_mac["apparmor_top_denials"][:10]:
+                lines.append(f"  - ({d['count']}x) profile `{d['profile']}`, operation `{d['operation']}`")
+        lines.append("")
+
+    if _section_on("packages") and (pkg_drift.get("recent_changes_7d") or pkg_drift.get("most_recent_change")):
+        lines.append("## 📦 Recent Package Changes")
+        if pkg_drift.get("most_recent_change"):
+            mrc = pkg_drift["most_recent_change"]
+            lines.append(f"- **Most recent package change on record:** {mrc['package']} ({mrc['action']}) at {mrc['when']}")
+        if pkg_drift.get("recent_changes_7d"):
+            lines.append(f"- ⚠️ **{pkg_drift['recent_changes_7d_count']} package change(s) in the 7 days before capture** — a strong \"what changed right before this broke\" candidate list, newest first:")
+            for e in pkg_drift["recent_changes_7d"][:20]:
+                lines.append(f"  - `{e['when']}` — {e['package']} ({e['action']})")
+            if pkg_drift["recent_changes_7d_count"] > 20:
+                lines.append(f"  - _(+{pkg_drift['recent_changes_7d_count'] - 20} more — see facts.json → package_drift.recent_changes_7d)_")
+        lines.append("")
+
+    if _section_on("cascade") and (cascade.get("cascades") or cascade.get("dependency_failures_untimed")):
+        lines.append("## 🔗 Service Failure Cascade")
+        if cascade.get("cascades"):
+            for c in cascade["cascades"]:
+                lines.append(f"- ⚠️ **{c['start_ts']} → {c['end_ts']}:** `{c['likely_trigger']}` failed first, likely triggering: {', '.join(c['cascaded_units'])}")
+        if cascade.get("dependency_failures_untimed"):
+            lines.append("- Dependency-failure evidence found but timestamps couldn't be parsed: " + ", ".join(cascade["dependency_failures_untimed"][:10]))
+        lines.append("")
+
+    containers = facts.get("container_logs", {}) or {}
+    if _section_on("containers") and containers:
+        lines.append("## 🐳 Container Correlation")
+        if containers.get("total_containers_seen"):
+            lines.append(f"- **Containers observed:** {containers['total_containers_seen']}")
+        if containers.get("exited_nonzero"):
+            lines.append(f"- ⚠️ **{len(containers['exited_nonzero'])} container(s) exited with a non-zero code:**")
+            for c in containers["exited_nonzero"][:10]:
+                lines.append(f"  - {c['name']}: exit code {c['exit_code']}" + (f" — {c['note']}" if c["note"] else ""))
+        if containers.get("currently_restarting"):
+            lines.append(f"- ⚠️ **{len(containers['currently_restarting'])} container(s) currently restarting** (restart-loop candidate)")
+        if containers.get("host_oom_events_mentioning_containers"):
+            lines.append(f"- ⚠️ **Host-level OOM events mentioning container runtimes:** {containers['host_oom_events_mentioning_containers']}")
+        if containers.get("container_log_files_found"):
+            lines.append(f"- **Container-specific log files found:** {containers['container_log_files_found']} (see `inventory.json`, category varies by path)")
+        lines.append("")
+
+    pcap = facts.get("network_capture") or {}
+    if _section_on("network") and pcap:
+        lines.append("## 🌐 Network Capture (pcap)")
+        lines.append("_Metadata only - packet/byte counts, top talkers, protocol mix, and TCP/DNS summaries. Raw payload content is never parsed, stored, or included here - see SECURITY.md._")
+        lines.append("")
+        if pcap.get("error"):
+            lines.append(f"- _{pcap['error']}_")
+        else:
+            lines.append(f"- **Packets:** {pcap['total_packets']:,} ({pcap['total_bytes_human']})" + (f" over {pcap['duration_seconds']}s ({pcap['packets_per_second']} pkt/s)" if pcap.get("duration_seconds") else ""))
+            if pcap.get("protocol_counts"):
+                lines.append("- **Protocol mix:** " + ", ".join(f"{k}: {v:,}" for k, v in sorted(pcap["protocol_counts"].items(), key=lambda kv: -kv[1])))
+            if pcap.get("top_talkers"):
+                lines.append("- **Top talkers (by bytes):**")
+                for t in pcap["top_talkers"][:10]:
+                    lines.append(f"  - {t['src']} → {t['dst']}: {t['bytes_human']}")
+            tcp_bits = []
+            if pcap.get("tcp_reset"):
+                tcp_bits.append(f"{pcap['tcp_reset']} RSTs")
+            if pcap.get("tcp_retransmits_suspected"):
+                tcp_bits.append(f"{pcap['tcp_retransmits_suspected']} suspected retransmissions")
+            if tcp_bits:
+                lines.append(f"- ⚠️ **TCP anomalies:** {', '.join(tcp_bits)} (SYN: {pcap.get('tcp_syn',0)}, SYN-ACK: {pcap.get('tcp_synack',0)})")
+            if pcap.get("possible_port_scan_pattern"):
+                lines.append("- ⚠️ **Possible port-scan pattern:** many SYNs with disproportionately few SYN-ACKs - could also just be a one-sided capture; worth a second look, not a certainty.")
+            if pcap.get("dns_top_queries"):
+                lines.append("- **Top DNS queries:** " + ", ".join(f"{q['qname']} ({q['count']}x)" for q in pcap["dns_top_queries"][:10]))
+            if pcap.get("truncated_at_max_packets"):
+                lines.append(f"- _(capture truncated after {pcap['truncated_at_max_packets']:,} packets for analysis speed - counts above reflect only that prefix)_")
+        lines.append("")
 
     if log_spans:
         lines.append("## Log Coverage Window")
@@ -1420,22 +2418,31 @@ class AnalysisError(Exception):
     pass
 
 
+ALL_FOCUS_AREAS = {"sar", "crash", "boot", "security", "packages", "cascade", "containers", "network"}
+
+
 class _DigestArgs:
     """Lightweight stand-in for the argparse.Namespace that build_digest()
     expects, so the CLI and the library entrypoint can share one digest
     renderer without build_digest() needing to know which caller it has."""
-    def __init__(self, min_severity, top_per_category, start_dt, end_dt, focus_text=None, focus_keywords=None):
+    def __init__(self, min_severity, top_per_category, start_dt, end_dt, focus_text=None,
+                 focus_keywords=None, enabled_sections=None):
         self.min_severity = min_severity
         self.top_per_category = top_per_category
         self.start_dt = start_dt
         self.end_dt = end_dt
         self.focus_text = focus_text
         self.focus_keywords = focus_keywords or []
+        # None means "everything enabled" (the default, and what every
+        # existing CLI/API caller gets unless it opts into the v4.0.0
+        # focus-area toggles) - never an empty-set-means-nothing-shown
+        # trap for old callers that don't know this parameter exists.
+        self.enabled_sections = enabled_sections
 
 
 def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_category=25,
                   max_examples=3, start=None, end=None, around=None, window=60.0,
-                  focus=None, progress_cb=None):
+                  focus=None, progress_cb=None, focus_areas=None, pcap_path=None):
     """
     Library entrypoint - run a full analysis and return a result dict:
         {kind, root, input_path, output_dir, inventory, findings, facts,
@@ -1457,6 +2464,22 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
     ahead of the full exhaustive scan - this is what lets the tool
     answer a specific question instead of just surfacing whatever is
     highest-severity regardless of relevance.
+
+    focus_areas is an optional iterable of the v4.0.0 analyzer toggle
+    keys (subset of ALL_FOCUS_AREAS: "sar", "crash", "boot", "security",
+    "packages", "cascade", "containers") controlling which of the new
+    digest sections are rendered. Every check still RUNS regardless
+    (they're cheap, and the full structured facts remain available via
+    facts.json/the API either way) - this only narrows what shows up in
+    the digest text itself (and therefore what the AI sees/discusses),
+    for engineers who already know a given axis isn't relevant to this
+    bundle. None (the default) enables every section, matching the
+    tool's original behavior for any caller that doesn't pass this.
+
+    pcap_path is an optional path to a standalone packet capture
+    (.pcap/.pcapng) to analyze alongside the bundle - see
+    backend/engine/pcap_analyzer.py. Reserved for the network analyzer;
+    None means no capture was provided.
 
     progress_cb(message: str), if given, is called with human-readable
     progress strings instead of printing to stdout - used by the web
@@ -1594,11 +2617,31 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         "num_matching_findings": num_focus_matches,
     }
 
+    if pcap_path:
+        report(f"Analyzing packet capture: {pcap_path} (metadata only - see SECURITY.md)")
+        try:
+            # analyzer_core.py is imported both as part of the `engine`
+            # package (relative import would work) and run directly as
+            # a standalone script (relative import would fail) - ensure
+            # this file's own directory is importable either way rather
+            # than committing to one import style.
+            _engine_dir = str(Path(__file__).resolve().parent)
+            if _engine_dir not in sys.path:
+                sys.path.insert(0, _engine_dir)
+            from pcap_analyzer import analyze_pcap
+            facts["network_capture"] = analyze_pcap(str(pcap_path))
+        except Exception as e:
+            facts["network_capture"] = {"error": str(e)}
+
     (output_dir / "inventory.json").write_text(json.dumps(inventory, indent=2), encoding="utf-8")
     (output_dir / "findings.json").write_text(json.dumps(findings_list, indent=2), encoding="utf-8")
     (output_dir / "facts.json").write_text(json.dumps(facts, indent=2, default=str), encoding="utf-8")
 
-    digest_args = _DigestArgs(min_severity, top_per_category, start_dt, end_dt, focus_text=focus_text, focus_keywords=focus_keywords)
+    enabled_sections = None
+    if focus_areas is not None:
+        enabled_sections = {a for a in focus_areas if a in ALL_FOCUS_AREAS}
+    digest_args = _DigestArgs(min_severity, top_per_category, start_dt, end_dt, focus_text=focus_text,
+                               focus_keywords=focus_keywords, enabled_sections=enabled_sections)
     elapsed = time.time() - t0
     digest = build_digest(kind, root, input_path, inventory, findings_list, facts, ctx["timeline"], ctx["log_spans"], stats, digest_args, elapsed)
     (output_dir / "digest.md").write_text(digest, encoding="utf-8")

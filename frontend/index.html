@@ -41,7 +41,7 @@
     <!-- STEP 1: Upload -->
     <section id="uploadSection" class="panel">
       <h2>1. Provide a diagnostic bundle</h2>
-      <p class="muted">Drop a sosreport (.tar.xz/.tgz/.tar.bz2), supportconfig (.tbz/.tar.gz/.zip), or crm_report archive — or an already-extracted folder path. Format is auto-detected.</p>
+      <p class="muted">Drop a sosreport (.tar.xz/.tgz/.tar.bz2), supportconfig (.tbz/.tar.gz/.zip), or crm_report archive — or an already-extracted folder path. Format is auto-detected, and so is everything inside it: performance (SAR), crash/coredump artifacts, boot timing, SELinux/AppArmor, package changes, systemd cascades, and container logs are all analyzed automatically whenever present — no need to tell it what kind of problem you're chasing.</p>
 
       <div id="dropzone" class="dropzone">
         <div class="dropzone-icon">⬆</div>
@@ -56,6 +56,13 @@
         <label for="serverPath">Path already on this machine (file or extracted folder)</label>
         <input type="text" id="serverPath" placeholder="C:\path\to\sosreport-hostname-2026-07-10.tar.xz">
       </div>
+
+      <details class="advanced-options">
+        <summary>🌐 Attach a packet capture (.pcap/.pcapng) — optional</summary>
+        <p class="muted small">Pcaps are almost never bundled inside a sosreport/supportconfig/crm_report archive, so this is a separate, optional upload. Analyzed as <strong>metadata only</strong> — packet/byte counts, top talkers, protocol mix, TCP/DNS summaries. Raw payload content is never parsed, stored, or sent anywhere; see <a href="SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a>.</p>
+        <input type="file" id="pcapInput" accept=".pcap,.pcapng,.cap">
+        <div id="pcapFileName" class="muted small hidden"></div>
+      </details>
 
       <div id="focusAiPanel" class="focus-ai-panel">
         <h3>🎯 What are you investigating?</h3>
@@ -103,7 +110,7 @@
       </div>
 
       <details class="advanced-options">
-        <summary>Advanced options (time-window scoping, severity)</summary>
+        <summary>Advanced options (time-window scoping, severity, analysis focus areas)</summary>
         <div class="options-grid">
           <div class="field-row">
             <label for="optMinSeverity">Minimum severity in digest</label>
@@ -145,6 +152,20 @@
           </div>
         </div>
         <p class="muted small">Only chronological log-like files are gated by a time window — configuration dumps and other point-in-time snapshots are always fully scanned regardless.</p>
+
+        <hr>
+        <h4>🧭 Analysis focus areas</h4>
+        <p class="muted small">Every applicable analyzer always <strong>runs</strong> automatically (auto-detected from what's actually in your bundle — SAR, crash artifacts, container logs, etc. never require picking a "type" up front). These toggles only control which sections appear in the digest &amp; AI report, so you can drop ones you already know aren't relevant to this investigation. Leave everything checked for the full picture.</p>
+        <div class="focus-areas-grid" id="focusAreasGrid">
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="sar" checked> 📊 Performance (SAR)</label>
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="crash" checked> 💥 Crash / Coredump</label>
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="boot" checked> 🥾 Boot performance</label>
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="security" checked> 🛡️ Security (SELinux/AppArmor)</label>
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="packages" checked> 📦 Recent package changes</label>
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="cascade" checked> 🔗 Service failure cascade</label>
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="containers" checked> 🐳 Container correlation</label>
+          <label class="checkbox-row"><input type="checkbox" class="focus-area-cb" value="network" checked> 🌐 Network capture (pcap)</label>
+        </div>
       </details>
 
       <button id="btnAnalyze" class="btn btn-primary btn-lg" disabled>Run analysis</button>
@@ -175,6 +196,7 @@
 
         <div class="tabs">
           <button class="tab-btn active" data-tab="ai">AI Root Cause Report</button>
+          <button class="tab-btn" data-tab="performance">📊 Performance</button>
           <button class="tab-btn" data-tab="digest">Digest</button>
           <button class="tab-btn" data-tab="findings">Findings</button>
           <button class="tab-btn" data-tab="timeline">Timeline</button>
@@ -191,6 +213,29 @@
           </div>
           <div id="aiError" class="alert alert-error hidden"></div>
           <div class="ai-render markdown-body" id="aiRender"></div>
+
+          <div id="chatSection" class="chat-section hidden">
+            <div class="chat-section-head">
+              <h4>💬 Ask a follow-up</h4>
+              <button id="btnResetChat" class="btn btn-ghost btn-sm">Reset conversation</button>
+            </div>
+            <p class="muted small">Give the model a custom instruction to regenerate or refine its answer — e.g. "focus more on the network side", "explain the timeline gap between 14:02 and 14:05", or "give me a shorter executive summary for my manager". Each message continues the same conversation, including the report above.</p>
+            <div id="chatThread" class="chat-thread"></div>
+            <div id="chatError" class="alert alert-error hidden"></div>
+            <div class="chat-input-row">
+              <textarea id="chatInput" rows="2" placeholder="Ask a follow-up question or give a new instruction…"></textarea>
+              <button id="btnSendChat" class="btn btn-primary">Send</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-panel hidden" id="tab-performance">
+          <div id="perfPlaceholder" class="placeholder-empty">No SAR performance data was found in this bundle (sysstat/sar wasn't captured, or this bundle predates the incident window). Everything else in this analysis is unaffected.</div>
+          <div id="perfContent" class="hidden">
+            <p class="muted small" id="perfTzNote"></p>
+            <p class="muted small" id="perfSummaryNote"></p>
+            <div class="chart-grid" id="chartGrid"></div>
+          </div>
         </div>
 
         <div class="tab-panel hidden" id="tab-digest">

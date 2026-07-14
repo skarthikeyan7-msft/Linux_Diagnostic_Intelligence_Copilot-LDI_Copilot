@@ -45,7 +45,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="3.1.2")
+app = FastAPI(title="LDI Copilot", version="4.0.0")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -74,6 +74,7 @@ def _new_job(name, focus_text=None):
             "dir": job_dir,
             "ai_report": "",
             "focus_text": focus_text,
+            "conversation": [],  # [{role, content}, ...] - system+digest+report turn, then follow-up chat exchanges
         }
     return job_id
 
@@ -140,6 +141,8 @@ async def analyze(
     end: str | None = Form(None),
     around: str | None = Form(None),
     window: float = Form(60.0),
+    focus_areas: str | None = Form(None),
+    pcap_file: UploadFile | None = File(None),
 ):
     """Start a new analysis job. Accepts EITHER an uploaded archive/file
     (drag-and-drop from the browser) OR a server_path already on disk
@@ -150,11 +153,27 @@ async def analyze(
     given, both the mechanical scan (keyword-tagged findings) and the
     later AI synthesis for this job are steered around answering that
     specific question instead of a generic exhaustive report. Returns
-    immediately with a job_id; poll GET /api/jobs/{job_id} for progress."""
+    immediately with a job_id; poll GET /api/jobs/{job_id} for progress.
+
+    `focus_areas` is an optional comma-separated subset of
+    engine.ALL_FOCUS_AREAS ("sar,crash,boot,security,packages,cascade,
+    containers,network") narrowing which v4.0.0 analyzer sections appear
+    in the digest (every check still runs regardless - this only
+    controls what gets rendered/sent to the AI). Omit entirely (or leave
+    blank) to keep every section, the default and pre-v4.0.0 behavior.
+
+    `pcap_file` is an optional standalone packet capture (.pcap/.pcapng)
+    to analyze alongside the bundle - pcaps are essentially never
+    embedded inside a sosreport/supportconfig/crm_report archive itself,
+    so this is a second, independent upload slot. Analyzed as METADATA
+    ONLY (packet/byte counts, top talkers, protocol mix, TCP/DNS
+    summaries) - raw payload content is never parsed or stored; see
+    SECURITY.md."""
     if not file and not server_path:
         raise HTTPException(status_code=400, detail="provide either a file upload or a server_path")
 
     focus = (focus or "").strip() or None
+    focus_areas_list = [a.strip() for a in focus_areas.split(",") if a.strip()] if focus_areas is not None else None
 
     if server_path:
         input_path = Path(server_path)
@@ -174,10 +193,22 @@ async def analyze(
                 fh.write(chunk)
         input_path = upload_path
 
+    pcap_path = None
+    if pcap_file is not None and pcap_file.filename:
+        job_dir = JOBS[job_id]["dir"]
+        pcap_path = job_dir / "upload" / pcap_file.filename
+        pcap_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(pcap_path, "wb") as fh:
+            while True:
+                chunk = await pcap_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+
     kwargs = dict(
         min_severity=min_severity, top_per_category=top_per_category,
         start=start or None, end=end or None, around=around or None, window=window,
-        focus=focus,
+        focus=focus, focus_areas=focus_areas_list, pcap_path=str(pcap_path) if pcap_path else None,
     )
     thread = threading.Thread(target=_run_job, args=(job_id, input_path, kwargs), daemon=True)
     thread.start()
@@ -243,6 +274,22 @@ def get_timeline(job_id: str):
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail=f"job status is {job['status']}, not done yet")
     return sorted(job["result"]["timeline"], key=lambda e: e["ts"])
+
+
+@app.get("/api/jobs/{job_id}/sar_series")
+def get_sar_series(job_id: str):
+    """Structured SAR time-series data (CPU/memory/disk/network/load),
+    backing the Performance sub-tab's client-side charts - a narrower,
+    purpose-built slice of facts.json so the chart code doesn't need to
+    fetch/parse the entire (potentially large) structured-facts payload
+    just to plot a handful of metrics. Returns {} (not 404) when the
+    bundle had no parseable SAR data - that's an expected, common case,
+    not an error."""
+    job = _get_job_or_404(job_id)
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"job status is {job['status']}, not done yet")
+    sar = job["result"]["facts"].get("sar_performance") or {}
+    return JSONResponse(json.loads(json.dumps(sar, default=str)))
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -396,12 +443,107 @@ async def synthesize(job_id: str, payload: dict):
         except ProviderError as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
         else:
+            reply = "".join(accumulated)
             with JOBS_LOCK:
                 if job_id in JOBS:
-                    JOBS[job_id]["ai_report"] = "".join(accumulated)
+                    JOBS[job_id]["ai_report"] = reply
+                    # Seeds the interactive-chat conversation with this
+                    # report as the first "assistant" turn, so a follow-up
+                    # question via /chat continues from exactly what the
+                    # engineer just read rather than needing its own
+                    # separate context.
+                    JOBS[job_id]["conversation"] = messages + [{"role": "assistant", "content": reply}]
             yield f"data: {json.dumps({'done': True})}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------------
+# API: interactive follow-up chat on a generated report. The initial
+# Generate/Regenerate call above seeds JOBS[id]["conversation"] with the
+# system+digest+report turn; every /chat call appends to and replays that
+# same history (not just the newest message) so the model keeps full
+# context of what it already told the engineer, exactly like a real
+# back-and-forth conversation rather than N independent one-shot asks.
+# --------------------------------------------------------------------------
+_CHAT_MAX_FOLLOWUP_TURNS = 12  # user+assistant exchange pairs, beyond the initial report turn
+
+
+@app.post("/api/jobs/{job_id}/chat")
+async def chat(job_id: str, payload: dict):
+    """Send a free-text follow-up instruction to the AI about a report
+    that's already been generated for this job - e.g. "focus more on the
+    network side", "explain the timeline gap between 14:02 and 14:05",
+    "give me a shorter executive summary for my manager". Requires
+    Generate/Regenerate to have completed at least once first (that call
+    seeds the conversation this endpoint continues). Streams the reply
+    via SSE exactly like /synthesize. Conversation history is capped
+    (see _CHAT_MAX_FOLLOWUP_TURNS) so an extended back-and-forth doesn't
+    let the request payload/cost/latency grow unbounded - the original
+    system+digest+report turn is always preserved regardless."""
+    job = _get_job_or_404(job_id)
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"job status is {job['status']}, not done yet")
+
+    message = (payload.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    provider, auth_type, _ = _validate_provider_auth(payload)
+    provider_kwargs = {k: v for k, v in payload.items() if k not in ("provider", "message", "redact")}
+
+    with JOBS_LOCK:
+        conversation = list(job.get("conversation") or [])
+    if not conversation:
+        raise HTTPException(status_code=409, detail="generate a report first (Generate log analysis), then ask follow-up questions here")
+
+    head, tail = conversation[:2], conversation[2:]
+    if len(tail) > _CHAT_MAX_FOLLOWUP_TURNS * 2:
+        tail = tail[-(_CHAT_MAX_FOLLOWUP_TURNS * 2):]
+    conversation = head + tail + [{"role": "user", "content": message}]
+
+    def event_stream():
+        accumulated = []
+        try:
+            for chunk in stream_chat(provider, conversation, **provider_kwargs):
+                accumulated.append(chunk)
+                yield f"data: {json.dumps({'delta': chunk})}\n\n"
+        except ProviderError as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        else:
+            reply = "".join(accumulated)
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]["conversation"] = conversation + [{"role": "assistant", "content": reply}]
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/jobs/{job_id}/chat")
+def get_chat_history(job_id: str):
+    """Returns the follow-up exchanges only (not the initial system
+    prompt/digest turn - the frontend already has the report itself from
+    /synthesize) so a page refresh can restore an in-progress chat
+    thread."""
+    job = _get_job_or_404(job_id)
+    with JOBS_LOCK:
+        conversation = list(job.get("conversation") or [])
+    return {"messages": conversation[3:]}  # skip system(0)/digest-user(1)/report-assistant(2)
+
+
+@app.delete("/api/jobs/{job_id}/chat")
+def reset_chat(job_id: str):
+    """Clears follow-up exchanges only, restoring the conversation to
+    "just the report that's already displayed" rather than wiping it
+    entirely - a re-generated report (via /synthesize) always resets this
+    completely anyway."""
+    job = _get_job_or_404(job_id)
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            conv = JOBS[job_id].get("conversation") or []
+            JOBS[job_id]["conversation"] = conv[:3]
+    return {"reset": True}
 
 
 # --------------------------------------------------------------------------

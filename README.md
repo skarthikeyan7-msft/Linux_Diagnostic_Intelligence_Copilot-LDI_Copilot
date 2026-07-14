@@ -1,10 +1,10 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-3.1.2-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.0.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
-Describe the specific issue you're investigating, pick an AI model (and how you want to authenticate to it), drop in an archive, and get a **focused**, evidence-cited root-cause report — instead of a generic exhaustive dump. Built on the same mechanical evidence-scanning engine as the [`sosreport-rca`](../sosreport-rca) CLI tool, extended with full `crm_report` support, investigation-focused steering, Microsoft Entra ID authentication for Azure OpenAI, a persistent tabbed UI, a full-height activity terminal with one-click Ollama control, and automatic redaction of sensitive identifiers when using a non-local AI provider.
+Describe the specific issue you're investigating, pick an AI model (and how you want to authenticate to it), drop in an archive, and get a **focused**, evidence-cited root-cause report — instead of a generic exhaustive dump. Every bundle is automatically analyzed across **performance (SAR), crash/coredump artifacts, boot timing, SELinux/AppArmor, recent package changes, systemd failure cascades, container correlation, and (optionally) a standalone packet capture** — no need to tell it what kind of problem you're chasing. Built on the same mechanical evidence-scanning engine as the [`sosreport-rca`](../sosreport-rca) CLI tool, extended with full `crm_report` support, investigation-focused steering, Microsoft Entra ID authentication for Azure OpenAI, a persistent tabbed UI, a full-height activity terminal with one-click Ollama control, automatic redaction of sensitive identifiers when using a non-local AI provider, and an interactive follow-up chat on every generated report.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history — this project follows [Semantic Versioning](https://semver.org/) and is tagged (`vX.Y.Z`) with a matching GitHub Release per version. See **[SECURITY.md](SECURITY.md)** for this project's full data-handling and confidentiality guidance — read this before using it with customer data at team scale.
 
@@ -53,13 +53,14 @@ python -m venv .venv
 
 The top of the page has three always-clickable tabs — **1. Provide Bundle**, **2. Analyzing**, **3. Results** — so you can jump back to tweak settings or check a previous tab at any time; nothing forces a strict linear flow.
 
-1. **Provide a bundle** (tab 1) — drag & drop an archive (`.tar.xz`, `.tgz`, `.tar.bz2`, `.zip`, …), or paste a path already on disk (file or an already-extracted folder). Format (sosreport/supportconfig/crm_report) is auto-detected.
+1. **Provide a bundle** (tab 1) — drag & drop an archive (`.tar.xz`, `.tgz`, `.tar.bz2`, `.zip`, …), or paste a path already on disk (file or an already-extracted folder). Format (sosreport/supportconfig/crm_report) is auto-detected — and so is everything inside it (SAR, crash artifacts, boot timing, security, package changes, systemd cascades, container logs). Optionally attach a standalone **packet capture** (`.pcap`/`.pcapng`) alongside it for network-level metadata analysis.
 2. **Say what you're investigating** — in the "🎯 What are you investigating?" box, describe the specific issue, e.g. *"find root cause of NC and IP cluster resource restart issue"*. This steers both the mechanical scan (a dedicated Focused Findings section, keyword-tagged results) and the AI report (which answers that question directly and demotes unrelated findings to a short closing section). Leave it blank for a generic full-bundle analysis.
 3. **Configure your AI model** — right below, in the same panel: pick a provider, then (for Azure OpenAI) pick an **authentication type** — API Key or Microsoft Entra ID — and fill in the fields for that choice. Optionally check "Remember these settings on this device". Filling this in now means a full AI-reasoned report generates **automatically** as soon as the scan finishes — no extra click. This panel lives permanently on tab 1; use the "✏️ Edit focus & AI settings" shortcut on the Results tab to jump straight back to it.
-4. **(Optional) scope the analysis** — expand "Advanced options" to restrict the scan to a specific date/time range or a time ± window, instead of the whole archive. Useful when you already know roughly when an incident happened.
-5. **Run analysis** — the view auto-advances to tab 2 to show live progress, then to tab 3 once done. Results open on the **AI Root Cause Report** tab by default, streaming in automatically if you configured a model in step 3 (or click "Generate log analysis" there if you didn't). A disclaimer is always shown above the report — ⚠️ AI-generated content may be incorrect or incomplete; verify against the evidence before acting. Other tabs: the full evidence **Digest**, a filterable **Findings** list (with a "show only findings matching my focus 🎯" toggle), and a cross-file **Timeline**.
-6. **Regenerate or refine** — click "✏️ Edit focus & AI settings" to jump back to tab 1, tweak the focus text or switch AI providers/auth type, then return to tab 3 and click Generate again to regenerate without re-running the mechanical scan.
-7. **Download** the combined AI report + evidence digest as a single Markdown file.
+4. **(Optional) scope the analysis** — expand "Advanced options" to restrict the scan to a specific date/time range or a time ± window, or narrow which **analysis focus areas** (SAR, crash, boot, security, packages, cascade, containers, network) actually show up in the digest/report. Useful when you already know roughly when an incident happened, or which axes matter for this investigation.
+5. **Run analysis** — the view auto-advances to tab 2 to show live progress, then to tab 3 once done. Results open on the **AI Root Cause Report** tab by default, streaming in automatically if you configured a model in step 3 (or click "Generate log analysis" there if you didn't). A disclaimer is always shown above the report — ⚠️ AI-generated content may be incorrect or incomplete; verify against the evidence before acting. Other tabs: a **📊 Performance** sub-tab with SAR charts (when SAR data was found), the full evidence **Digest**, a filterable **Findings** list (with a "show only findings matching my focus 🎯" toggle), and a cross-file **Timeline**.
+6. **Ask follow-up questions** — once a report is generated, an "💬 Ask a follow-up" thread appears below it. Type a custom instruction and the model replies in the context of the report it just gave you, without re-running the mechanical scan.
+7. **Regenerate or refine** — click "✏️ Edit focus & AI settings" to jump back to tab 1, tweak the focus text or switch AI providers/auth type, then return to tab 3 and click Generate again to regenerate (this also resets the follow-up chat thread) without re-running the mechanical scan.
+8. **Download** the combined AI report + evidence digest as a single Markdown file.
 
 Recent analyses from the current server session are listed under "Recent analyses" (top right) so you can revisit results without re-uploading.
 
@@ -78,6 +79,25 @@ The **"🔌 Test AI connectivity"** button (right below the model picker in tab 
 ### A note on focused analysis
 
 The mechanical engine's keyword matching is intentionally simple (it just tags findings that literally contain your focus words), while the AI layer does the actual causal reasoning across the *entire* evidence base — so it can, for example, connect a flapping NIC (`NIC Link is Down`) to a restart of a resource named `rsc_ip_cluster` even though "NIC" and "IP" don't share a literal keyword. If you ask about "NC and IP" and the mechanical Focused Findings section looks sparse, that's expected — the AI report is where the deeper connection gets made. Use the Findings tab's focus filter to see exactly what was keyword-matched, and the Digest/Timeline to see everything else the AI had available to reason over.
+
+## Multi-analyzer deep-dive (v4.0.0)
+
+Every bundle is **automatically** analyzed across all of the below — there's no "pick an analysis type" step, because SAR/crash/security/etc. data (when present) lives inside the *same* sosreport/supportconfig/crm_report bundle as everything else; each is just a dedicated parser that only adds a digest section when it actually finds something relevant:
+
+- **📊 Performance (SAR)** — parses sysstat's pre-rendered `sar` text tables (CPU/memory/disk I/O/network/load) into both a condensed text summary *and* dependency-free `<canvas>` line charts on a new **Performance** sub-tab (Results → Performance). Every timestamp is explicitly labeled with the analyzed **VM's own detected timezone** (from `/etc/timezone`, the captured `date` output, or `/etc/localtime`) so you never confuse "the time I'm reading this in" with "the time it happened on the customer's box" — a common source of confusion when the analyst and the customer are in different timezones.
+- **💥 Crash / Coredump analysis** — correlates ABRT crash reports (`var/spool/abrt/ccpp-*`, already-human-readable backtraces ABRT captured at crash time), kdump/kexec configuration, and vmcore presence/size. Deliberately scoped to what's realistically available in a bundle — full raw-core-file-plus-gdb symbolication needs matching debug symbols and a Linux gdb environment, which isn't something this Windows-hosted tool can do.
+- **🥾 Boot performance** — `systemd-analyze`'s own startup breakdown, slowest-unit ("blame") ranking, and critical-chain tree, when captured.
+- **🛡️ Security (SELinux/AppArmor)** — enforcing/permissive status, AppArmor profile counts, and a *structured* denial breakdown (by SELinux scontext/tcontext/tclass, or AppArmor profile/operation) — more actionable than a flat list of near-identical raw log lines.
+- **📦 Recent package changes** — installed-package timestamps (and yum/dnf transaction history, where available) surfaced with a dedicated "changed in the 7 days before capture" view — a very common real "what changed right before this broke" question.
+- **🔗 Service failure cascade** — looks for `Dependency failed for X` / `Triggering OnFailure=` evidence and groups near-simultaneous multi-unit failures, since a cluster of units failing within a few seconds usually shares one root cause rather than being N independent problems.
+- **🐳 Container correlation** — Docker/Podman `ps` snapshots correlated with host-level OOM evidence; flags containers that exited with a signal consistent with an OOM-kill (exit code 137) or are stuck restart-looping.
+- **🌐 Network capture (pcap)** — optional: attach a standalone `.pcap`/`.pcapng` (Step 1, "Attach a packet capture") for packet/byte counts, top talkers, protocol mix, TCP anomaly counts (resets, suspected retransmissions, a rough port-scan heuristic), and a DNS query summary. **Metadata only, never raw payload content** — see [SECURITY.md](SECURITY.md) for the full privacy stance behind this design choice, and why it's held to a stricter standard than the rest of the digest.
+
+**Analysis focus areas** (Step 1 → Advanced options) let you narrow which of the sections above actually render in the digest/AI report — useful once you already know a given axis isn't relevant to this investigation. Every analyzer still *runs* regardless (they're cheap, and the full structured data stays available in `facts.json`/the API either way) — the toggles only control what's emphasized in what you and the AI actually read. All checked by default.
+
+### Interactive follow-up chat
+
+The generated report isn't the end of the conversation — **Results → AI Root Cause Report** now has an "💬 Ask a follow-up" thread below the report. Type a custom instruction (*"focus more on the network side"*, *"explain the timeline gap between 14:02 and 14:05"*, *"give me a shorter executive summary for my manager"*) and the model replies **in the context of the report it just gave you**, not as a fresh, disconnected question. Each exchange appends to the same conversation; "Reset conversation" clears the follow-up thread without discarding the report itself or re-running the mechanical scan. History is capped in length so an extended back-and-forth doesn't let request size/cost/latency grow unbounded — the original report is always preserved regardless of how many follow-ups you send.
 
 ## AI provider setup
 
@@ -133,13 +153,20 @@ ldi-copilot/
 ├── SECURITY.md                 # data-handling / confidentiality guidance - read before team rollout
 ├── backend/
 │   ├── app.py                 # FastAPI server: job management, REST API, static file serving,
-│   │                          # /api/models live-availability endpoint, /api/ollama/* lifecycle
-│   ├── requirements.txt
+│   │                          # /api/models live-availability endpoint, /api/ollama/* lifecycle,
+│   │                          # /api/jobs/{id}/chat (interactive follow-up), /api/jobs/{id}/sar_series
+│   ├── requirements.txt        # fastapi, uvicorn, python-multipart, dpkt (pcap parsing)
 │   ├── engine/
-│   │   └── analyzer_core.py   # mechanical scanning engine (extraction, detection, pattern
-│   │                          # matching, fact-checks, timeline, digest, focus-keyword
-│   │                          # tagging) - sosreport + supportconfig + crm_report, with a
-│   │                          # run_analysis() library API
+│   │   ├── analyzer_core.py   # mechanical scanning engine (extraction, detection, pattern
+│   │   │                      # matching, fact-checks, timeline, digest, focus-keyword
+│   │   │                      # tagging) - sosreport + supportconfig + crm_report, with a
+│   │   │                      # run_analysis() library API. v4.0.0 added 7 new fact-checks
+│   │   │                      # (SAR/perf, crash/coredump, boot, SELinux/AppArmor, package
+│   │   │                      # drift, systemd cascade, container correlation), VM-timezone
+│   │   │                      # detection, and focus-area digest-section gating
+│   │   └── pcap_analyzer.py   # standalone .pcap/.pcapng metadata analyzer (dpkt-based) -
+│   │                          # packet/byte counts, top talkers, protocol mix, TCP/DNS
+│   │                          # summaries; never parses/stores raw payload content
 │   ├── ai/
 │   │   ├── providers.py       # OpenAI / Anthropic / Azure OpenAI (API key + Entra ID) /
 │   │   │                      # Ollama streaming clients, known_models registry, and
@@ -148,23 +175,26 @@ ldi-copilot/
 │   │   ├── redaction.py       # hostname/IPv4 redaction for non-local providers, with a
 │   │   │                      # local-only legend
 │   │   └── ollama_manager.py  # starts/stops/monitors a local `ollama serve` process on demand
-│   └── data/jobs/<id>/         # per-analysis uploaded file + extracted tree + output (gitignored)
+│   └── data/jobs/<id>/         # per-analysis uploaded file(s) + extracted tree + output (gitignored)
 ├── frontend/
 │   ├── index.html             # persistent top-level tabs (Provide Bundle/Analyzing/Results),
-│   │                          # focus+AI config panel permanently inlined in tab 1, full-height
-│   │                          # right-edge activity terminal with Ollama toolbar, bottom-right
-│   │                          # Microsoft logo+text watermark
+│   │                          # focus+AI config panel permanently inlined in tab 1, optional
+│   │                          # pcap upload slot + analysis focus-area toggles, full-height
+│   │                          # right-edge activity terminal with Ollama toolbar, Performance
+│   │                          # sub-tab, interactive chat thread, bottom-right Microsoft
+│   │                          # logo+text watermark
 │   ├── app.js                 # upload, polling, rendering, SSE streaming, tiny MD renderer,
 │   │                          # top-level tab switching, auth-type-aware AI config, model
 │   │                          # dropdown + availability checks, activity-terminal logging,
-│   │                          # Ollama start/stop/status polling, auto-chained synthesis
+│   │                          # Ollama start/stop/status polling, auto-chained synthesis,
+│   │                          # dependency-free <canvas> SAR charts, interactive chat thread
 │   └── styles.css
 └── samples/                    # synthetic test fixtures (fake_sosreport, fake_supportconfig,
                                  # fake_crm_report, fake_crm_report_multi) - safe, fictional
                                  # data for trying the app
 ```
 
-**Request flow:** browser uploads a bundle (+ optional focus text + optional AI config incl. auth type, all collected in tab 1) → FastAPI saves it and starts a background thread running `run_analysis(..., focus=...)` → browser polls job status (mirroring new progress lines into the activity terminal as they arrive), tab auto-advances to "2. Analyzing" → once done, browser fetches the digest/findings/facts/timeline JSON, tab auto-advances to "3. Results" and renders the dashboard, opening on the AI Root Cause Report tab → if AI settings were filled in, the browser automatically POSTs the provider credentials (+ auth type, + redact flag) + focus text + the job's digest to `/api/jobs/{id}/synthesize` (first calling `/api/ollama/start` and polling `/api/ollama/status` if Ollama was selected and isn't already running) → the endpoint redacts known hostnames/IPs from the digest first if the provider isn't local, emits a local-only redaction-legend SSE event, and (for Entra ID) exchanges the tenant/client/secret for a bearer token before streaming the model's response back via Server-Sent Events. The focus+AI panel never moves in the DOM — the Results tab's "Edit focus & AI settings" button just switches the active top-level tab back to it, so a second analysis from tab 1 always finds its fields intact.
+**Request flow:** browser uploads a bundle (+ optional focus text + optional pcap + optional AI config incl. auth type, all collected in tab 1) → FastAPI saves it and starts a background thread running `run_analysis(..., focus=..., focus_areas=..., pcap_path=...)` → browser polls job status (mirroring new progress lines into the activity terminal as they arrive), tab auto-advances to "2. Analyzing" → once done, browser fetches the digest/findings/facts/timeline/sar_series JSON, tab auto-advances to "3. Results" and renders the dashboard (including Performance-tab charts, if SAR data was found), opening on the AI Root Cause Report tab → if AI settings were filled in, the browser automatically POSTs the provider credentials (+ auth type, + redact flag) + focus text + the job's digest to `/api/jobs/{id}/synthesize` (first calling `/api/ollama/start` and polling `/api/ollama/status` if Ollama was selected and isn't already running) → the endpoint redacts known hostnames/IPs from the digest first if the provider isn't local, emits a local-only redaction-legend SSE event, and (for Entra ID) exchanges the tenant/client/secret for a bearer token before streaming the model's response back via Server-Sent Events, seeding the interactive-chat conversation with that report as its first turn. Follow-up messages go to `/api/jobs/{id}/chat`, replaying the same conversation history rather than starting fresh each time. The focus+AI panel never moves in the DOM — the Results tab's "Edit focus & AI settings" button just switches the active top-level tab back to it, so a second analysis from tab 1 always finds its fields intact.
 
 ## Focused analysis
 
@@ -191,3 +221,8 @@ Detects the crmsh `crm report` layout (`analysis.txt`, `cib.xml`, `members.txt`,
 - The redaction feature is a best-effort mitigation, not a guarantee — it only catches known hostnames (from this analysis's own facts) and IPv4 addresses. It does not find customer/company names in free text, usernames, IPv6 addresses, or other identifiers. See [SECURITY.md](SECURITY.md) for the full picture.
 - Single-user, single-machine tool: job state is in-memory and does not survive a server restart (uploaded files/analysis output on disk do persist under `backend/data/jobs/` until deleted). Not designed to be deployed as a shared, centrally-reachable server for a team — see [SECURITY.md](SECURITY.md) for the recommended one-instance-per-engineer model.
 - No authentication on the local server itself — appropriate for local personal use; do not expose this server beyond localhost.
+- **SAR analysis** parses the pre-rendered text tables sysstat's own `sar` command already wrote into the bundle (`sos_commands/sar/*`, or the equivalent supportconfig/crm_report capture) — it does **not** decode the raw binary `/var/log/sa/saDD` files, which would require the `sar`/`sadf` binary (not available in this Windows-hosted tool). If sysstat wasn't installed on the customer's box, or the sar plugin wasn't included in the capture, there's simply no SAR data to show — the Performance tab will say so rather than erroring.
+- **Crash/coredump analysis** is scoped to already-textual artifacts a bundle realistically contains (ABRT reports, kdump config, vmcore file presence/size) — it does **not** symbolize a raw core file with `gdb` (that needs matching debug symbols and a Linux environment, and sosreport/supportconfig don't normally include the actual core file anyway, since it's typically huge).
+- **VM timezone detection** is best-effort (checks `/etc/timezone`, the captured `date` output, then `/etc/localtime`) and returns "unknown" rather than guessing when none of these signals are present — never silently assumes UTC.
+- **Packet capture (pcap) analysis** requires you to separately obtain and attach a capture — sosreport/supportconfig/crm_report essentially never embed one themselves (too large, too privacy-sensitive for a general-purpose collector to grab automatically). It's metadata-only by design; see [SECURITY.md](SECURITY.md) for why.
+- The **interactive chat** follow-up history is capped in length (see `_CHAT_MAX_FOLLOWUP_TURNS` in `backend/app.py`) to bound request size/cost/latency on long back-and-forths — the original report is always preserved, only older follow-up exchanges age out.

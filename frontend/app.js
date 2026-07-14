@@ -401,6 +401,20 @@ async function startAnalysis() {
   fd.append("min_severity", $("optMinSeverity").value);
   fd.append("top_per_category", $("optTopPerCategory").value);
 
+  const checkedFocusAreas = Array.from(document.querySelectorAll(".focus-area-cb:checked")).map((cb) => cb.value);
+  // Always sent explicitly (even "all checked", even "" if the user
+  // unchecked everything) so the backend can tell "user didn't touch
+  // this control" (field absent - default to everything) apart from
+  // "user deliberately unchecked everything" (empty string - show
+  // nothing) without any ambiguity.
+  fd.append("focus_areas", checkedFocusAreas.join(","));
+
+  const pcapFile = $("pcapInput").files[0];
+  if (pcapFile) {
+    fd.append("pcap_file", pcapFile);
+    logTerminal(`🌐 Attaching packet capture: ${pcapFile.name} (metadata-only analysis)`, "info");
+  }
+
   const mode = getScopeMode();
   if (mode === "range") {
     if ($("optStart").value.trim()) fd.append("start", $("optStart").value.trim());
@@ -518,16 +532,21 @@ async function loadResults(jobIdOverride) {
   $("digestRender").innerHTML = markdownToHtml(digest);
   renderFindings(findings);
   renderTimeline(timeline);
+  loadSarSeries(jobId);
 
   // Reset AI tab for the (possibly new) job
   $("aiRender").innerHTML = "";
   $("aiError").classList.add("hidden");
   $("btnDownloadReport").classList.add("hidden");
+  $("chatSection").classList.add("hidden");
+  $("chatThread").innerHTML = "";
   const existingReport = await fetch(`/api/jobs/${jobId}/ai_report`).then((r) => r.text()).catch(() => "");
   if (existingReport) {
     $("aiRender").innerHTML = markdownToHtml(existingReport);
     $("btnDownloadReport").classList.remove("hidden");
     $("btnSynthesize").textContent = "Regenerate log analysis";
+    $("chatSection").classList.remove("hidden");
+    await restoreChatHistory(jobId);
   } else {
     $("btnSynthesize").textContent = "Generate log analysis";
   }
@@ -671,6 +690,185 @@ function renderTimeline(timeline) {
       </div>`
     )
     .join("");
+}
+
+// --------------------------------------------------------------------------
+// Performance (SAR) sub-tab - dependency-free <canvas> line charts, one
+// card per metric group. Consistent with the project's zero-external-
+// dependency philosophy (own markdown renderer, own everything here too).
+// --------------------------------------------------------------------------
+const CHART_COLORS = ["#4da3ff", "#f2c94c", "#6fcf97", "#ff5470", "#bb86fc", "#ff8a4c"];
+
+// Draws one or more named value-series (each an array of {ts, value})
+// sharing a single time axis onto `canvas`, auto-scaling both axes.
+// Deliberately simple (no zoom/pan/tooltips) - this is a diagnostic
+// glance, not a full charting library; findings.json/facts.json retain
+// the exact numbers for anything requiring precision.
+function drawLineChart(canvas, namedSeries) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(rect.width, 300);
+  const h = Math.max(rect.height, 140);
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const allPoints = namedSeries.flatMap((s) => s.points);
+  if (!allPoints.length) {
+    ctx.fillStyle = "#8b94a7";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("No data points", 10, h / 2);
+    return;
+  }
+  const padL = 46, padR = 10, padT = 10, padB = 22;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  const xs = allPoints.map((p) => p.t);
+  const ys = allPoints.map((p) => p.v);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  let yMin = Math.min(0, ...ys), yMax = Math.max(...ys);
+  if (yMax === yMin) yMax = yMin + 1;
+  yMax += (yMax - yMin) * 0.08; // small headroom so the peak isn't flush against the top edge
+
+  const xOf = (t) => padL + (xMax === xMin ? 0 : ((t - xMin) / (xMax - xMin)) * plotW);
+  const yOf = (v) => padT + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+
+  // Gridlines + y-axis labels (4 bands)
+  ctx.strokeStyle = "#2a313f";
+  ctx.fillStyle = "#8b94a7";
+  ctx.font = "10.5px sans-serif";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = yMin + ((yMax - yMin) * i) / 4;
+    const y = yOf(v);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - padR, y);
+    ctx.stroke();
+    ctx.fillText(v >= 100 ? v.toFixed(0) : v.toFixed(1), 2, y + 3);
+  }
+  // x-axis start/end time labels (VM-local wall clock, HH:MM)
+  const fmtT = (t) => {
+    const d = new Date(t);
+    return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+  };
+  ctx.fillText(fmtT(xMin), padL, h - 6);
+  ctx.fillText(fmtT(xMax), w - padR - 30, h - 6);
+
+  namedSeries.forEach((s, idx) => {
+    if (!s.points.length) return;
+    ctx.strokeStyle = s.color || CHART_COLORS[idx % CHART_COLORS.length];
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    s.points.forEach((p, i) => {
+      const x = xOf(p.t), y = yOf(p.v);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+}
+
+// facts.json timestamps from the engine are naive VM-local wall-clock
+// strings (e.g. "2026-07-10T14:10:01", no timezone suffix) - parsed here
+// as if they were UTC purely so Date's internals give us a consistent,
+// timezone-independent numeric axis to plot against; never displayed as
+// "UTC" anywhere (labels always say "VM-local", per the detected zone
+// note shown above the charts).
+function seriesPoints(rows, valueKey, filter) {
+  return rows
+    .filter((r) => (filter ? filter(r) : true) && typeof r[valueKey] === "number")
+    .map((r) => ({ t: Date.parse(r.ts.endsWith("Z") ? r.ts : r.ts + "Z"), v: r[valueKey] }))
+    .filter((p) => Number.isFinite(p.t));
+}
+
+function buildChartCard(title, statsText, namedSeries) {
+  const card = document.createElement("div");
+  card.className = "chart-card";
+  const legend = namedSeries
+    .map((s, i) => `<span><span class="swatch" style="background:${s.color || CHART_COLORS[i % CHART_COLORS.length]}"></span>${escapeHtml(s.label)}</span>`)
+    .join("");
+  card.innerHTML = `<h4>${escapeHtml(title)}</h4><div class="chart-stats">${escapeHtml(statsText)}</div><canvas></canvas><div class="chart-legend">${legend}</div>`;
+  requestAnimationFrame(() => drawLineChart(card.querySelector("canvas"), namedSeries));
+  return card;
+}
+
+async function loadSarSeries(jobId) {
+  let sar = {};
+  try {
+    sar = await fetch(`/api/jobs/${jobId}/sar_series`).then((r) => r.json());
+  } catch {
+    sar = {};
+  }
+  const groups = sar.metric_groups_found || [];
+  if (!groups.length) {
+    $("perfPlaceholder").classList.remove("hidden");
+    $("perfContent").classList.add("hidden");
+    return;
+  }
+  $("perfPlaceholder").classList.add("hidden");
+  $("perfContent").classList.remove("hidden");
+
+  const tz = sar.vm_timezone;
+  $("perfTzNote").textContent = tz
+    ? `🕒 Timestamps below are VM-local time (${tz.label}) - not your own timezone or the customer's, unless they happen to match.`
+    : "🕒 The VM's timezone could not be determined - timestamps below are shown exactly as `sar` printed them on the analyzed host.";
+  const s = sar.summary || {};
+  const bits = [];
+  if (s.cpu_pct_used_avg != null) bits.push(`CPU avg ${s.cpu_pct_used_avg}% / peak ${s.cpu_pct_used_peak}%`);
+  if (s.mem_pct_used_avg != null) bits.push(`Mem avg ${s.mem_pct_used_avg}% / peak ${s.mem_pct_used_peak}%`);
+  if (s.load1_avg != null) bits.push(`Load(1m) avg ${s.load1_avg} / peak ${s.load1_peak}`);
+  if (s.disk_tps_avg != null) bits.push(`Disk avg ${s.disk_tps_avg} tps / peak ${s.disk_tps_peak} tps`);
+  if (s.busiest_iface) bits.push(`Busiest NIC: ${s.busiest_iface} (${s.busiest_iface_rxkbps_avg} kB/s avg rx)`);
+  $("perfSummaryNote").textContent = bits.join("  ·  ");
+
+  const grid = $("chartGrid");
+  grid.innerHTML = "";
+  const series = sar.series || {};
+
+  if (series.cpu) {
+    const rows = series.cpu.filter((r) => (r.CPU === "all" || r.CPU === undefined));
+    const used = rows.filter((r) => typeof r["%idle"] === "number").map((r) => ({ ts: r.ts, used: 100 - r["%idle"] }));
+    grid.appendChild(buildChartCard("📊 CPU used (%)", `${used.length} samples`, [
+      { label: "% used", points: seriesPoints(used, "used"), color: CHART_COLORS[0] },
+    ]));
+    const iowait = seriesPoints(rows, "%iowait");
+    if (iowait.length) {
+      grid.appendChild(buildChartCard("⏳ I/O wait (%)", `${iowait.length} samples`, [
+        { label: "%iowait", points: iowait, color: CHART_COLORS[3] },
+      ]));
+    }
+  }
+  if (series.memory) {
+    grid.appendChild(buildChartCard("🧠 Memory used (%)", `${series.memory.length} samples`, [
+      { label: "%memused", points: seriesPoints(series.memory, "%memused"), color: CHART_COLORS[2] },
+    ]));
+  }
+  if (series.disk_io) {
+    grid.appendChild(buildChartCard("💽 Disk transactions/sec", `${series.disk_io.length} samples`, [
+      { label: "tps", points: seriesPoints(series.disk_io, "tps"), color: CHART_COLORS[1] },
+    ]));
+  }
+  if (series.load) {
+    grid.appendChild(buildChartCard("⚖️ Load average (1 min)", `${series.load.length} samples`, [
+      { label: "ldavg-1", points: seriesPoints(series.load, "ldavg-1"), color: CHART_COLORS[4] },
+    ]));
+  }
+  if (series.network) {
+    const byIface = {};
+    series.network.forEach((r) => {
+      if (typeof r["rxkB/s"] !== "number" || !r.IFACE) return;
+      (byIface[r.IFACE] = byIface[r.IFACE] || []).push(r);
+    });
+    const namedSeries = Object.keys(byIface)
+      .slice(0, 6)
+      .map((iface, i) => ({ label: iface, points: seriesPoints(byIface[iface], "rxkB/s"), color: CHART_COLORS[i % CHART_COLORS.length] }));
+    if (namedSeries.length) {
+      grid.appendChild(buildChartCard("🌐 Network received (kB/s)", `${Object.keys(byIface).length} interface(s)`, namedSeries));
+    }
+  }
 }
 
 // --------------------------------------------------------------------------
@@ -956,6 +1154,11 @@ async function runSynthesis() {
   $("btnSynthesize").textContent = "Generating…";
   $("aiRender").innerHTML = '<p class="muted">Waiting for the model to respond…</p>';
   $("btnDownloadReport").classList.add("hidden");
+  // A (re)generate always starts a brand-new conversation server-side
+  // (see backend/app.py synthesize()) - clear any previous follow-up
+  // chat thread from the UI so it doesn't look like it still applies.
+  $("chatSection").classList.add("hidden");
+  $("chatThread").innerHTML = "";
 
   if (payload.provider === "ollama") {
     try {
@@ -1008,6 +1211,7 @@ async function runSynthesis() {
         }
         if (parsed.done) {
           $("btnDownloadReport").classList.remove("hidden");
+          $("chatSection").classList.remove("hidden");
         }
       }
     }
@@ -1020,6 +1224,114 @@ async function runSynthesis() {
     $("btnSynthesize").disabled = false;
     $("btnSynthesize").textContent = accumulated ? "Regenerate log analysis" : "Generate log analysis";
   }
+}
+
+// --------------------------------------------------------------------------
+// Interactive follow-up chat on the generated report (Results -> AI tab).
+// Backed by POST/GET/DELETE /api/jobs/{id}/chat - see backend/app.py. The
+// report itself (rendered above via #aiRender) is the conversation's
+// first "assistant" turn server-side; this thread only ever shows the
+// follow-up exchanges layered on top of it.
+// --------------------------------------------------------------------------
+function appendChatMessage(role, content, pending) {
+  const div = document.createElement("div");
+  div.className = `chat-message ${role}${pending ? " pending" : ""}`;
+  div.innerHTML = `<div class="chat-role">${role === "user" ? "You" : "AI"}</div><div class="chat-body">${markdownToHtml(content)}</div>`;
+  $("chatThread").appendChild(div);
+  $("chatThread").scrollTop = $("chatThread").scrollHeight;
+  return div;
+}
+
+async function restoreChatHistory(jobId) {
+  try {
+    const data = await fetch(`/api/jobs/${jobId}/chat`).then((r) => r.json());
+    (data.messages || []).forEach((m) => appendChatMessage(m.role === "user" ? "user" : "assistant", m.content, false));
+  } catch {
+    // Non-fatal - the report itself still renders fine without history.
+  }
+}
+
+async function sendChatMessage() {
+  const message = $("chatInput").value.trim();
+  if (!message) return;
+  const { payload, missing } = collectAiPayload();
+  $("chatError").classList.add("hidden");
+  if (missing.length) {
+    $("chatError").textContent = `Missing required AI field(s): ${missing.join(", ")} - check "Edit focus & AI settings".`;
+    $("chatError").classList.remove("hidden");
+    return;
+  }
+
+  appendChatMessage("user", message, false);
+  $("chatInput").value = "";
+  const pendingEl = appendChatMessage("assistant", "_thinking…_", true);
+  $("btnSendChat").disabled = true;
+
+  if (payload.provider === "ollama") {
+    try {
+      await ensureOllamaRunning();
+    } catch (err) {
+      pendingEl.remove();
+      $("chatError").textContent = `Ollama startup failed: ${err.message}`;
+      $("chatError").classList.remove("hidden");
+      $("btnSendChat").disabled = false;
+      return;
+    }
+  }
+
+  let accumulated = "";
+  try {
+    const resp = await fetch(`/api/jobs/${state.jobId}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...payload, message }),
+    });
+    if (!resp.ok || !resp.body) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(detail.detail || `Request failed (HTTP ${resp.status})`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    pendingEl.classList.remove("pending");
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop();
+      for (const evt of events) {
+        const line = evt.trim();
+        if (!line.startsWith("data:")) continue;
+        const parsed = JSON.parse(line.slice(5).trim());
+        if (parsed.error) throw new Error(parsed.error);
+        if (parsed.delta) {
+          accumulated += parsed.delta;
+          pendingEl.querySelector(".chat-body").innerHTML = markdownToHtml(accumulated);
+          $("chatThread").scrollTop = $("chatThread").scrollHeight;
+        }
+      }
+    }
+    logTerminal(`💬 AI follow-up reply generated (${accumulated.length.toLocaleString()} chars)`, "success");
+  } catch (err) {
+    pendingEl.querySelector(".chat-body").innerHTML = `<em>Failed to respond: ${escapeHtml(err.message)}</em>`;
+    pendingEl.classList.remove("pending");
+    logTerminal(`❌ Chat follow-up failed: ${err.message}`, "error");
+  } finally {
+    $("btnSendChat").disabled = false;
+  }
+}
+
+async function resetChat() {
+  if (!state.jobId) return;
+  try {
+    await fetch(`/api/jobs/${state.jobId}/chat`, { method: "DELETE" });
+  } catch {
+    // best-effort - clear the visible thread regardless
+  }
+  $("chatThread").innerHTML = "";
+  $("chatError").classList.add("hidden");
+  logTerminal("🔄 Chat conversation reset (report above is unaffected).", "info");
 }
 
 // --------------------------------------------------------------------------
@@ -1129,6 +1441,8 @@ function resetToUpload() {
   $("fileInput").value = "";
   $("serverPath").value = "";
   $("dropzoneFile").classList.add("hidden");
+  $("pcapInput").value = "";
+  $("pcapFileName").classList.add("hidden");
   // Deliberately NOT clearing focusInput / AI provider settings - a
   // support engineer often analyzes a second bundle (e.g. another
   // node's crm_report) for the very same investigation, and retyping
@@ -1156,4 +1470,17 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btnEditFocusAi").addEventListener("click", () => activateMainTab("upload"));
   $("btnRecent").addEventListener("click", () => { $("recentPanel").classList.toggle("hidden"); loadRecentJobs(); });
   $("btnCloseRecent").addEventListener("click", () => $("recentPanel").classList.add("hidden"));
+  $("btnSendChat").addEventListener("click", sendChatMessage);
+  $("btnResetChat").addEventListener("click", resetChat);
+  $("chatInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
+    }
+  });
+  $("pcapInput").addEventListener("change", () => {
+    const f = $("pcapInput").files[0];
+    $("pcapFileName").textContent = f ? `Selected: ${f.name} (${humanSize(f.size)})` : "";
+    $("pcapFileName").classList.toggle("hidden", !f);
+  });
 });

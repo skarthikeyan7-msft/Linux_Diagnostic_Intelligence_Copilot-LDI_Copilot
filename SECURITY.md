@@ -26,6 +26,10 @@ Nothing leaves the machine **except** the evidence digest sent to an AI provider
 
 The raw uploaded archive itself is **never** sent anywhere — only the mechanically-produced Markdown digest (pattern-matched findings, structured fact-checks, a chronological timeline) is ever transmitted, and only to the provider you explicitly chose.
 
+The v4.0.0 mechanical analyzers (SAR/performance, crash/coredump, boot performance, SELinux/AppArmor, package drift, systemd failure cascades, container correlation, and the pcap metadata analyzer below) introduce **no new data flows** — they're all local, offline text/binary parsing of files already inside the bundle (or the optional attached capture), folded into the same digest described above. Nothing about them changes when/what gets sent externally.
+
+The interactive follow-up chat (Results → AI tab, "Ask a follow-up") continues the **same conversation** as the original report: each follow-up message you type is sent to whichever provider generated that report, along with the existing conversation history (the original system prompt + digest + report, plus recent follow-ups, capped in length — see the code comments in `backend/app.py`'s `/api/jobs/{id}/chat` for the exact cap). It does not re-send the raw archive, and redaction (if applicable) was already applied to the digest in that first turn.
+
 ## Redaction: reducing exposure even when using a public AI model
 
 As of v2.2.0, whenever a **non-local** provider is selected, LDI Copilot automatically redacts the evidence digest before sending it:
@@ -37,6 +41,18 @@ As of v2.2.0, whenever a **non-local** provider is selected, LDI Copilot automat
 **Limitations — read before relying on this for genuinely sensitive engagements:**
 - This is a **best-effort mitigation, not a guarantee**. It only catches the two most mechanically reliable categories (known hostnames from this analysis's own facts, and IPv4 addresses). It does **not** find or redact: customer/company names mentioned in free text, usernames, email addresses, application-specific identifiers, IPv6 addresses, MAC addresses, file paths containing customer names, or anything else that isn't one of the two categories above.
 - If a bundle is sensitive enough that *any* residual identifying detail reaching a public AI provider would be unacceptable, **use Ollama** (fully offline) instead of relying on redaction with a cloud provider.
+
+## Packet captures (.pcap/.pcapng): metadata only, never payload content
+
+As of v4.0.0, you can optionally attach a standalone packet capture alongside a bundle for network-level analysis (`backend/engine/pcap_analyzer.py`). This is held to a **stricter standard than the rest of the digest**, because raw packet payloads can contain credentials, session tokens, cookies, or other highly sensitive content that the hostname/IP redaction described above was never designed to parse or scrub from arbitrary binary payload data:
+
+- **Only metadata is ever extracted:** packet/byte counts, source/destination IP pairs ("top talkers"), protocol mix (TCP/UDP/ICMP/…), TCP-layer anomaly counts (resets, suspected retransmissions, a rough SYN-vs-SYN-ACK port-scan heuristic), DNS query names, and packets-per-second timing.
+- **Raw payload bytes/strings are never read into memory as analysis output, never written to `facts.json`/the digest, and never sent to any AI provider.** The parser (`dpkt`) only inspects packet headers (Ethernet/IP/TCP/UDP/ICMP/DNS) for the fields listed above — application-layer payload content (HTTP bodies, TLS application data, plaintext protocol payloads, etc.) is never decoded or surfaced.
+- IP addresses and DNS names **are** included in the summary (that's the point of a "top talkers"/"DNS summary" view) and flow through the same hostname/IP redaction as the rest of the digest when a non-local AI provider is selected — see "Redaction" above.
+- The pcap is stored on disk under the same per-job folder as the bundle (`backend/data/jobs/<job_id>/upload/`) and is subject to the same retention/cleanup guidance below — deleting the job deletes the capture too.
+- `dpkt` (the one new dependency this feature adds) is a pure-Python pcap/pcapng parser with no network access of its own; it never phones home or uploads anything itself.
+
+If your organization's policy is stricter than "metadata only" for packet captures specifically, don't attach one — every other part of this tool works identically without it.
 
 ## An explicit confirmation gate before any external send
 

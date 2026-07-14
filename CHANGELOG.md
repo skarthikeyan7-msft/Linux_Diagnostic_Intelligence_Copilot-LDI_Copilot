@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-07-15
+
+### Added - BREAKING (major version: new analyzer suite + interactive chat)
+- **Seven new mechanical analyzers**, wired into `run_structured_checks()`/`build_digest()` and run automatically on every analysis (auto-detected - no analysis-type picker):
+  - **📊 Performance (SAR)** (`check_sar_performance`) - parses sysstat's pre-rendered `sar` text tables (CPU/memory/disk I/O/network/load) into time series + a condensed summary. New `detect_vm_timezone()` utility labels every SAR timestamp with the analyzed VM's own detected timezone (`/etc/timezone`, captured `date` output, or `/etc/localtime`) so analyst/customer timezone confusion can't happen. New **Performance** sub-tab (Results) renders dependency-free `<canvas>` line charts per metric group, backed by a new `GET /api/jobs/{id}/sar_series` endpoint.
+  - **💥 Crash / Coredump analysis** (`check_crash_analysis`) - ABRT report correlation (backtrace/reason/cmdline/executable/time), kdump configuration, vmcore presence/size, kernel oops/panic signature counts. Scoped to already-textual bundle artifacts, not raw-core-plus-gdb symbolication.
+  - **🥾 Boot performance** (`check_boot_performance`) - `systemd-analyze` startup breakdown, slowest-unit ("blame") ranking, and critical-chain tree, when captured.
+  - **🛡️ Security (SELinux/AppArmor)** (`check_security_mac`) - enforcing/permissive status, AppArmor profile counts, and structured denial breakdowns by SELinux scontext/tcontext/tclass or AppArmor profile/operation.
+  - **📦 Recent package changes** (`check_package_drift`) - installed-package timestamps plus yum/dnf transaction history where available, with a dedicated "changed in the 7 days before capture" view.
+  - **🔗 Service failure cascade** (`check_systemd_cascade`) - detects `Dependency failed for X`/`Triggering OnFailure=` evidence and clusters near-simultaneous multi-unit failures into a likely-trigger → cascaded-units view.
+  - **🐳 Container correlation** (`check_container_logs`) - Docker/Podman `ps` snapshot parsing, flags non-zero exit codes (with a SIGKILL/SIGTERM/SIGSEGV note) and restart-looping containers, correlated with host-level OOM evidence in dmesg/messages.
+  - Each ships its own conditionally-rendered digest section (only appears if relevant data was found), and a new **"Analysis focus areas"** checkbox row (Step 1 → Advanced options) lets you narrow which sections actually render (every check still runs regardless -`facts.json`/the API always has the full data). Wired end-to-end: frontend checkboxes → `focus_areas` form field → `run_analysis(focus_areas=...)` → `build_digest()` section gating.
+- **TCPdump/pcap analyzer** (`backend/engine/pcap_analyzer.py`, new `dpkt` dependency) - optional standalone packet-capture upload (Step 1, second upload slot) analyzed as **metadata only**: packet/byte counts, top talkers, protocol mix, TCP anomaly counts (resets, suspected retransmissions, a rough port-scan heuristic), DNS query summary, packets/sec timing. **Raw payload content is never parsed, stored, or sent anywhere** - see `SECURITY.md` for the full privacy rationale. New `pcap_path` param on `run_analysis()`; new `pcap_file` upload field on `POST /api/analyze`.
+- **Interactive follow-up chat** on the Results → AI Root Cause Report tab: a persistent chat thread below the generated report lets you send custom instructions ("focus more on the network side", "explain the timeline gap between 14:02 and 14:05") and get a reply **in the context of the same conversation** (not a fresh disconnected question). New `POST /api/jobs/{id}/chat` (streams via SSE, replays capped conversation history), `GET /api/jobs/{id}/chat` (restore on reload), `DELETE /api/jobs/{id}/chat` (reset follow-ups without discarding the report). `synthesize()` now seeds `JOBS[id]["conversation"]` with the system+digest+report turn on every (re)generate.
+- **Windows-path-sanitization fix in archive extraction**: `safe_extract_tar`/`safe_extract_zip` now sanitize Windows-illegal characters (`< > : " | ? *`) in archive member names before extracting - discovered via the crash analyzer, since real-world ABRT crash-report directories are named like `ccpp-2026-07-10-11:15:22-9999`, which would otherwise silently fail to extract at all on this tool's own (Windows) runtime, making the crash analyzer see nothing for the most common real-world case. Extraction now succeeds (with the sanitized name) instead of being silently dropped into `extraction_skipped.json`.
+
+### Changed - BREAKING
+- `run_analysis()` gained new optional parameters `focus_areas` and `pcap_path`; `_DigestArgs`/`build_digest()` gained `enabled_sections`. Fully backward compatible for existing callers (both default to "everything enabled", matching pre-v4.0.0 behavior) - flagged as breaking only because of the size of the new public surface area on the library API.
+- `backend/requirements.txt` gained `dpkt>=1.9.8` - the project's first runtime dependency beyond FastAPI/uvicorn/python-multipart.
+
 ## [3.1.2] - 2026-07-14
 
 ### Changed
@@ -107,6 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.0.0
 [3.1.2]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.2
 [3.1.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.1
 [3.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.0
