@@ -204,7 +204,7 @@ function initTerminal() {
 // Ollama lifecycle control - the terminal's toolbar (status badge +
 // Start/Stop/Refresh) gives direct manual control, and runSynthesis()
 // calls ensureOllamaRunning() automatically whenever Ollama is the
-// selected provider, so clicking "Generate root-cause report" starts
+// selected provider, so clicking "Generate log analysis" starts
 // Ollama on demand if it isn't already up - no separate manual step
 // needed. See backend/ai/ollama_manager.py for the server-side design
 // (never spawns a duplicate instance; only stops one it started itself).
@@ -527,9 +527,9 @@ async function loadResults(jobIdOverride) {
   if (existingReport) {
     $("aiRender").innerHTML = markdownToHtml(existingReport);
     $("btnDownloadReport").classList.remove("hidden");
-    $("btnSynthesize").textContent = "Regenerate root-cause report";
+    $("btnSynthesize").textContent = "Regenerate log analysis";
   } else {
-    $("btnSynthesize").textContent = "Generate root-cause report";
+    $("btnSynthesize").textContent = "Generate log analysis";
   }
 
   // Auto-chain: if AI settings were filled in back in Step 1, kick off
@@ -965,7 +965,7 @@ async function runSynthesis() {
       $("aiError").classList.remove("hidden");
       logTerminal(`❌ Ollama startup failed: ${err.message}`, "error");
       $("btnSynthesize").disabled = false;
-      $("btnSynthesize").textContent = "Generate root-cause report";
+      $("btnSynthesize").textContent = "Generate log analysis";
       return;
     }
   }
@@ -1018,7 +1018,7 @@ async function runSynthesis() {
     logTerminal(`❌ AI generation failed: ${err.message}`, "error");
   } finally {
     $("btnSynthesize").disabled = false;
-    $("btnSynthesize").textContent = accumulated ? "Regenerate root-cause report" : "Generate root-cause report";
+    $("btnSynthesize").textContent = accumulated ? "Regenerate log analysis" : "Generate log analysis";
   }
 }
 
