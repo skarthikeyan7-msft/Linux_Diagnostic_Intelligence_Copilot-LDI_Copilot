@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-07-14
+
+### Fixed
+- **Activity terminal Ollama Start/Stop buttons**: Start stayed enabled (looked "stuck on") even while Ollama was confirmed running, and Stop was permanently disabled whenever Ollama was reachable but not started by LDI Copilot itself (the common case when using the Ollama desktop app), making it look broken. Root cause was twofold: `renderOllamaBadge()` gated Stop's disabled state on `status.managed` (whether *this app* spawned the process) instead of whether Ollama was actually running, and `startOllama()`'s `finally` block unconditionally re-enabled Start regardless of the outcome. Both buttons now reflect actual Ollama state (running/starting → Start disabled, Stop enabled; otherwise the reverse) - Stop remains safe to click in the "not managed by this app" case, since the backend already no-ops with a clear reason instead of terminating an instance it didn't launch.
+
+### Added
+- **"🔌 Test AI connectivity" button** in the focus+AI panel (Step 1): sends a tiny fixed test message (never any bundle/job data) to the currently configured provider/credentials and reports success or failure inline plus in the activity terminal - useful for confirming an API key, endpoint, or Ollama model actually works before running a full analysis. Starts Ollama first (like Generate) when Ollama is selected. New `POST /api/test-connection` endpoint; validation logic shared with `/synthesize` via a new `_validate_provider_auth()` helper.
+- **AI-generated content disclaimer**: a persistent "⚠️ AI-generated content may be incorrect or incomplete" notice above every AI Root Cause Report, and prepended to the downloaded `.md` report so it travels with the file if shared outside the app.
+
 ## [3.0.0] - 2026-07-13
 
 ### Changed - BREAKING
@@ -88,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[3.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.0
 [3.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.0.0
 [2.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.2.0
 [2.1.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.1.1

@@ -45,7 +45,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="3.0.0")
+app = FastAPI(title="LDI Copilot", version="3.1.0")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -263,6 +263,25 @@ def get_providers():
     return PROVIDERS
 
 
+def _validate_provider_auth(payload):
+    """Shared validation for endpoints that need a fully-specified
+    provider + auth_type + credentials payload (synthesize,
+    test-connection). Raises HTTPException(400) with a clear message on
+    any problem; returns (provider, auth_type, auth_cfg) on success."""
+    provider = payload.get("provider")
+    if provider not in PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"unknown provider: {provider!r}")
+    provider_cfg = PROVIDERS[provider]
+    auth_type = payload.get("auth_type") or provider_cfg["default_auth_type"]
+    if auth_type not in provider_cfg["auth_types"]:
+        raise HTTPException(status_code=400, detail=f"unknown auth_type {auth_type!r} for provider {provider}")
+    auth_cfg = provider_cfg["auth_types"][auth_type]
+    missing = [f for f in auth_cfg["fields"] if not payload.get(f)]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"missing required field(s) for {provider} ({auth_cfg['label']}): {', '.join(missing)}")
+    return provider, auth_type, auth_cfg
+
+
 @app.post("/api/models")
 def list_available_models(payload: dict):
     """Best-effort live model-availability check backing the model
@@ -282,6 +301,45 @@ def list_available_models(payload: dict):
         return {"available": None, "error": str(e)}
     except KeyError as e:
         return {"available": None, "error": f"missing required field: {e}"}
+
+
+# A tiny, fixed, synthetic prompt - never any bundle/job data - used only
+# to confirm a provider + its credentials/model/endpoint actually work
+# end-to-end before running a full analysis. Deliberately static so this
+# endpoint carries zero privacy considerations of its own.
+_CONNECTIVITY_TEST_MESSAGES = [
+    {"role": "system", "content": "This is a connectivity test, not a real request. Reply with exactly one word: OK"},
+    {"role": "user", "content": "ping"},
+]
+
+
+@app.post("/api/test-connection")
+def test_connection(payload: dict):
+    """Lightweight connectivity/authentication check for the currently
+    configured AI provider - especially useful for cloud ("public AI
+    model") providers, where a support engineer wants to confirm their
+    API key/endpoint/deployment actually works before running a full
+    analysis. Sends the tiny static prompt above (never job/bundle
+    data) and reads back a few characters of a real response, then
+    closes the connection early rather than waiting for a full
+    completion. For paid providers this consumes a negligible number of
+    tokens - not a full synthesis worth. Always returns HTTP 200 with
+    {ok, sample, error}; never raises for a provider-side failure."""
+    provider, auth_type, _ = _validate_provider_auth(payload)
+    provider_kwargs = {k: v for k, v in payload.items() if k not in ("provider", "extra_context", "focus_text", "redact")}
+
+    gen = stream_chat(provider, _CONNECTIVITY_TEST_MESSAGES, **provider_kwargs)
+    sample = ""
+    try:
+        for chunk in gen:
+            sample += chunk
+            if len(sample) >= 40:
+                break
+        return {"ok": True, "sample": sample.strip(), "error": None}
+    except ProviderError as e:
+        return {"ok": False, "sample": None, "error": str(e)}
+    finally:
+        gen.close()
 
 
 @app.post("/api/jobs/{job_id}/synthesize")
@@ -307,17 +365,8 @@ async def synthesize(job_id: str, payload: dict):
     if job["status"] != "done":
         raise HTTPException(status_code=409, detail=f"job status is {job['status']}, not done yet")
 
-    provider = payload.get("provider")
-    if provider not in PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"unknown provider: {provider!r}")
+    provider, auth_type, _ = _validate_provider_auth(payload)
     provider_cfg = PROVIDERS[provider]
-    auth_type = payload.get("auth_type") or provider_cfg["default_auth_type"]
-    if auth_type not in provider_cfg["auth_types"]:
-        raise HTTPException(status_code=400, detail=f"unknown auth_type {auth_type!r} for provider {provider}")
-    auth_cfg = provider_cfg["auth_types"][auth_type]
-    missing = [f for f in auth_cfg["fields"] if not payload.get(f)]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"missing required field(s) for {provider} ({auth_cfg['label']}): {', '.join(missing)}")
 
     focus_text = payload.get("focus_text")
     if focus_text is None:

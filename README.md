@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-3.0.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-3.1.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -57,7 +57,7 @@ The top of the page has three always-clickable tabs — **1. Provide Bundle**, *
 2. **Say what you're investigating** — in the "🎯 What are you investigating?" box, describe the specific issue, e.g. *"find root cause of NC and IP cluster resource restart issue"*. This steers both the mechanical scan (a dedicated Focused Findings section, keyword-tagged results) and the AI report (which answers that question directly and demotes unrelated findings to a short closing section). Leave it blank for a generic full-bundle analysis.
 3. **Configure your AI model** — right below, in the same panel: pick a provider, then (for Azure OpenAI) pick an **authentication type** — API Key or Microsoft Entra ID — and fill in the fields for that choice. Optionally check "Remember these settings on this device". Filling this in now means a full AI-reasoned report generates **automatically** as soon as the scan finishes — no extra click. This panel lives permanently on tab 1; use the "✏️ Edit focus & AI settings" shortcut on the Results tab to jump straight back to it.
 4. **(Optional) scope the analysis** — expand "Advanced options" to restrict the scan to a specific date/time range or a time ± window, instead of the whole archive. Useful when you already know roughly when an incident happened.
-5. **Run analysis** — the view auto-advances to tab 2 to show live progress, then to tab 3 once done. Results open on the **AI Root Cause Report** tab by default, streaming in automatically if you configured a model in step 3 (or click "Generate root-cause report" there if you didn't). Other tabs: the full evidence **Digest**, a filterable **Findings** list (with a "show only findings matching my focus 🎯" toggle), and a cross-file **Timeline**.
+5. **Run analysis** — the view auto-advances to tab 2 to show live progress, then to tab 3 once done. Results open on the **AI Root Cause Report** tab by default, streaming in automatically if you configured a model in step 3 (or click "Generate root-cause report" there if you didn't). A disclaimer is always shown above the report — ⚠️ AI-generated content may be incorrect or incomplete; verify against the evidence before acting. Other tabs: the full evidence **Digest**, a filterable **Findings** list (with a "show only findings matching my focus 🎯" toggle), and a cross-file **Timeline**.
 6. **Regenerate or refine** — click "✏️ Edit focus & AI settings" to jump back to tab 1, tweak the focus text or switch AI providers/auth type, then return to tab 3 and click Generate again to regenerate without re-running the mechanical scan.
 7. **Download** the combined AI report + evidence digest as a single Markdown file.
 
@@ -69,7 +69,11 @@ The panel docked along the entire right edge of the page is a persistent, timest
 
 ### Ollama auto-start
 
-Since Ollama is the default AI provider, clicking **"Generate root-cause report"** with Ollama selected will automatically start `ollama serve` if it isn't already running — no need to remember to start it yourself first. Progress (including Ollama's own startup log lines) streams into the activity terminal while it comes up. You can also start/stop/check it manually any time via the terminal's toolbar. LDI Copilot will never spawn a duplicate instance if Ollama is already reachable (e.g. via the Ollama desktop app), and the Stop button only ever stops an instance LDI Copilot itself started — it will never terminate an Ollama process it didn't launch.
+Since Ollama is the default AI provider, clicking **"Generate root-cause report"** with Ollama selected will automatically start `ollama serve` if it isn't already running — no need to remember to start it yourself first. Progress (including Ollama's own startup log lines) streams into the activity terminal while it comes up. You can also start/stop/check it manually any time via the terminal's toolbar — the **Start** button disables itself while Ollama is running/starting, and **Stop** becomes enabled at that point (it's a no-op with a clear message in the terminal if Ollama is running but wasn't started by LDI Copilot itself — e.g. the desktop app — rather than actually terminating an instance it didn't launch).
+
+### Testing AI connectivity before a full analysis
+
+The **"🔌 Test AI connectivity"** button (right below the model picker in tab 1) sends a tiny fixed test message — never any bundle data — to the currently configured provider/credentials and reports success or failure inline, plus in the activity terminal. Useful for confirming an API key, endpoint, or Ollama model actually works before running a full analysis and waiting on a real synthesis call. For Ollama it starts the service first (same as Generate); for paid providers it consumes a negligible number of tokens, not a full report's worth.
 
 ### A note on focused analysis
 

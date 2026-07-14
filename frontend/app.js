@@ -222,7 +222,16 @@ function renderOllamaBadge(status) {
   badge.className = `ollama-status-badge status-${cls}`;
   badge.textContent = labels[cls] || labels.unknown;
   badge.title = status && status.error ? status.error : "";
-  $("btnStopOllama").disabled = !(status && status.managed);
+  // Enable/disable based on whether Ollama is actually running/starting,
+  // not on status.managed (whether THIS app happens to be the one that
+  // spawned it). Stop is safe to offer either way - the backend already
+  // no-ops with a clear reason if it isn't managed by this app (e.g. an
+  // externally-running instance) instead of actually terminating it, so
+  // disabling it outright here just hid that useful feedback and left
+  // the control looking permanently broken.
+  const isActive = cls === "running" || cls === "starting";
+  $("btnStartOllama").disabled = isActive;
+  $("btnStopOllama").disabled = !isActive;
 }
 
 function mirrorOllamaLogs(status) {
@@ -279,7 +288,10 @@ async function startOllama() {
   } catch (err) {
     logTerminal(`❌ ${err.message}`, "error");
   } finally {
-    $("btnStartOllama").disabled = false;
+    // Re-render from the real current status instead of blindly
+    // re-enabling Start - otherwise Start stays clickable even after
+    // Ollama is confirmed running, which is the bug this fixes.
+    await refreshOllamaStatus();
   }
 }
 
@@ -1010,10 +1022,68 @@ async function runSynthesis() {
   }
 }
 
+// --------------------------------------------------------------------------
+// AI connectivity test - a lightweight "does this provider/credential
+// combination actually work?" check, separate from a full synthesis run.
+// Sends only the tiny fixed test prompt defined server-side
+// (_CONNECTIVITY_TEST_MESSAGES in backend/app.py) - never any bundle
+// data - so it carries none of the confidentiality considerations a
+// real synthesis call does, and doesn't require the external-send
+// confirmation checkbox.
+// --------------------------------------------------------------------------
+async function testConnectivity() {
+  const { payload, missing } = collectAiPayload();
+  const statusEl = $("connectivityStatus");
+  const btn = $("btnTestConnectivity");
+
+  if (missing.length) {
+    statusEl.textContent = `⚠ Fill in: ${missing.join(", ")}`;
+    return;
+  }
+
+  const providerLabel = (state.providers[payload.provider] || {}).label || payload.provider;
+  btn.disabled = true;
+  statusEl.textContent = "Testing…";
+  logTerminal(`🔌 Testing connectivity to ${providerLabel}…`, "info");
+
+  if (payload.provider === "ollama") {
+    try {
+      await ensureOllamaRunning();
+    } catch (err) {
+      statusEl.textContent = `❌ ${err.message}`;
+      logTerminal(`❌ Ollama startup failed: ${err.message}`, "error");
+      btn.disabled = false;
+      return;
+    }
+  }
+
+  try {
+    const resp = await fetch("/api/test-connection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await resp.json();
+    if (result.ok) {
+      statusEl.textContent = `✅ Connected (replied: "${result.sample}")`;
+      logTerminal(`✅ ${providerLabel} connectivity OK (replied: "${result.sample}")`, "success");
+    } else {
+      statusEl.textContent = `❌ ${result.error || "Connection failed"}`;
+      logTerminal(`❌ ${providerLabel} connectivity failed: ${result.error || "unknown error"}`, "error");
+    }
+  } catch (err) {
+    statusEl.textContent = `❌ ${err.message}`;
+    logTerminal(`❌ Connectivity test request failed: ${err.message}`, "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function downloadReport() {
   const digest = state.jobResult ? state.jobResult.digest : "";
   const aiText = $("aiRender").innerText || "";
-  const content = `# AI Root Cause Report\n\n${aiText}\n\n---\n\n# Full Evidence Digest\n\n${digest}`;
+  const disclaimer = "> ⚠️ **AI-generated content may be incorrect or incomplete.** Always verify findings against the evidence digest and your own judgment before acting on this report.";
+  const content = `# AI Root Cause Report\n\n${disclaimer}\n\n${aiText}\n\n---\n\n# Full Evidence Digest\n\n${digest}`;
   const blob = new Blob([content], { type: "text/markdown" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -1081,6 +1151,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btnAnalyze").addEventListener("click", startAnalysis);
   $("btnNewAnalysis").addEventListener("click", resetToUpload);
   $("btnSynthesize").addEventListener("click", runSynthesis);
+  $("btnTestConnectivity").addEventListener("click", testConnectivity);
   $("btnDownloadReport").addEventListener("click", downloadReport);
   $("btnEditFocusAi").addEventListener("click", () => activateMainTab("upload"));
   $("btnRecent").addEventListener("click", () => { $("recentPanel").classList.toggle("hidden"); loadRecentJobs(); });

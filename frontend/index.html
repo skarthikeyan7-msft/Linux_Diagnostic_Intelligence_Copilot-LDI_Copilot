@@ -78,6 +78,11 @@
           <select id="aiAuthType"></select>
         </div>
         <div id="aiFields" class="options-grid"></div>
+        <div class="model-check-row">
+          <button type="button" id="btnTestConnectivity" class="btn btn-ghost btn-sm">🔌 Test AI connectivity</button>
+          <span id="connectivityStatus" class="muted small"></span>
+        </div>
+        <p class="muted small">Sends a tiny fixed test message (never your bundle data) to confirm the provider/credentials actually work. May incur a negligible token cost for paid providers.</p>
         <div class="field-row">
           <label for="aiExtraContext">Extra context for the model (optional)</label>
           <textarea id="aiExtraContext" rows="2" placeholder="e.g. this happened right after a maintenance window / patch deployment…"></textarea>
@@ -179,6 +184,7 @@
           <div class="ai-tab-head">
             <button id="btnEditFocusAi" class="btn btn-ghost btn-sm">✏️ Edit focus &amp; AI settings</button>
           </div>
+          <div class="ai-disclaimer">⚠️ <strong>AI-generated content may be incorrect or incomplete.</strong> Always verify findings against the Digest/Timeline evidence and your own judgment before acting on this report.</div>
           <div class="ai-actions">
             <button id="btnSynthesize" class="btn btn-primary">Generate root-cause report</button>
             <button id="btnDownloadReport" class="btn btn-ghost hidden">Download report (.md)</button>
@@ -220,7 +226,7 @@
       <div class="terminal-toolbar">
         <span id="ollamaStatusBadge" class="ollama-status-badge status-unknown">🦙 Ollama: checking…</span>
         <button id="btnStartOllama" class="btn btn-ghost btn-sm">▶ Start</button>
-        <button id="btnStopOllama" class="btn btn-ghost btn-sm">■ Stop</button>
+        <button id="btnStopOllama" class="btn btn-ghost btn-sm" title="Only stops an Ollama instance LDI Copilot itself started - an externally-running instance (e.g. the desktop app) is left untouched.">■ Stop</button>
         <button id="btnRefreshOllama" class="btn btn-ghost btn-sm" title="Re-check status">⟳</button>
       </div>
     </div>
