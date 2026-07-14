@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.1] - 2026-07-14
+
+### Fixed
+- **OpenAI/Azure OpenAI "reasoning" model support**: `stream_openai()` and `stream_azure_openai()` hardcoded `temperature: 0.2` on every request, which OpenAI's reasoning model family (o1, o3, o3-mini, o4-mini, ...) - and Azure OpenAI deployments of them - reject outright with `HTTP 400: Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported.` Since Azure deployment names are user-defined, there's no reliable way to detect a reasoning-model deployment by name ahead of time. Fixed by reacting to the actual API error instead: both functions now retry once without `temperature` whenever this specific error occurs, letting the API fall back to its own default (1). Safe to retry cleanly - the API rejects invalid parameters before streaming any content, so the retry never duplicates output. Verified via a mocked-HTTP unit test asserting exactly two calls (temperature included, then removed) and a successful result from the retry.
+
 ## [3.1.0] - 2026-07-14
 
 ### Fixed
@@ -97,6 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[3.1.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.1
 [3.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.0
 [3.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.0.0
 [2.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v2.2.0

@@ -40,6 +40,21 @@ class ProviderError(Exception):
     pass
 
 
+def _is_unsupported_temperature_error(message):
+    """True if a provider's error message indicates the model rejected
+    a non-default temperature value. OpenAI's "reasoning" model family
+    (o1, o3, o3-mini, o4-mini, ...) and their Azure OpenAI deployment
+    equivalents only accept the default temperature (1) and reject any
+    other value with an HTTP 400 - e.g. "Unsupported value:
+    'temperature' does not support 0.2 with this model. Only the
+    default (1) value is supported." Since Azure deployment names are
+    user-defined, there's no reliable way to detect a reasoning model
+    by name alone - reacting to the actual API error is more robust
+    than trying to maintain a hardcoded list of model-name patterns."""
+    msg = (message or "").lower()
+    return "temperature" in msg and ("does not support" in msg or "unsupported value" in msg)
+
+
 def _post_stream(url, headers, body, extract_fn, timeout=180):
     """POST body (dict) to url and stream the line-delimited / SSE
     response. extract_fn(parsed_json_obj) -> str|None text delta to
@@ -117,7 +132,6 @@ def get_entra_id_token(tenant_id, client_id, client_secret, scope="https://cogni
 def stream_openai(api_key, model, messages, base_url="https://api.openai.com/v1"):
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {"model": model, "messages": messages, "stream": True, "temperature": 0.2}
 
     def extract(obj):
         choices = obj.get("choices") or []
@@ -125,7 +139,19 @@ def stream_openai(api_key, model, messages, base_url="https://api.openai.com/v1"
             return None
         return choices[0].get("delta", {}).get("content")
 
-    yield from _post_stream(url, headers, body, extract)
+    body = {"model": model, "messages": messages, "stream": True, "temperature": 0.2}
+    try:
+        yield from _post_stream(url, headers, body, extract)
+    except ProviderError as e:
+        if not _is_unsupported_temperature_error(str(e)):
+            raise
+        # "Reasoning" models (o1/o3/o3-mini/o4-mini/...) reject any
+        # temperature other than the default (1) - retry once without
+        # it. Safe to retry cleanly here: the API rejects invalid
+        # parameters with an HTTP error before streaming any content,
+        # so nothing has been yielded yet on this first attempt.
+        body.pop("temperature", None)
+        yield from _post_stream(url, headers, body, extract)
 
 
 def stream_azure_openai(endpoint, deployment, messages, api_version="2024-06-01", api_key=None, entra_token=None):
@@ -141,7 +167,6 @@ def stream_azure_openai(endpoint, deployment, messages, api_version="2024-06-01"
         headers = {"api-key": api_key, "Content-Type": "application/json"}
     else:
         raise ProviderError("Azure OpenAI call requires either an api_key or an entra_token")
-    body = {"messages": messages, "stream": True, "temperature": 0.2}
 
     def extract(obj):
         choices = obj.get("choices") or []
@@ -149,7 +174,17 @@ def stream_azure_openai(endpoint, deployment, messages, api_version="2024-06-01"
             return None
         return choices[0].get("delta", {}).get("content")
 
-    yield from _post_stream(url, headers, body, extract)
+    body = {"messages": messages, "stream": True, "temperature": 0.2}
+    try:
+        yield from _post_stream(url, headers, body, extract)
+    except ProviderError as e:
+        if not _is_unsupported_temperature_error(str(e)):
+            raise
+        # Same reasoning-model retry as stream_openai() above - Azure
+        # deployment names are user-defined, so there's no reliable way
+        # to detect a reasoning-model deployment by name up front.
+        body.pop("temperature", None)
+        yield from _post_stream(url, headers, body, extract)
 
 
 def stream_anthropic(api_key, model, messages, max_tokens=4096):
