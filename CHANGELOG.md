@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.3] - 2026-07-15
+
+### Added
+- **README troubleshooting note for cloud VM users** (Azure/AWS/GCP): documents why passing a cloud VM's *public* IP to `--host`/`-HostAddress` always fails with `[Errno 99] Cannot assign requested address` (cloud public IPs are NAT'd at the platform level and are never actually configured on the VM's own network interface, so the OS can't bind to them) - reported from a real Azure RHEL 8 VM. Recommends binding to `0.0.0.0` (or, more safely, using an SSH tunnel and keeping the default localhost-only bind - `ssh -L 8756:127.0.0.1:8756 user@vm-ip`) instead, plus a reminder to scope any cloud firewall rule to a specific source IP rather than the whole internet, and to review [SECURITY.md](SECURITY.md) before exposing this beyond localhost with real customer bundle data.
+
 ## [4.2.2] - 2026-07-15
 
 ### Fixed
@@ -164,6 +169,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.2.3]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.3
 [4.2.2]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.2
 [4.2.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.1
 [4.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.0

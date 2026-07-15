@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.2.2-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.2.3-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -56,6 +56,8 @@ Options (same three flags on every launcher, just spelled per that shell's own c
 ./run.sh --no-browser
 ./run.sh --host 0.0.0.0
 ```
+
+> **Cloud VM users (Azure/AWS/GCP):** never pass your VM's *public* IP to `--host`/`-HostAddress`. Cloud public IPs are NAT'd at the platform level and are never actually configured on the VM's own network interface, so the OS refuses to bind to it (`[Errno 99] Cannot assign requested address`). Bind to `0.0.0.0` (or leave the default `127.0.0.1`) instead - the public IP is only ever used from *outside* the VM to reach whatever's bound there. **Safer option:** don't expose the port at all - `ssh -L 8756:127.0.0.1:8756 user@your-vm-ip` and browse to `http://127.0.0.1:8756` on your own machine, keeping the default localhost-only bind and zero new attack surface. If you do need `--host 0.0.0.0`, also open the port in your cloud provider's firewall (Azure NSG / AWS security group / GCP firewall rule) scoped to your own IP specifically, not `0.0.0.0/0` - see [SECURITY.md](SECURITY.md) before exposing this beyond localhost, especially with real customer bundle data.
 
 ### Manual setup (alternative to the run scripts)
 
