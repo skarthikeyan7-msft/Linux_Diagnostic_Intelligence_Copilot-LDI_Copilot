@@ -5,6 +5,11 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.1] - 2026-07-15
+
+### Fixed
+- **"2. Analyzing" tab lost its content after moving to Results**: navigating to "3. Results" once a scan finished, then clicking back to "2. Analyzing", showed the "No analysis is currently running" placeholder instead of the just-completed scan's progress log - even though that log's content was still sitting in the DOM. Root cause: the placeholder-vs-content toggle was driven by `state.analyzing` (true only while a scan is actively in flight right now), which flips to `false` the moment results load. Fixed with a new, separately-tracked `state.hasProgressContent` flag that stays `true` from the moment a scan starts until a genuinely *new* one begins (`startAnalysis()`) - so the completed run's log now stays visible when navigating back to "2. Analyzing" at any point, exactly as long as the user hasn't started another analysis yet. Also fixed the same gap for jobs opened via "Recent analyses" (which never went through the live-polling code path that used to populate this log at all) - `loadResults()` now always renders the loaded job's progress history.
+
 ## [4.2.0] - 2026-07-15
 
 ### Fixed
@@ -148,6 +153,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.2.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.1
 [4.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.0
 [4.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.1.0
 [4.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.0.0

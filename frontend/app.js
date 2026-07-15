@@ -12,7 +12,8 @@ const state = {
   providers: {},
   savedAiSettings: null,
   autoSynthesizeNext: false, // set true right before submitting a fresh analysis; consumed (and reset) the next time results load
-  analyzing: false,  // true while a job is in flight; drives the Analyzing tab's placeholder vs. progress log
+  analyzing: false,  // true only while a job is actively in flight (right now) - not used for the Analyzing tab's own visibility, see hasProgressContent
+  hasProgressContent: false, // true once there is a progress log worth showing (set on starting OR loading any job); stays true across navigating away to Results and back - only a fresh "Run analysis"/"Start a new analysis" clears it, so the completed run's log remains visible until a genuinely new analysis begins
   activeMainTab: "upload",
   terminalProgressCount: 0, // number of progress lines already mirrored into the activity terminal for the current job
   ollamaLogCount: 0,        // same idea, for Ollama's own subprocess log lines
@@ -160,8 +161,8 @@ function activateMainTab(tabName) {
 }
 
 function updatePlaceholders() {
-  $("progressPlaceholder").classList.toggle("hidden", state.analyzing);
-  $("progressContent").classList.toggle("hidden", !state.analyzing);
+  $("progressPlaceholder").classList.toggle("hidden", state.hasProgressContent);
+  $("progressContent").classList.toggle("hidden", !state.hasProgressContent);
   $("resultsPlaceholder").classList.toggle("hidden", !!state.jobResult);
   $("resultsContent").classList.toggle("hidden", !state.jobResult);
 }
@@ -432,6 +433,7 @@ async function startAnalysis() {
   state.autoSynthesizeNext = true;
 
   state.analyzing = true;
+  state.hasProgressContent = true;
   state.terminalProgressCount = 0;
   activateMainTab("progress");
   $("progressError").classList.add("hidden");
@@ -523,6 +525,15 @@ async function loadResults(jobIdOverride) {
   }
 
   state.analyzing = false;
+  // The Analyzing tab's progress log stays populated with this job's
+  // history from here on - navigating away to Results (below) and back
+  // to "2. Analyzing" must keep showing it, not revert to the "no
+  // analysis running" placeholder, until a genuinely new analysis starts
+  // (startAnalysis()) or the user explicitly resets (resetToUpload()).
+  // Also covers picking a job from "Recent analyses", which never goes
+  // through the live polling loop that would otherwise populate this.
+  state.hasProgressContent = true;
+  renderProgressLog(job.progress || []);
   activateMainTab("results");
   activateTab("ai"); // always land on the AI report for fresh results
 
