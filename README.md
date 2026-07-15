@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.0.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.1.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -26,27 +26,51 @@ The CLI (`sosreport-rca`) is great for scripting/automation. This project wraps 
 
 ## Quick start
 
-Requirements: Python 3.10+ on Windows (uses only the standard library for the engine; FastAPI/uvicorn for the server).
+Requirements: Python 3.10+ (uses only the standard library plus `dpkt` for the engine; FastAPI/uvicorn for the server). Runs on **Windows, Linux, and macOS** — pick the launcher matching whatever shell you're already in; all three do exactly the same thing (create/reuse a local `.venv`, install dependencies, start the server, open your browser):
 
-```powershell
-.\run.ps1
-```
+| Shell | Command |
+|---|---|
+| **PowerShell** (Windows PowerShell 5.1, or `pwsh` 7+ on Windows/Linux/macOS) | `.\run.ps1` |
+| **Command Prompt (cmd.exe)** | `.\run.bat` |
+| **bash** (Linux, macOS, WSL, Git Bash) | `./run.sh` (first: `chmod +x run.sh`) |
 
-This creates a local `.venv`, installs dependencies, starts the server, and opens `http://127.0.0.1:8756` in your browser. Stop it with `Ctrl+C`.
+Stop any of them with `Ctrl+C`.
 
-Options:
+> **Command Prompt users:** always type `.\run.bat` (or `call run.bat`), not a bare `run.bat`. Many Windows machines — including Microsoft-managed corporate devices — have the `NoDefaultCurrentDirectoryInExePath` security policy enabled, which blocks cmd.exe from finding a bare `run.bat` in the current folder at all (`'run.bat' is not recognized...`) even when you're sitting right in this directory. The explicit `.\` prefix sidesteps that policy entirely and always works.
+
+Options (same three flags on every launcher, just spelled per that shell's own convention):
 ```powershell
 .\run.ps1 -Port 9000            # use a different port
 .\run.ps1 -NoBrowser             # don't auto-open a browser tab
 .\run.ps1 -HostAddress 0.0.0.0   # allow LAN access (not recommended - see Privacy below)
 ```
+```bat
+.\run.bat --port 9000
+.\run.bat --no-browser
+.\run.bat --host 0.0.0.0
+```
+```bash
+./run.sh --port 9000
+./run.sh --no-browser
+./run.sh --host 0.0.0.0
+```
 
-### Manual setup (alternative to run.ps1)
+### Manual setup (alternative to the run scripts)
+
+Windows (PowerShell or cmd):
 ```powershell
 cd backend
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python app.py
+```
+
+Linux / macOS / WSL (bash):
+```bash
+cd backend
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py
 ```
 
 ## Using it
@@ -85,7 +109,7 @@ The mechanical engine's keyword matching is intentionally simple (it just tags f
 Every bundle is **automatically** analyzed across all of the below — there's no "pick an analysis type" step, because SAR/crash/security/etc. data (when present) lives inside the *same* sosreport/supportconfig/crm_report bundle as everything else; each is just a dedicated parser that only adds a digest section when it actually finds something relevant:
 
 - **📊 Performance (SAR)** — parses sysstat's pre-rendered `sar` text tables (CPU/memory/disk I/O/network/load) into both a condensed text summary *and* dependency-free `<canvas>` line charts on a new **Performance** sub-tab (Results → Performance). Every timestamp is explicitly labeled with the analyzed **VM's own detected timezone** (from `/etc/timezone`, the captured `date` output, or `/etc/localtime`) so you never confuse "the time I'm reading this in" with "the time it happened on the customer's box" — a common source of confusion when the analyst and the customer are in different timezones.
-- **💥 Crash / Coredump analysis** — correlates ABRT crash reports (`var/spool/abrt/ccpp-*`, already-human-readable backtraces ABRT captured at crash time), kdump/kexec configuration, and vmcore presence/size. Deliberately scoped to what's realistically available in a bundle — full raw-core-file-plus-gdb symbolication needs matching debug symbols and a Linux gdb environment, which isn't something this Windows-hosted tool can do.
+- **💥 Crash / Coredump analysis** — correlates ABRT crash reports (`var/spool/abrt/ccpp-*`, already-human-readable backtraces ABRT captured at crash time), kdump/kexec configuration, and vmcore presence/size. Deliberately scoped to what's realistically available in a bundle — full raw-core-file-plus-gdb symbolication needs matching debug symbols and would mean shelling out to `gdb`, which this analysis engine deliberately never does (keeps the tool dependency-free and portable across Windows/Linux/macOS).
 - **🥾 Boot performance** — `systemd-analyze`'s own startup breakdown, slowest-unit ("blame") ranking, and critical-chain tree, when captured.
 - **🛡️ Security (SELinux/AppArmor)** — enforcing/permissive status, AppArmor profile counts, and a *structured* denial breakdown (by SELinux scontext/tcontext/tclass, or AppArmor profile/operation) — more actionable than a flat list of near-identical raw log lines.
 - **📦 Recent package changes** — installed-package timestamps (and yum/dnf transaction history, where available) surfaced with a dedicated "changed in the 7 days before capture" view — a very common real "what changed right before this broke" question.
@@ -142,13 +166,15 @@ Summary:
 - The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0`, which isn't recommended given what these bundles contain.
 - Uploaded archives and their extracted contents/analysis output are kept under `backend/data/jobs/<job_id>/` for the lifetime of the server process. Delete a job's data any time via the API (`DELETE /api/jobs/{id}`) or just delete the folder; nothing is auto-uploaded anywhere.
 - The AI synthesis step sends the **evidence digest** (system/cluster names, log excerpts, IPs, timestamps, etc. — not the raw uploaded archive) to whichever provider you pick, with known hostnames/IPs redacted by default for non-local providers. Use **Ollama** (the default) if the bundle must never leave the machine.
-- The frontend has zero external/CDN dependencies (including its own small Markdown renderer, and the Microsoft logo mark which is drawn as an inline SVG) so the UI itself works with no internet access — only the AI synthesis step (for non-Ollama providers) and the optional "Check available models" call need connectivity.
+- The frontend has zero external/CDN dependencies (including its own small Markdown renderer) so the UI itself works with no internet access — only the AI synthesis step (for non-Ollama providers) and the optional "Check available models" call need connectivity.
 
 ## Architecture
 
 ```
 ldi-copilot/
-├── run.ps1                    # one-command launcher (venv + deps + server)
+├── run.ps1                    # one-command launcher (PowerShell / pwsh - Windows, Linux, macOS)
+├── run.bat                    # one-command launcher (Windows Command Prompt)
+├── run.sh                     # one-command launcher (bash - Linux, macOS, WSL, Git Bash)
 ├── CHANGELOG.md
 ├── SECURITY.md                 # data-handling / confidentiality guidance - read before team rollout
 ├── backend/
@@ -181,8 +207,7 @@ ldi-copilot/
 │   │                          # focus+AI config panel permanently inlined in tab 1, optional
 │   │                          # pcap upload slot + analysis focus-area toggles, full-height
 │   │                          # right-edge activity terminal with Ollama toolbar, Performance
-│   │                          # sub-tab, interactive chat thread, bottom-right Microsoft
-│   │                          # logo+text watermark
+│   │                          # sub-tab, interactive chat thread
 │   ├── app.js                 # upload, polling, rendering, SSE streaming, tiny MD renderer,
 │   │                          # top-level tab switching, auth-type-aware AI config, model
 │   │                          # dropdown + availability checks, activity-terminal logging,
@@ -221,7 +246,7 @@ Detects the crmsh `crm report` layout (`analysis.txt`, `cib.xml`, `members.txt`,
 - The redaction feature is a best-effort mitigation, not a guarantee — it only catches known hostnames (from this analysis's own facts) and IPv4 addresses. It does not find customer/company names in free text, usernames, IPv6 addresses, or other identifiers. See [SECURITY.md](SECURITY.md) for the full picture.
 - Single-user, single-machine tool: job state is in-memory and does not survive a server restart (uploaded files/analysis output on disk do persist under `backend/data/jobs/` until deleted). Not designed to be deployed as a shared, centrally-reachable server for a team — see [SECURITY.md](SECURITY.md) for the recommended one-instance-per-engineer model.
 - No authentication on the local server itself — appropriate for local personal use; do not expose this server beyond localhost.
-- **SAR analysis** parses the pre-rendered text tables sysstat's own `sar` command already wrote into the bundle (`sos_commands/sar/*`, or the equivalent supportconfig/crm_report capture) — it does **not** decode the raw binary `/var/log/sa/saDD` files, which would require the `sar`/`sadf` binary (not available in this Windows-hosted tool). If sysstat wasn't installed on the customer's box, or the sar plugin wasn't included in the capture, there's simply no SAR data to show — the Performance tab will say so rather than erroring.
+- **SAR analysis** parses the pre-rendered text tables sysstat's own `sar` command already wrote into the bundle (`sos_commands/sar/*`, or the equivalent supportconfig/crm_report capture) — it does **not** decode the raw binary `/var/log/sa/saDD` files, which would require shelling out to the `sar`/`sadf` binary - a dependency this tool deliberately avoids so it stays portable across Windows/Linux/macOS without needing sysstat installed on the analysis machine itself. If sysstat wasn't installed on the customer's box, or the sar plugin wasn't included in the capture, there's simply no SAR data to show — the Performance tab will say so rather than erroring.
 - **Crash/coredump analysis** is scoped to already-textual artifacts a bundle realistically contains (ABRT reports, kdump config, vmcore file presence/size) — it does **not** symbolize a raw core file with `gdb` (that needs matching debug symbols and a Linux environment, and sosreport/supportconfig don't normally include the actual core file anyway, since it's typically huge).
 - **VM timezone detection** is best-effort (checks `/etc/timezone`, the captured `date` output, then `/etc/localtime`) and returns "unknown" rather than guessing when none of these signals are present — never silently assumes UTC.
 - **Packet capture (pcap) analysis** requires you to separately obtain and attach a capture — sosreport/supportconfig/crm_report essentially never embed one themselves (too large, too privacy-sensitive for a general-purpose collector to grab automatically). It's metadata-only by design; see [SECURITY.md](SECURITY.md) for why.

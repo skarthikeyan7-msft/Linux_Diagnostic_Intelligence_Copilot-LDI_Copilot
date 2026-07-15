@@ -7,10 +7,10 @@ LDI Copilot is built to analyze real customer Linux VM diagnostics (sosreport, s
 ## Recommended deployment model: one instance per engineer
 
 **LDI Copilot is a single-user, localhost-only tool by design** — not a shared, centrally-hosted service:
-- The server binds to `127.0.0.1` by default; nothing on your network can reach it unless you explicitly pass `--host 0.0.0.0` (or `.\run.ps1 -HostAddress 0.0.0.0`), which is **strongly discouraged** for exactly this reason.
+- The server binds to `127.0.0.1` by default; nothing on your network can reach it unless you explicitly pass `--host 0.0.0.0` (or `.\run.ps1 -HostAddress 0.0.0.0` / `.\run.bat --host 0.0.0.0` / `./run.sh --host 0.0.0.0`), which is **strongly discouraged** for exactly this reason.
 - Job state (uploaded bundles, extracted files, analysis output) lives in-memory and under `backend/data/jobs/<id>/` **on the machine running the server** — there is no shared database, no multi-tenant job store, and no user accounts.
 
-**The recommended way to roll this out to your entire CSS team is for each engineer to clone the repo and run their own local instance on their own machine** (`.\run.ps1`), the same way they'd run a local dev tool. This means:
+**The recommended way to roll this out to your entire CSS team is for each engineer to clone the repo and run their own local instance on their own machine** (`.\run.ps1` / `.\run.bat` / `./run.sh`, whichever matches their shell — the tool runs on Windows, Linux, and macOS), the same way they'd run a local dev tool. This means:
 - No single point of failure or single repository of customer bundles across the team.
 - No new network-accessible attack surface — each instance is exactly as exposed as the engineer's own laptop already is.
 - No additional authentication/authorization system needs to be built or trusted, because there isn't a shared service to authenticate against.
@@ -77,7 +77,7 @@ This ordering reflects data-locality and organizational-governance properties on
 
 The GitHub repository itself is private. To share it with your CSS team:
 - Add teammates as collaborators (or, for larger rollouts, transfer/mirror it into a team-owned GitHub organization with its own access controls) via the repository's **Settings → Collaborators and teams**.
-- Each teammate then clones the repo and runs their **own** local instance (`.\run.ps1`) — see "Recommended deployment model" above. Nothing about cloning the repo shares any customer data; customer bundles and analysis output are never committed to the repository (`backend/data/` is gitignored) and should stay that way.
+- Each teammate then clones the repo and runs their **own** local instance (`.\run.ps1` / `.\run.bat` / `./run.sh`) — see "Recommended deployment model" above. Nothing about cloning the repo shares any customer data; customer bundles and analysis output are never committed to the repository (`backend/data/` is gitignored) and should stay that way.
 
 ## What this tool does **not** provide
 

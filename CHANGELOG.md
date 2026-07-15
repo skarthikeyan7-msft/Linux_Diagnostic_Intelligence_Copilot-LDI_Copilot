@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-07-15
+
+### Added
+- **Cross-platform launchers**: new `run.sh` (bash - Linux/macOS/WSL/Git Bash) and `run.bat` (Windows Command Prompt) mirror `run.ps1`'s behavior (create/reuse `.venv`, install dependencies, start the server, open the browser). `run.ps1` itself is now also portable to `pwsh` (PowerShell 7+) on Linux/macOS, auto-detecting the correct venv layout (`Scripts\python.exe` vs `bin/python`) via the `$IsWindows` automatic variable. All three accept equivalent `--host`/`--port`/`--no-browser` (or PowerShell-cased) flags. Verified working end-to-end via Git Bash (`run.sh`) and Command Prompt (`run.bat`).
+- **README documentation** for a real, easy-to-hit gotcha discovered while testing `run.bat`: many Windows machines (including Microsoft-managed corporate devices) have the `NoDefaultCurrentDirectoryInExePath` security policy enabled, which makes cmd.exe unable to find a *bare* `run.bat` typed in the current folder (even at a real interactive prompt) - always use `.\run.bat` (or `call run.bat`) instead, which works unconditionally.
+
+### Changed
+- Confirmed (via a fresh audit) that the Python backend itself was already fully cross-platform - the only platform-specific code paths (`ollama_manager.py`'s Windows-only `subprocess.CREATE_NO_WINDOW` flag, and `analyzer_core.py`'s Windows-path-sanitizing archive extraction fix from v4.0.0) were already correctly guarded behind `sys.platform`/`os.name` checks and are no-ops on Linux/macOS.
+
+### Removed
+- **Microsoft logo watermark** removed from the bottom-right corner of the UI (`frontend/index.html`'s `.ms-logo-corner` block and its CSS in `frontend/styles.css`) - this is an independent personal tool, not an official Microsoft product, and shouldn't visually imply otherwise. Can be added back locally if desired; not part of the shipped UI going forward.
+
 ## [4.0.0] - 2026-07-15
 
 ### Added - BREAKING (major version: new analyzer suite + interactive chat)
@@ -127,6 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.1.0
 [4.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.0.0
 [3.1.2]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.2
 [3.1.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.1

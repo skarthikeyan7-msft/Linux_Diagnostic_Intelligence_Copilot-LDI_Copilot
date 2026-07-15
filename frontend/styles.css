@@ -139,31 +139,6 @@ body {
 .term-warn { color: var(--warning); }
 .term-error { color: var(--critical); }
 
-/* Microsoft logo watermark, bottom-right corner of the viewport. */
-.ms-logo-corner {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  z-index: 20;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 6px 10px 6px 6px;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  pointer-events: none;
-}
-.ms-logo { flex-shrink: 0; border-radius: 2px; }
-.ms-logo-text {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  font-family: "Segoe UI", -apple-system, Roboto, Helvetica, Arial, sans-serif;
-  letter-spacing: .01em;
-}
-
 @media (max-width: 1300px) {
   .layout { flex-direction: column; }
   .terminal-panel {
