@@ -43,15 +43,94 @@ exit /b 0
 set "ROOT=%~dp0"
 set "VENVDIR=%ROOT%.venv"
 set "VENVPY=%VENVDIR%\Scripts\python.exe"
+set "VERCHECK=import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 1)"
+set "VERSTR=import sys; print('.'.join(map(str, sys.version_info[:3])))"
 
-if not exist "%VENVPY%" (
-    echo Creating virtual environment ^(.venv^)...
-    where python >nul 2>nul
+rem Resolve a Python interpreter meeting the minimum version (3.10+).
+rem Priority: an explicit %PYTHON% override (respected even if too old -
+rem fail loudly rather than silently substitute something else); then
+rem the official "py" launcher's version-selection flags (the standard
+rem way multiple installed Python versions coexist on Windows); then
+rem bare python3/python on PATH.
+set "PYEXE="
+set "PYARG="
+
+if defined PYTHON (
+    where "%PYTHON%" >nul 2>nul
     if errorlevel 1 (
-        echo Python 3.10+ not found on PATH. Install it from https://python.org and try again.
+        echo %PYTHON% is set but that's not an executable on PATH.
         exit /b 1
     )
-    python -m venv "%VENVDIR%"
+    "%PYTHON%" -c "%VERCHECK%" >nul 2>nul
+    if errorlevel 1 (
+        for /f "delims=" %%V in ('"%PYTHON%" -c "%VERSTR%" 2^>nul') do set "FOUNDVER=%%V"
+        echo %PYTHON% ^(version !FOUNDVER!^) is older than the required Python 3.10+. Set PYTHON to a newer interpreter and try again.
+        exit /b 1
+    )
+    set "PYEXE=%PYTHON%"
+) else (
+    where py >nul 2>nul
+    if not errorlevel 1 (
+        for %%V in (-3.13 -3.12 -3.11 -3.10) do (
+            if not defined PYEXE (
+                py %%V -c "%VERCHECK%" >nul 2>nul
+                if not errorlevel 1 (
+                    set "PYEXE=py"
+                    set "PYARG=%%V"
+                )
+            )
+        )
+    )
+    if not defined PYEXE (
+        for %%C in (python3 python) do (
+            if not defined PYEXE (
+                where %%C >nul 2>nul
+                if not errorlevel 1 (
+                    %%C -c "%VERCHECK%" >nul 2>nul
+                    if not errorlevel 1 set "PYEXE=%%C"
+                )
+            )
+        )
+    )
+)
+
+if not defined PYEXE (
+    echo.
+    echo No Python 3.10+ interpreter found.
+    where python3 >nul 2>nul
+    if not errorlevel 1 (
+        for /f "delims=" %%V in ('python3 -c "%VERSTR%" 2^>nul') do echo   - found 'python3' -^> Python %%V ^(too old^)
+    )
+    where python >nul 2>nul
+    if not errorlevel 1 (
+        for /f "delims=" %%V in ('python -c "%VERSTR%" 2^>nul') do echo   - found 'python' -^> Python %%V ^(too old^)
+    )
+    echo.
+    echo Install a newer Python from https://www.python.org/downloads/ - the installer
+    echo registers itself with the "py" launcher, which this script prefers ^(or, if you
+    echo already have multiple versions installed via the launcher, this script
+    echo auto-detects "py -3.10" through "py -3.13"^).
+    echo Or point at a specific interpreter explicitly:
+    echo     set PYTHON=C:\path\to\python.exe ^&^& run.bat
+    exit /b 1
+)
+for /f "delims=" %%V in ('%PYEXE% %PYARG% -c "%VERSTR%" 2^>nul') do set "PYVER=%%V"
+
+rem A venv from a previous run against a too-old Python would otherwise
+rem be silently reused as-is - self-heal by recreating it rather than
+rem making the user manually delete .venv first.
+if exist "%VENVPY%" (
+    "%VENVPY%" -c "%VERCHECK%" >nul 2>nul
+    if errorlevel 1 (
+        for /f "delims=" %%V in ('"%VENVPY%" -c "%VERSTR%" 2^>nul') do set "STALEVER=%%V"
+        echo Existing .venv was built with Python !STALEVER! ^(too old^) - recreating it with %PYEXE% %PYARG% ^(!PYVER!^)...
+        rmdir /s /q "%VENVDIR%"
+    )
+)
+
+if not exist "%VENVPY%" (
+    echo Creating virtual environment ^(.venv^) with %PYEXE% %PYARG% ^(!PYVER!^)...
+    %PYEXE% %PYARG% -m venv "%VENVDIR%"
 )
 
 echo Installing/checking dependencies...

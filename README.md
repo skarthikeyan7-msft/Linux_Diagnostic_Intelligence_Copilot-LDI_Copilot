@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.2.1-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.2.2-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -37,6 +37,8 @@ Requirements: Python 3.10+ (uses only the standard library plus `dpkt` for the e
 Stop any of them with `Ctrl+C`.
 
 > **Command Prompt users:** always type `.\run.bat` (or `call run.bat`), not a bare `run.bat`. Many Windows machines — including Microsoft-managed corporate devices — have the `NoDefaultCurrentDirectoryInExePath` security policy enabled, which blocks cmd.exe from finding a bare `run.bat` in the current folder at all (`'run.bat' is not recognized...`) even when you're sitting right in this directory. The explicit `.\` prefix sidesteps that policy entirely and always works.
+
+> **RHEL/CentOS/Alma/Rocky Linux 8 users:** the default `python3` on RHEL 8.x is Python 3.6 — years past upstream end-of-life and too old for this project (FastAPI/Pydantic need 3.8+; this codebase's own type hints need 3.10+). All three launchers detect this and fail with a clear message rather than a confusing `pip` error — `run.sh` specifically auto-detects a newer `python3.10`/`3.11`/`3.12`/`3.13` on `PATH` ahead of the too-old default, so installing one (`sudo dnf install python3.11`) and rerunning is usually all that's needed; you don't have to touch the system default `python3`.
 
 Options (same three flags on every launcher, just spelled per that shell's own convention):
 ```powershell

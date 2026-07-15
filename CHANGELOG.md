@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.2] - 2026-07-15
+
+### Fixed
+- **`run.sh` failed outright on RHEL 8.x** with a confusing pip error (`Could not find a version that satisfies the requirement fastapi>=0.110 ... from versions: ... 0.83.0`) instead of a clear diagnosis. Root cause: RHEL/CentOS/Alma/Rocky 8's default `python3` is Python 3.6 (long past upstream end-of-life), and the launcher used whatever `python3`/`python` it found on `PATH` without checking its version at all - pip's own version-resolution then silently filtered out every FastAPI release that had already dropped Python 3.6 support, surfacing as an opaque "no matching distribution" error with no indication the real problem was the interpreter, not the package.
+- All three launchers (`run.sh`, `run.ps1`, `run.bat`) now validate the resolved Python meets the minimum version (3.10+) *before* touching pip at all, and fail with a clear, actionable message (including the exact `dnf install python3.11` / `apt install python3.11` remediation) if not:
+  - `run.sh` now probes `python3.10` through `python3.13` (newest first) *ahead of* the bare `python3`/`python` names - RHEL/CentOS/Fedora commonly have a newer versioned interpreter installed *alongside* an old default, and this ensures it's preferred automatically without any configuration.
+  - `run.ps1`/`run.bat` prefer the official Windows `py` launcher's version-selection flags (`py -3.11`, etc.) for the same reason, falling back to bare `python3`/`python`.
+  - An explicit `$PYTHON`/`%PYTHON%`/`$env:PYTHON` override is still respected even if it turns out too old (fails loudly naming that specific override, rather than silently substituting something else).
+  - A pre-existing `.venv` built against a too-old Python (e.g. from a previous failed run) is now detected and automatically recreated with a valid interpreter, instead of being silently reused and hitting the same pip error again.
+- Verified via a dedicated bash test suite using fake versioned-python stubs (no valid interpreter found -> clear RHEL guidance; old + new both present -> newer one auto-selected; explicit `$PYTHON` override validation; stale-venv auto-recreation) plus live functional runs of all three launchers on this machine.
+
 ## [4.2.1] - 2026-07-15
 
 ### Fixed
@@ -153,6 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.2.2]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.2
 [4.2.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.1
 [4.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.0
 [4.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.1.0
