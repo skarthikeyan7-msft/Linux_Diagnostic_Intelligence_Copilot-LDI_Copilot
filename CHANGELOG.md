@@ -5,9 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [4.2.3] - 2026-07-15
+## [4.2.4] - 2026-07-16
 
 ### Added
+- **Proactive `--host` validation before starting the server**: `backend/app.py` now attempts a real (ephemeral-port) bind against the requested `--host` value *before* handing off to uvicorn, catching the exact failure mode reported from a real Azure RHEL 8 VM - passing a cloud VM's public IP, which is NAT'd at the platform edge and never actually assigned to the VM's own network interface. Instead of the raw, context-free `[Errno 99] Cannot assign requested address`, the server now exits immediately with a clear explanation of *why* (cloud public IPs are never locally bindable, regardless of platform) and two concrete fixes (SSH tunnel to keep the safe localhost-only default, or `--host 0.0.0.0` + a properly-scoped cloud firewall rule). Skips the check entirely (zero overhead, zero risk of false positives) for `0.0.0.0`/`127.0.0.1`/`localhost`/`::`/`::1`, so the overwhelmingly common default case is completely unaffected. Verified with a dedicated test suite (8 cases, including the exact reported Azure IP) plus live end-to-end runs confirming normal startup, `--host 0.0.0.0`, and the rejected-bad-IP path all behave correctly.
+
+
 - **README troubleshooting note for cloud VM users** (Azure/AWS/GCP): documents why passing a cloud VM's *public* IP to `--host`/`-HostAddress` always fails with `[Errno 99] Cannot assign requested address` (cloud public IPs are NAT'd at the platform level and are never actually configured on the VM's own network interface, so the OS can't bind to them) - reported from a real Azure RHEL 8 VM. Recommends binding to `0.0.0.0` (or, more safely, using an SSH tunnel and keeping the default localhost-only bind - `ssh -L 8756:127.0.0.1:8756 user@vm-ip`) instead, plus a reminder to scope any cloud firewall rule to a specific source IP rather than the whole internet, and to review [SECURITY.md](SECURITY.md) before exposing this beyond localhost with real customer bundle data.
 
 ## [4.2.2] - 2026-07-15
@@ -169,6 +172,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.2.4]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.4
 [4.2.3]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.3
 [4.2.2]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.2
 [4.2.1]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.1

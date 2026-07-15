@@ -21,6 +21,7 @@ does not listen on all interfaces unless you explicitly opt in (see
 import argparse
 import json
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -45,7 +46,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="4.2.3")
+app = FastAPI(title="LDI Copilot", version="4.2.4")
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -587,6 +588,55 @@ def health():
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 
+def _preflight_check_host(host):
+    """Proactively verifies `host` is actually bindable on THIS machine
+    before starting uvicorn at all, so a bad --host value fails with an
+    immediately actionable message instead of the raw OS error
+    ("[Errno 99] Cannot assign requested address" on Linux, similar on
+    Windows/macOS) that uvicorn would otherwise surface with no context.
+
+    By far the most common cause (reported directly from a real Azure
+    RHEL 8 VM): passing a cloud VM's PUBLIC IP to --host. Public cloud
+    IPs (Azure/AWS/GCP) are NAT'd at the platform's network edge and are
+    never actually assigned to the VM's own network interface - `ip addr
+    show` on the VM itself will never list it - so the OS can never bind
+    a listening socket to it directly, no matter what. This is expected
+    cloud networking behavior, not a bug in this tool.
+
+    Skips the check entirely for 0.0.0.0/127.0.0.1/localhost/::/::1,
+    which are always valid regardless of the machine's actual interface
+    configuration, so this never adds any overhead or false positives
+    for the overwhelmingly common (and recommended) case.
+    """
+    if host in ("0.0.0.0", "127.0.0.1", "localhost", "::", "::1"):
+        return
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))  # port 0 = OS picks an ephemeral port; only the address itself is under test
+    except OSError as e:
+        print(f"\nERROR: cannot bind to --host {host} on this machine ({e}).\n", file=sys.stderr)
+        print(
+            "This almost always means the address isn't actually configured on any\n"
+            "network interface here. The single most common cause: passing a CLOUD\n"
+            "VM's PUBLIC IP (Azure/AWS/GCP) to --host. Public cloud IPs are NAT'd at\n"
+            "the platform's edge and are never assigned to the VM's own network card,\n"
+            "so the OS can never bind to them directly - this is expected cloud\n"
+            "networking behavior, not a bug in this tool.\n\n"
+            "Fix: use --host 0.0.0.0 (binds every local interface) or the default\n"
+            "127.0.0.1 (localhost only, safest), then either:\n"
+            "  - reach it via an SSH tunnel from your own machine (no exposed port\n"
+            "    at all): ssh -L 8756:127.0.0.1:8756 user@<vm-public-ip>\n"
+            "    then browse to http://127.0.0.1:8756 locally, or\n"
+            "  - open the port in your cloud firewall (scoped to your own IP, not\n"
+            "    0.0.0.0/0) and browse to http://<vm-public-ip>:<port> from outside.\n"
+            "See README.md's Quick start section and SECURITY.md before exposing\n"
+            "this beyond localhost, especially with real customer bundle data.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main():
     import uvicorn
     ap = argparse.ArgumentParser(description="LDI Copilot local server")
@@ -594,6 +644,7 @@ def main():
     ap.add_argument("--port", type=int, default=8756, help="Port (default 8756)")
     ap.add_argument("--reload", action="store_true", help="Auto-reload on code changes (development only)")
     args = ap.parse_args()
+    _preflight_check_host(args.host)
     print(f"LDI Copilot starting at http://{args.host}:{args.port}")
     uvicorn.run("app:app", host=args.host, port=args.port, reload=args.reload)
 
