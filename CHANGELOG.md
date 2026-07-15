@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] - 2026-07-16
+
+### Added
+- **Per-user local accounts** — a stronger, per-user alternative to v4.3.0's single shared-secret gate. Provision teammates with a new CLI (`python backend/manage_users.py add/remove/list <username>`); passwords are hashed with `hashlib.scrypt` (stdlib, no new dependency) and never stored or logged in plaintext. The moment at least one account exists and `--host` is non-loopback, every request requires signing in at a new login page (`frontend/login.html`) with an individual username/password rather than one secret everyone shares - access for one person can be revoked independently of everyone else. Failed logins lock an account out for 15 minutes after 5 attempts, and a lookup for a nonexistent username takes the same time and returns the same message as a wrong password, so neither timing nor error text can be used to enumerate valid usernames.
+- **`--require-auth`**: forces whichever auth gate would apply on a non-loopback host to also apply on `127.0.0.1`, for testing the login flow locally before deploying for real.
+- The topbar now shows "👤 &lt;username&gt; · Sign out" whenever accounts mode is active (via a new `GET /api/auth/me`), with zero effect on any other auth mode.
+
+### Changed
+- **Auth mode precedence** (`backend/app.py`'s `main()`): `--no-auth` still always wins; an explicit `--auth-token` still always wins next (so a quick shared-password setup remains available even with accounts configured, e.g. for a one-off situation where provisioning individual accounts isn't worth it); otherwise, if any account exists, the new per-user gate is used; otherwise the v4.3.0 auto-generated shared-token fallback is unchanged. Existing `--auth-token`/`--no-auth` users on non-loopback hosts see **no behavior change** unless they provision an account.
+
+### Fixed
+- **Stale authenticated-looking page after signing out**: found live while verifying the login flow in a real browser - after logging out, re-navigating to `/` sometimes redisplayed a broken shell of the main app (with a burst of 401 console errors) instead of the login page, because the browser served `/`'s HTML straight from its own cache without making a network request at all, so the server's redirect-to-login check never got a chance to run. Not a data leak (every actual API call the stale shell then made still correctly 401'd), but a confusing dead end. Fixed by adding `Cache-Control: no-store` to every response the new session middleware handles, so the browser always re-checks with the server before showing any page while this gate is active.
+
 ## [4.3.0] - 2026-07-16
 
 ### Added
@@ -182,6 +195,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.4.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.4.0
 [4.3.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.3.0
 [4.2.4]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.4
 [4.2.3]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.3

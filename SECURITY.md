@@ -19,27 +19,32 @@ This remains the recommended default. If your situation genuinely calls for one 
 
 ## Running one shared instance instead (if you can't avoid it)
 
-As of v4.3.0, if you do run a single instance reachable by more than one person, two independent controls are available and are turned on **automatically** the moment `--host` is anything other than a loopback address:
+As of v4.4.0, if you do run a single instance reachable by more than one person, layered controls are available and (except accounts, which need one-time setup) turn on **automatically** the moment `--host` is anything other than a loopback address:
 
-- **A shared-secret auth gate** (`backend/auth.py`) — every request (every API route and the page itself, except `/api/health`) requires an HTTP Basic Auth credential. A random password is generated and printed once at startup unless you pass `--auth-token` yourself (to pin a stable one) or `--no-auth` (to disable the gate entirely - only if network-level access is already restricted, e.g. VPN-only). This is a single shared secret, not per-user accounts — anyone with the password has the exact same access as everyone else with it, including to every other person's uploaded bundles and generated reports on that instance.
-- **`--https`** — TLS via a self-signed certificate (auto-generated and reused under `certs/`, gitignored) or your own certificate via `--ssl-certfile`/`--ssl-keyfile`. Without this, a shared instance sends the auth password and every bundle/report over plain HTTP, readable by anyone positioned on the network path between a user and the server.
+- **Per-user accounts** (`backend/users.py`, `backend/auth.py`'s `SessionCookieMiddleware`) - **the recommended control**. Provision each teammate with `python backend/manage_users.py add <username>` (prompts for a password, hashed with `hashlib.scrypt` - a memory-hard KDF, never stored or logged in plaintext). The moment at least one account exists, everyone signs in individually at a login page instead of sharing one secret; access for one person can be revoked (`manage_users.py remove <username>`) without affecting anyone else, and failed logins lock an account out after 5 attempts within 15 minutes. This does **not** create per-user data isolation - see below.
+- **A shared-secret auth gate** (`backend/auth.py`'s `BasicAuthMiddleware`, the original v4.3.0 control) - every request requires a single shared HTTP Basic Auth credential. Used automatically as a zero-setup fallback whenever no accounts are configured yet, or explicitly via `--auth-token` (which always takes priority over accounts, for cases where individual provisioning is overkill). `--no-auth` disables every gate entirely - only if network-level access is already restricted, e.g. VPN-only.
+- **`--https`** — TLS via a self-signed certificate (auto-generated and reused under `certs/`, gitignored) or your own certificate via `--ssl-certfile`/`--ssl-keyfile`. Without this, a shared instance sends account/token credentials and every bundle/report over plain HTTP, readable by anyone positioned on the network path between a user and the server.
+- **`--require-auth`** — forces whichever gate would apply on a non-loopback host to also apply on `127.0.0.1`, for testing the login flow locally.
 
 **What this combination does and does not give you:**
 - ✅ Blocks a stranger who finds the address/port from reaching the tool or any data on it at all.
-- ✅ Encrypts traffic between each user and the server (with `--https`), so the shared password and bundle data aren't sent in the clear.
-- ❌ Does **not** give per-user isolation. Every authenticated user sees the exact same job list (`GET /api/jobs`) and can open, chat about, or delete any job on the instance — including bundles a different teammate uploaded. If your team analyzes different customers' data on the same shared instance, every team member with the password can see every customer's bundle.
-- ❌ Does **not** give audit logging, RBAC, or per-user rate limiting/quotas against a shared AI provider budget.
-- ❌ Is not a substitute for real network-layer controls. Combine it with a cloud firewall rule scoped to your team's known IP ranges/VPN CIDR (not `0.0.0.0/0`) whenever possible — the auth gate is a safety net behind that, not instead of it.
+- ✅ With accounts specifically: individual identity and revocability - you know *who* signed in (not just that *someone* did), and can cut off one person without resetting a secret everyone else also has to update.
+- ✅ Encrypts traffic between each user and the server (with `--https`), so credentials and bundle data aren't sent in the clear.
+- ❌ Does **not** give per-user *data* isolation, even with accounts. Every authenticated user - regardless of mode - sees the exact same job list (`GET /api/jobs`) and can open, chat about, or delete any job on the instance, including bundles a different teammate uploaded. If your team analyzes different customers' data on the same shared instance, every team member with access can see every customer's bundle.
+- ❌ Does **not** give audit logging (who analyzed what, when - accounts mode knows who's *logged in*, but nothing correlates that identity to specific job actions), RBAC, or per-user rate limiting/quotas against a shared AI provider budget.
+- ❌ Is not a substitute for real network-layer controls. Combine it with a cloud firewall rule scoped to your team's known IP ranges/VPN CIDR (not `0.0.0.0/0`) whenever possible - every auth gate here is a safety net behind that, not instead of it.
 
 If any of the ❌ items above are unacceptable for the customer engagements you support, go back to one-instance-per-engineer instead.
 
-Example for a globally-distributed team on one Azure VM, combining both controls with a firewall rule:
+Example for a globally-distributed team on one Azure VM, with individual accounts plus a firewall rule:
 ```bash
-./run.sh --host 0.0.0.0 --https --auth-token "your-team-shared-password"
+python backend/manage_users.py add alice
+python backend/manage_users.py add bob
+./run.sh --host 0.0.0.0 --https
 ```
-Then scope the cloud NSG/security group rule for that port to your team's IP ranges, and share the URL and password with your team over a channel you trust — never in a public ticket or chat.
+Then scope the cloud NSG/security group rule for that port to your team's IP ranges, and share the URL with your team - each person signs in with their own account, nothing else to distribute or leak.
 
-Do **not** run a shared instance with `--no-auth` unless network-level access is independently locked down (VPN-only, or a firewall rule scoped to known IPs) — without either the auth gate or a network restriction, this would be an unauthenticated multi-tenant service holding multiple customers' diagnostic data on the open internet.
+Do **not** run a shared instance with `--no-auth` unless network-level access is independently locked down (VPN-only, or a firewall rule scoped to known IPs) — without either an auth gate or a network restriction, this would be an unauthenticated multi-tenant service holding multiple customers' diagnostic data on the open internet.
 
 ## What data leaves the machine, and when
 
@@ -107,8 +112,8 @@ The GitHub repository itself is private. To share it with your CSS team:
 
 Be clear-eyed about the gaps before treating this as a complete solution for handling regulated or highly sensitive customer data:
 - No encryption at rest for uploaded bundles or analysis output on disk.
-- No audit logging of who analyzed what, when.
-- No role-based access control or per-user accounts/isolation — the optional shared-secret auth gate (v4.3.0+, see "Running one shared instance instead") blocks unauthenticated outsiders, but every authenticated user of a shared instance has identical access to every job on it, by design.
+- No audit logging of who analyzed what, when - per-user accounts (v4.4.0+) know who's *logged in*, but nothing correlates that identity to specific job actions.
+- No per-user data isolation - the optional auth gates (shared-secret or per-user accounts, see "Running one shared instance instead") block unauthenticated outsiders, but every authenticated user of a shared instance has identical access to every job on it, regardless of which auth mode is active.
 - No data-loss-prevention (DLP) scanning beyond the hostname/IP redaction described above.
 - No formal compliance certification of any kind.
 

@@ -15,6 +15,7 @@ SSL_CERTFILE=""
 SSL_KEYFILE=""
 AUTH_TOKEN=""
 NO_AUTH=0
+REQUIRE_AUTH=0
 MIN_PY_MAJOR=3
 MIN_PY_MINOR=10
 
@@ -28,8 +29,9 @@ while [[ $# -gt 0 ]]; do
     --ssl-keyfile) SSL_KEYFILE="$2"; shift 2 ;;
     --auth-token) AUTH_TOKEN="$2"; shift 2 ;;
     --no-auth) NO_AUTH=1; shift ;;
+    --require-auth) REQUIRE_AUTH=1; shift ;;
     -h|--help)
-      echo "Usage: ./run.sh [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth]"
+      echo "Usage: ./run.sh [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth] [--require-auth]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -148,6 +150,7 @@ if [[ "$HTTPS" -eq 1 ]]; then
 fi
 [[ -n "$AUTH_TOKEN" ]] && APP_ARGS+=(--auth-token "$AUTH_TOKEN")
 [[ "$NO_AUTH" -eq 1 ]] && APP_ARGS+=(--no-auth)
+[[ "$REQUIRE_AUTH" -eq 1 ]] && APP_ARGS+=(--require-auth)
 
 URL="${SCHEME}://${HOST_ADDRESS}:${PORT}"
 echo ""

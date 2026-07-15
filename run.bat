@@ -14,6 +14,7 @@ set "SSLCERTFILE="
 set "SSLKEYFILE="
 set "AUTHTOKEN="
 set "NOAUTH=0"
+set "REQUIREAUTH=0"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -62,13 +63,18 @@ if /i "%~1"=="--no-auth" (
     shift
     goto parse_args
 )
+if /i "%~1"=="--require-auth" (
+    set "REQUIREAUTH=1"
+    shift
+    goto parse_args
+)
 if /i "%~1"=="-h" goto usage
 if /i "%~1"=="--help" goto usage
 echo Unknown option: %~1
 exit /b 1
 
 :usage
-echo Usage: run.bat [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth]
+echo Usage: run.bat [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth] [--require-auth]
 exit /b 0
 
 :args_done
@@ -179,6 +185,7 @@ if "%HTTPS%"=="1" (
 )
 if defined AUTHTOKEN set "APPARGS=%APPARGS% --auth-token %AUTHTOKEN%"
 if "%NOAUTH%"=="1" set "APPARGS=%APPARGS% --no-auth"
+if "%REQUIREAUTH%"=="1" set "APPARGS=%APPARGS% --require-auth"
 echo.
 echo Starting LDI Copilot at %URL%
 echo Press Ctrl+C to stop.

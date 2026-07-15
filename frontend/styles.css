@@ -60,6 +60,16 @@ body {
   font-size: 12px;
   cursor: default;
 }
+.whoami-pill {
+  background: var(--bg-panel-2);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+.whoami-pill a { color: var(--accent); text-decoration: none; margin-left: 6px; cursor: pointer; }
+.whoami-pill a:hover { text-decoration: underline; }
 
 .main {
   flex: 1;

@@ -13,7 +13,8 @@ param(
     [string]$SslCertFile,
     [string]$SslKeyFile,
     [string]$AuthToken,
-    [switch]$NoAuth
+    [switch]$NoAuth,
+    [switch]$RequireAuth
 )
 
 $ErrorActionPreference = "Stop"
@@ -159,6 +160,7 @@ if ($Https) {
 }
 if ($AuthToken) { $appArgs += @("--auth-token", $AuthToken) }
 if ($NoAuth) { $appArgs += "--no-auth" }
+if ($RequireAuth) { $appArgs += "--require-auth" }
 
 Push-Location (Join-Path $root "backend")
 try {

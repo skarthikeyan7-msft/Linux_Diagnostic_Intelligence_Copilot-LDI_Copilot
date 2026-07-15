@@ -17,8 +17,10 @@ sosreport/supportconfig/crm_report bundles that routinely contain
 hostnames, internal IPs, and configuration data, so it deliberately
 does not listen on all interfaces unless you explicitly opt in (see
 --host in the CLI args below). When --host is pointed at a non-loopback
-address, a shared-secret auth gate (HTTP Basic Auth) turns on
-automatically - see backend/auth.py and --auth-token/--no-auth below.
+address, an auth gate turns on automatically - per-user accounts
+(recommended - see backend/users.py, backend/manage_users.py) if any are
+configured, else a single shared secret (backend/auth.py) - see
+--auth-token/--no-auth/--require-auth below.
 """
 import argparse
 import json
@@ -32,8 +34,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, Form, File, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
+from fastapi import FastAPI, Request, UploadFile, Form, File, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # allow `import engine`, `import ai` when run directly
@@ -43,13 +45,19 @@ from ai import (
     PROVIDERS, stream_chat, ProviderError, build_messages, list_models,
     collect_known_hostnames, redact_text, build_redaction_summary, ollama_manager,
 )
+from auth import SESSION_COOKIE_NAME, SessionStore
+from users import UserStore
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="4.3.0")
+app = FastAPI(title="LDI Copilot", version="4.4.0")
+
+USERS_PATH = BASE_DIR / "backend" / "data" / "users.json"
+USER_STORE = UserStore(USERS_PATH)
+SESSIONS = SessionStore()
 
 # Auth gate (backend/auth.py), wired here at module level rather than
 # inside main(). uvicorn.run("app:app", ...) resolves that string by
@@ -60,12 +68,32 @@ app = FastAPI(title="LDI Copilot", version="4.3.0")
 # app.add_middleware() there) would silently apply to a FastAPI instance
 # that's never actually served. Reading an environment variable here
 # instead works correctly for both copies, since os.environ is shared
-# process-wide rather than per-module state: main() sets this variable
-# before calling uvicorn.run(), and this line then runs again - and
-# picks it up - during uvicorn's fresh re-import.
+# process-wide rather than per-module state: main() sets these variables
+# before calling uvicorn.run(), and this code then runs again - and
+# picks them up - during uvicorn's fresh re-import.
+#
+# Exactly one of the two gates below is ever active - main() decides
+# which (or neither, for --no-auth/loopback) and sets ONE of these two
+# env vars accordingly, never both. "Accounts" (per-user, backend/users.py)
+# takes priority over "token" (single shared secret) whenever at least
+# one account is configured; see main()'s auth_mode selection for the
+# exact precedence rules and why.
 _LDI_AUTH_TOKEN_ENV = "LDI_COPILOT_AUTH_TOKEN"
+_LDI_ACCOUNTS_AUTH_ENV = "LDI_COPILOT_ACCOUNTS_AUTH"
+_LDI_COOKIE_SECURE_ENV = "LDI_COPILOT_COOKIE_SECURE"
+
+# Whether the login endpoint marks the session cookie Secure (HTTPS-only)
+# - mirrors whatever --https resolved to at startup, read the same
+# environment-variable way as the auth mode itself, for the same reason.
+COOKIE_SECURE = os.environ.get(_LDI_COOKIE_SECURE_ENV) == "1"
+
 _auth_token = os.environ.get(_LDI_AUTH_TOKEN_ENV)
-if _auth_token:
+_accounts_auth_enabled = os.environ.get(_LDI_ACCOUNTS_AUTH_ENV) == "1"
+
+if _accounts_auth_enabled:
+    from auth import SessionCookieMiddleware
+    app.add_middleware(SessionCookieMiddleware, session_store=SESSIONS)
+elif _auth_token:
     from auth import BasicAuthMiddleware
     app.add_middleware(BasicAuthMiddleware, token=_auth_token)
 
@@ -148,6 +176,54 @@ def _get_job_or_404(job_id):
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+# --------------------------------------------------------------------------
+# API: per-user account authentication ("accounts" auth mode - see
+# backend/auth.py, backend/users.py, backend/manage_users.py). These
+# routes always exist regardless of which auth mode main() actually
+# enforces for this run (harmless if unused - a session cookie that
+# nothing ever checks doesn't grant anything), which keeps the login
+# flow testable/usable even without a non-loopback --host.
+# --------------------------------------------------------------------------
+@app.post("/api/auth/login")
+async def login(payload: dict, response: Response):
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    ok, message = USER_STORE.verify(username, password)
+    if not ok:
+        raise HTTPException(status_code=401, detail=message)
+    token = SESSIONS.create(username)
+    resp = JSONResponse({"username": username})
+    resp.set_cookie(
+        SESSION_COOKIE_NAME, token, httponly=True, samesite="lax",
+        secure=COOKIE_SECURE, max_age=SESSIONS.ttl_seconds, path="/",
+    )
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        SESSIONS.destroy(token)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return resp
+
+
+@app.get("/api/auth/me")
+async def whoami(request: Request):
+    """Lets the frontend show "logged in as <username>" plus a logout
+    button when accounts mode is active - 401 (silently ignored by the
+    frontend) whenever there's no session, whether that's because the
+    user isn't logged in yet or because this instance isn't using
+    accounts mode at all (e.g. --auth-token/--no-auth/loopback)."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    username = SESSIONS.get_username(token)
+    if not username:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    return {"username": username}
 
 
 # --------------------------------------------------------------------------
@@ -693,23 +769,58 @@ def main():
     ap.add_argument("--https", action="store_true", help="Serve over HTTPS/TLS instead of plain HTTP. Without --ssl-certfile/--ssl-keyfile, auto-generates and reuses a self-signed certificate under ../certs (browsers show a one-time trust warning for it - see README.md's HTTPS section).")
     ap.add_argument("--ssl-certfile", default=None, help="Path to a PEM certificate file - supply your own trusted cert instead of the auto-generated self-signed one (use together with --ssl-keyfile)")
     ap.add_argument("--ssl-keyfile", default=None, help="Path to the PEM private key matching --ssl-certfile")
-    ap.add_argument("--auth-token", default=None, help="Shared secret required (as an HTTP Basic Auth password, any username) to reach this server. If --host is non-loopback and this is omitted, a random token is generated and printed once at startup - use --no-auth to disable this gate instead (not recommended for anything but a network already restricted to trusted users, e.g. VPN-only).")
-    ap.add_argument("--no-auth", action="store_true", help="Disable the shared-secret auth gate even when --host is non-loopback. Only safe when something else already restricts who can reach this address (VPN, firewall rule scoped to known IPs).")
+    ap.add_argument("--auth-token", default=None, help="Shared secret required (as an HTTP Basic Auth password, any username) to reach this server. Takes priority over per-user accounts if both are present - use this for quick/simple sharing without provisioning individual accounts. If --host is non-loopback and neither this nor any account (see backend/manage_users.py) exists, a random token is generated and printed once at startup. Use --no-auth to disable all auth gates instead.")
+    ap.add_argument("--no-auth", action="store_true", help="Disable all auth gates (accounts and shared-token alike) even when --host is non-loopback. Only safe when something else already restricts who can reach this address (VPN, firewall rule scoped to known IPs).")
+    ap.add_argument("--require-auth", action="store_true", help="Force whichever auth gate would apply on a non-loopback host to also apply here, even though --host is loopback. Useful for testing the login flow locally before deploying.")
     args = ap.parse_args()
     scheme = "https" if args.https else "http"
     _preflight_check_host(args.host, scheme=scheme)
 
-    is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
-    auth_token = args.auth_token
-    if args.no_auth and auth_token:
+    if args.no_auth and args.auth_token:
         print("ERROR: --auth-token and --no-auth are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
-    if not args.no_auth and not auth_token and not is_loopback:
-        from auth import generate_token
-        auth_token = generate_token()
 
-    if auth_token:
+    is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
+    enforce = args.require_auth or not is_loopback
+    n_users = USER_STORE.count()
+
+    # Precedence: --no-auth always wins (gate off). An explicit
+    # --auth-token always wins next, regardless of accounts, so a quick
+    # shared-password setup is still available even if accounts happen
+    # to be configured too. Otherwise: no enforcement needed (loopback,
+    # no --require-auth) -> gate off; enforcement needed and at least one
+    # account exists -> the stronger per-user "accounts" gate; otherwise
+    # (enforcement needed, zero accounts, no explicit token) -> the same
+    # auto-generated shared-token fallback introduced in v4.3.0.
+    if args.no_auth:
+        auth_mode, auth_token = "none", None
+    elif args.auth_token:
+        auth_mode, auth_token = "token", args.auth_token
+    elif not enforce:
+        auth_mode, auth_token = "none", None
+    elif n_users > 0:
+        auth_mode, auth_token = "accounts", None
+    else:
+        from auth import generate_token
+        auth_mode, auth_token = "token", generate_token()
+
+    if auth_mode == "accounts":
+        os.environ[_LDI_ACCOUNTS_AUTH_ENV] = "1"
+        os.environ.pop(_LDI_AUTH_TOKEN_ENV, None)
+        usernames = ", ".join(USER_STORE.list_usernames())
+        print(
+            f"Auth gate ENABLED (per-user accounts, {n_users} configured: {usernames}).\n"
+            "Each teammate signs in at the login page with their own username and\n"
+            "password - nothing to share over chat/email. Manage accounts with:\n"
+            "    python backend/manage_users.py add <username>\n"
+            "    python backend/manage_users.py remove <username>\n"
+            "    python backend/manage_users.py list\n"
+            "To fall back to a single shared password instead, pass --auth-token.\n"
+            "See SECURITY.md before exposing this beyond localhost.\n"
+        )
+    elif auth_mode == "token":
         os.environ[_LDI_AUTH_TOKEN_ENV] = auth_token
+        os.environ.pop(_LDI_ACCOUNTS_AUTH_ENV, None)
         print(
             "Auth gate ENABLED - every request needs an HTTP Basic Auth credential.\n"
             "  Username: (anything, e.g. \"ldi\")\n"
@@ -717,19 +828,25 @@ def main():
             "Share this password only with your team, over a channel you trust (not\n"
             "in a public chat/ticket). Your browser will prompt for it once and cache\n"
             "it for the session. To pin a stable password instead of a random one each\n"
-            "restart, pass --auth-token yourself. To disable this gate entirely\n"
-            "(only if something else already restricts access, e.g. VPN), pass\n"
-            "--no-auth. See SECURITY.md before exposing this beyond localhost.\n"
+            "restart, pass --auth-token yourself. For stronger, per-user access\n"
+            "instead of one shared password, provision accounts with\n"
+            "backend/manage_users.py and restart without --auth-token. To disable\n"
+            "all auth gates (only if something else already restricts access, e.g.\n"
+            "VPN), pass --no-auth. See SECURITY.md before exposing this beyond\n"
+            "localhost.\n"
         )
     else:
         os.environ.pop(_LDI_AUTH_TOKEN_ENV, None)
-        if not is_loopback:
+        os.environ.pop(_LDI_ACCOUNTS_AUTH_ENV, None)
+        if enforce:
             print(
                 "WARNING: auth gate DISABLED (--no-auth) while bound to a non-loopback\n"
                 f"address ({args.host}). Anyone who can reach this address can use this\n"
                 "tool and any customer data uploaded to it. Make sure network-level\n"
                 "access (VPN/firewall) is already locked down. See SECURITY.md.\n"
             )
+
+    os.environ[_LDI_COOKIE_SECURE_ENV] = "1" if args.https else "0"
 
     ssl_certfile, ssl_keyfile = args.ssl_certfile, args.ssl_keyfile
     if args.https and not (ssl_certfile and ssl_keyfile):

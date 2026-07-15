@@ -324,6 +324,31 @@ function initOllamaControls() {
 }
 
 // --------------------------------------------------------------------------
+// Per-user accounts ("accounts" auth mode - backend/auth.py,
+// backend/users.py) - shows "signed in as <username>" + a logout link in
+// the topbar when this instance has that mode active. A 401 from
+// /api/auth/me is expected and silently ignored whenever accounts mode
+// isn't in use (--auth-token/--no-auth/loopback), so this never shows
+// anything misleading in those cases.
+// --------------------------------------------------------------------------
+async function initWhoami() {
+  try {
+    const resp = await fetch("/api/auth/me");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const pill = $("whoamiPill");
+    pill.innerHTML = `👤 ${escapeHtml(data.username)} <a id="btnLogout">Sign out</a>`;
+    pill.classList.remove("hidden");
+    document.getElementById("btnLogout").addEventListener("click", async () => {
+      await fetch("/api/auth/logout", { method: "POST" });
+      window.location.href = "/login.html";
+    });
+  } catch {
+    // Network error or accounts mode not in use - nothing to show.
+  }
+}
+
+// --------------------------------------------------------------------------
 // Upload / dropzone
 // --------------------------------------------------------------------------
 function initDropzone() {
@@ -1508,6 +1533,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initTabs();
   initMainTabs();
   initAiProviders();
+  initWhoami();
   loadRecentJobs();
   updatePlaceholders();
 

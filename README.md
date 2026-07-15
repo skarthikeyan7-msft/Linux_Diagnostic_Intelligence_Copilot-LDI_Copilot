@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.3.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.4.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -20,7 +20,7 @@ The CLI (`sosreport-rca`) is great for scripting/automation. This project wraps 
 - **Move freely between Provide Bundle / Analyzing / Results** at any time via a persistent top tab bar, instead of being forced through a linear wizard
 - **Watch background progress from a full-height activity terminal docked along the entire right edge** — bundle selection, scan progress, AI synthesis, Ollama start/stop, downloads — without needing to be on a specific tab
 - **Reduce exposure automatically when using a public AI model** — known hostnames and IP addresses are redacted from the evidence digest before it's sent to any non-local provider, with an explicit confirmation required before any external send, and the exact redaction mapping shown right on the Results page (see [SECURITY.md](SECURITY.md))
-- **Optionally serve over HTTPS and behind a shared-secret auth gate** — if you need to reach this from more than just `localhost` (e.g. a team sharing one instance on a cloud VM), `--https` adds TLS and a non-loopback `--host` automatically requires an HTTP Basic Auth credential (see "Sharing with a team" below)
+- **Optionally serve over HTTPS and behind an auth gate** — if you need to reach this from more than just `localhost` (e.g. a team sharing one instance on a cloud VM), `--https` adds TLS and a non-loopback `--host` automatically requires signing in (per-user accounts if you provision any, else a shared password) - see "Sharing with a team" below
 - Get a live, readable dashboard (summary cards, cluster status, findings by category, chronological timeline) instead of a markdown file
 - Analyze `crm_report`/`hb_report` bundles too, with per-node attribution across a multi-node cluster
 - Keep everything on your machine — the server binds to `127.0.0.1` only by default, and bundle data is only ever sent off-box if you explicitly choose a cloud AI provider for the synthesis step
@@ -68,17 +68,26 @@ Options (same flags on every launcher, just spelled per that shell's own convent
 
 ## Sharing with a team over the internet
 
-**Read this before pointing `--host` at anything other than `127.0.0.1`.** [SECURITY.md](SECURITY.md)'s primary recommendation is still **one instance per engineer** — running a single shared instance means every user of that instance sees the same job list and uploaded bundles (there's no per-user isolation; see "What this doesn't provide" below). If you need a single shared instance anyway (e.g. a global support team without per-engineer VMs), this project gives you two independent safety nets, both automatic:
+**Read this before pointing `--host` at anything other than `127.0.0.1`.** [SECURITY.md](SECURITY.md)'s primary recommendation is still **one instance per engineer** — running a single shared instance means every user of that instance sees the same job list and uploaded bundles (there's no per-user *data* isolation, even with accounts below; see "What this doesn't provide"). If you need a single shared instance anyway (e.g. a global support team without per-engineer VMs), this project gives you independent safety nets, layered together:
 
-- **`--https`** — serves over TLS instead of plain HTTP. Without `--ssl-certfile`/`--ssl-keyfile`, a self-signed certificate is generated once and reused on every restart (`certs/`, gitignored) covering `localhost`/`127.0.0.1`/`::1` plus whatever `--host` you passed. Browsers will show a one-time "connection isn't private" warning for it — expected for any self-signed cert; click through ("Advanced" → "Continue"), or pass your own trusted certificate via `--ssl-certfile`/`--ssl-keyfile` instead to avoid the warning entirely.
-- **A shared-secret auth gate** — the moment `--host` is anything other than a loopback address (`127.0.0.1`/`localhost`/`::1`) and you haven't passed `--auth-token` or `--no-auth`, a random password is generated and printed once at startup, and every request (API and the page itself) requires it as an HTTP Basic Auth credential (any username, that exact password). Your browser prompts for it once per browsing session and remembers it after that — no code or frontend changes needed. Share the printed password with your team over a channel you trust (not a public ticket/chat). Pass `--auth-token "your-own-password"` to pin a stable one instead of a fresh random one every restart. `/api/health` is deliberately excluded (for uptime monitoring) since it reveals nothing beyond `{"status": "ok"}`.
-- **`--no-auth`** disables the gate even on a non-loopback host — only do this if network-level access is *already* restricted (VPN-only, or a firewall rule scoped to specific known IPs), since this basic auth gate is a courtesy speed bump against a stray internet scanner, not a substitute for real network controls.
+- **Per-user accounts (recommended)** — real individual sign-in instead of one password everyone shares. Provision each teammate with:
+  ```bash
+  python backend/manage_users.py add alice
+  python backend/manage_users.py add bob
+  ```
+  (prompts for a password, hashed with `scrypt` — never stored or logged in plaintext). The moment one account exists and `--host` is non-loopback, every request requires signing in at a login page with that person's own username/password — nothing to share over chat/email at all, no single secret to leak or rotate, and you can revoke one person's access (`python backend/manage_users.py remove alice`) without affecting anyone else. Accounts lock out after 5 failed attempts (15 minutes) to resist brute-forcing. Manage the list any time with `add` / `remove` / `list` — changes apply immediately, no restart needed (except the very first account, which needs one restart to switch the server into accounts mode).
+- **`--auth-token "a-shared-secret"`** — the original single-shared-password gate (HTTP Basic Auth), still available for quick/simple sharing when individual accounts are overkill. Takes priority over accounts if both are present, so you can always fall back to it. Omit it entirely on a non-loopback host with zero accounts configured and a random password is generated and printed once at startup instead.
+- **`--https`** — serves over TLS instead of plain HTTP, so credentials (account passwords or the shared token alike) and bundle data aren't sent in the clear. Without `--ssl-certfile`/`--ssl-keyfile`, a self-signed certificate is generated once and reused on every restart (`certs/`, gitignored). Browsers will show a one-time "connection isn't private" warning for it — expected for any self-signed cert; click through ("Advanced" → "Continue"), or pass your own trusted certificate instead to avoid the warning entirely.
+- **`--no-auth`** disables every auth gate even on a non-loopback host — only do this if network-level access is *already* restricted (VPN-only, or a firewall rule scoped to specific known IPs), since these gates are a safety net against a stray internet scanner finding the address, not a substitute for real network controls.
+- **`--require-auth`** forces whichever gate would apply on a non-loopback host to also apply on `127.0.0.1` — handy for testing the login flow locally before deploying for real.
 
-Realistic setup for a globally-distributed support team on one Azure VM:
+Realistic setup for a globally-distributed support team on one Azure VM, with individual accounts:
 ```bash
-./run.sh --host 0.0.0.0 --https --auth-token "your-team-shared-password"
+python backend/manage_users.py add alice
+python backend/manage_users.py add bob
+./run.sh --host 0.0.0.0 --https
 ```
-Then open the VM's NSG for the chosen port (scoped to your team's known IP ranges/VPN CIDR if at all possible, not `0.0.0.0/0`), and share `https://<vm-public-ip>:<port>` plus the password with your team over a trusted channel.
+Then open the VM's NSG for the chosen port (scoped to your team's known IP ranges/VPN CIDR if at all possible, not `0.0.0.0/0`), and share `https://<vm-public-ip>:<port>` with your team — each person signs in with their own account, nothing else to distribute.
 
 ### Manual setup (alternative to the run scripts)
 
@@ -188,7 +197,7 @@ If authentication succeeds but the chat call still fails, double-check step 3 �
 **See [SECURITY.md](SECURITY.md) for the full picture** — recommended team deployment model (one instance per engineer, not a shared server), exactly what data leaves the machine and when, the redaction feature and its limitations, a provider risk ordering, retention guidance, and an explicit list of what this tool does *not* provide (encryption at rest, audit logging, RBAC, DLP, formal compliance certification).
 
 Summary:
-- The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0` (or another real address), which automatically turns on a shared-secret auth gate and offers `--https` for TLS - see "Sharing with a team" above.
+- The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0` (or another real address), which automatically requires signing in (per-user accounts if any are configured, else a shared password) and offers `--https` for TLS - see "Sharing with a team" above.
 - Uploaded archives and their extracted contents/analysis output are kept under `backend/data/jobs/<job_id>/` for the lifetime of the server process. Delete a job's data any time via the API (`DELETE /api/jobs/{id}`) or just delete the folder; nothing is auto-uploaded anywhere.
 - The AI synthesis step sends the **evidence digest** (system/cluster names, log excerpts, IPs, timestamps, etc. — not the raw uploaded archive) to whichever provider you pick, with known hostnames/IPs redacted by default for non-local providers — and now shown directly on the Results page, not just the activity terminal. Use **Ollama** (the default) if the bundle must never leave the machine.
 - The frontend has zero external/CDN dependencies (including its own small Markdown renderer) so the UI itself works with no internet access — only the AI synthesis step (for non-Ollama providers) and the optional "Check available models" call need connectivity.
