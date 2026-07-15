@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2026-07-15
+
+### Fixed
+- **supportconfig SAR detection**: `check_sar_performance()` required the *filename* to contain the substring "sar", but real-world supportconfig bundles name files inside their `sar/` directory by date/day-of-month only (e.g. `sar/15`) - never containing the word "sar" itself. Every supportconfig SAR file was silently missed. Fixed by matching on directory *membership* (an exact path segment equal to `sar`) in addition to the filename check.
+- **sosreport SAR detection**: `sos_commands/sar/*` (pre-rendered text) was already checked, but the raw sysstat spool directory (`var/log/sa/*`) sosreport also copies in wholesale was not - occasionally this contains pre-rendered `sarDD`/`sadDD` text reports alongside the (correctly still-unparsed) binary `saDD` files. Now checked too, with `is_probably_text()` filtering out the binary files before attempting to parse them as text (never decodes raw binary sar data - see README/SECURITY.md).
+
+### Changed
+- **Scan progress reporting now names the current file**: the periodic "...scanned N/Total files, M distinct findings so far" progress line only ever printed *after* a file finished, so a single very large/slow file (which can legitimately take minutes) produced a long silent gap with no indication of which file was responsible. The check now fires *before* each file starts, and the message includes that file's path: `...scanning var/log/audit/audit.log (19/912 files, 1905 distinct findings so far)`.
+
 ## [4.1.0] - 2026-07-15
 
 ### Added
@@ -139,6 +148,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.2.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.0
 [4.1.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.1.0
 [4.0.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.0.0
 [3.1.2]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v3.1.2

@@ -58,7 +58,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -1224,19 +1224,37 @@ def _parse_sar_text(text, fallback_date):
 
 def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
     """Parses pre-rendered `sar` text captures - sysstat's own plain-text
-    table output, as bundled by the sosreport/supportconfig sar plugin -
-    NOT the raw binary /var/log/sa/saDD files (those need the sar/sadf
-    binary to decode, which can't be assumed available in this tool's
-    own runtime) - into per-metric time series plus a condensed summary.
+    table output - into per-metric time series plus a condensed summary.
+    Looks in every location a bundle realistically stores this:
+      - sosreport: the dedicated sar-plugin capture (sos_commands/sar/*),
+        AND the raw sysstat spool directory it also copies in wholesale
+        (var/log/sa/* - mostly binary saDD files this tool can't decode
+        without the sar/sadf binary, but occasionally also pre-rendered
+        sarDD/sadDD text reports if the box was configured to write
+        those via cron - worth checking rather than assuming binary).
+      - supportconfig: files live under a dedicated sar/ directory, but
+        are typically named by day-of-month/date (e.g. "15"), NOT by
+        anything containing the literal word "sar" - so matching must be
+        by directory membership (an exact path SEGMENT equal to "sar"),
+        never by filename substring, or every file in that directory is
+        silently missed.
+      - crm_report: sysstats.txt.
+    Binary candidates are filtered out via is_probably_text() before
+    attempting to parse them as text - the parser itself is also safe
+    against binary noise (no real sar table header will ever match
+    random bytes), but skipping early avoids a wasted read on what can
+    be a multi-MB raw sa file.
     Best-effort and intentionally silent when a bundle has no sar data at
     all (common - sysstat isn't always installed on the customer's box).
     """
     if kind == "sosreport":
-        candidates = find_inventory(inventory, "sos_commands/sar/")
+        candidates = find_inventory(inventory, "sos_commands/sar/", "var/log/sa/")
     elif kind == "supportconfig":
-        candidates = [p for p in find_inventory(inventory, "sar") if "sar" in p.rsplit("/", 1)[-1].lower()]
+        candidates = [p for p in find_inventory(inventory, "sar")
+                      if "sar" in p.lower().split("/")[:-1] or "sar" in p.rsplit("/", 1)[-1].lower()]
     else:
         candidates = find_inventory(inventory, "sysstats.txt")
+    candidates = [p for p in candidates if is_probably_text(root / p)]
 
     fallback_date = capture_dt.date() if capture_dt else None
     all_series = defaultdict(list)
@@ -2569,7 +2587,7 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
 
     report("Scanning files for known failure signatures (this can take a while for large archives)...")
     last_report = time.time()
-    for item in inventory:
+    for idx, item in enumerate(inventory, start=1):
         relpath = item["path"]
         if item["size"] <= 0:
             continue
@@ -2577,11 +2595,16 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         if not is_probably_text(fpath):
             ctx["stats"]["files_skipped_binary"] += 1
             continue
+        # Reported BEFORE scan_file() runs (not after) so a single very
+        # large/slow file - which can legitimately take minutes on a huge
+        # log - shows up immediately as "currently scanning", instead of
+        # the progress line going silent for that entire stretch with no
+        # indication of which file is responsible.
+        if time.time() - last_report > 5:
+            report(f"  ...scanning {relpath}  ({idx}/{len(inventory)} files, {len(ctx['findings'])} distinct findings so far)")
+            last_report = time.time()
         scan_file(root, relpath, kind, item["category"], ctx)
         ctx["stats"]["files_scanned"] += 1
-        if time.time() - last_report > 5:
-            report(f"  ...scanned {ctx['stats']['files_scanned']}/{len(inventory)} files, {len(ctx['findings'])} distinct findings so far")
-            last_report = time.time()
 
     stats = ctx["stats"]
     report(f"Scan complete: {stats['files_scanned']} files scanned, {stats['lines_scanned']:,} lines, {len(ctx['findings'])} distinct findings")
