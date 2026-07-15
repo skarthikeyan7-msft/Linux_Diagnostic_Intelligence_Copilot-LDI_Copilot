@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-07-16
+
+### Added
+- **HTTPS/TLS support (`--https`)**: the server can now serve over TLS instead of plain HTTP. Without `--ssl-certfile`/`--ssl-keyfile`, a self-signed certificate is auto-generated once (`backend/certs.py`, new `cryptography` dependency) and reused across restarts under `certs/` (gitignored) - covering `localhost`/`127.0.0.1`/`::1` plus whatever `--host` was requested. Browsers show a one-time "connection isn't private" warning for it, as expected for any self-signed certificate; supply your own trusted certificate via `--ssl-certfile`/`--ssl-keyfile` to avoid that warning entirely. All three launchers (`run.sh`/`run.bat`/`run.ps1`) gained matching `--https`/`--ssl-certfile`/`--ssl-keyfile` passthrough flags.
+- **Shared-secret auth gate for non-loopback hosts**: the moment `--host` is anything other than `127.0.0.1`/`localhost`/`::1`, every request (every API route and the page itself, except `/api/health`) now requires an HTTP Basic Auth credential (`backend/auth.py`) - any username, one shared password. A random password is generated and printed once at startup unless `--auth-token` is passed explicitly (to pin a stable one) or `--no-auth` (to disable the gate - only appropriate when network-level access is already restricted, e.g. VPN-only). Requires zero frontend code, since browsers cache a successful Basic Auth credential per-origin and automatically attach it to the page's own subsequent `fetch()` calls. All three launchers gained matching `--auth-token`/`--no-auth` passthrough flags. Built in response to a request to expose a single instance to a globally-distributed support team over the internet - see the new "Sharing with a team" section in README.md and "Running one shared instance instead" in SECURITY.md for exactly what this does and does not protect against (notably: no per-user isolation - every authenticated user of a shared instance sees every job on it).
+- **Redaction mapping now shown directly on the Results page**: previously the "🔒 Redacted N hostname(s)/IP address(es)..." summary and its token↔real-value legend were only ever logged to the activity terminal, easy to miss and lost once the terminal scrolled. A new callout now renders right above the AI report itself (between the focus-area summary and the report), with the summary always visible and the full mapping available in a collapsible detail view. Persisted server-side per job (`GET /api/jobs/{id}/redaction`) so it's still shown correctly after navigating away and back, or reopening the job later from "Recent analyses" - not just during the initial streamed generation.
+
+### Fixed
+- **Auth middleware silently not applying**: initial implementation called `app.add_middleware(...)` directly inside `main()`, which had no effect on the actually-served app - `uvicorn.run("app:app", ...)` resolves that string by re-importing `app.py` under the module name `app`, a separate module object from the `__main__` copy that runs `main()` (this is what lets `--reload` re-import fresh on file changes). Caught before release by a dedicated live-process test suite that starts the real server as a subprocess and checks actual HTTP responses rather than only unit-testing the function in isolation; fixed by handing the computed token across via an environment variable that both module copies read identically at import time, since `os.environ` (unlike a module-level Python object) is shared process-wide.
+
 ## [4.2.4] - 2026-07-16
 
 ### Added
@@ -172,6 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.3.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.3.0
 [4.2.4]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.4
 [4.2.3]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.3
 [4.2.2]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.2

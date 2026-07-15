@@ -315,6 +315,17 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 }
 .callout-focus strong { color: var(--accent); }
 
+.callout-redaction {
+  background: rgba(111, 207, 151, 0.08);
+  border-color: rgba(111, 207, 151, 0.35);
+}
+.callout-redaction strong { color: var(--info); }
+.redaction-summary { margin-bottom: 4px; }
+.redaction-details summary { cursor: pointer; color: var(--text-muted); font-size: 13px; margin-top: 4px; }
+.redaction-columns { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 10px; }
+.redaction-group h5 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: var(--text-muted); }
+.redaction-group code { display: block; font-size: 12px; line-height: 1.6; background: none; padding: 0; color: var(--text); }
+
 .focus-ai-panel {
   background: var(--bg-panel-2);
   border: 1px solid var(--border);

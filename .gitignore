@@ -8,6 +8,11 @@ venv/
 # contain sensitive hostnames/IPs/config data and shouldn't be committed
 backend/data/
 
+# auto-generated self-signed TLS cert/key for --https - machine-specific
+# and the private key should never be committed even though it's
+# self-signed and low-value
+/certs/
+
 # analyzer CLI-style output directories, if ever generated locally
 *_analysis/
 extraction_skipped.json

@@ -10,6 +10,11 @@ set -euo pipefail
 HOST_ADDRESS="127.0.0.1"
 PORT="8756"
 OPEN_BROWSER=1
+HTTPS=0
+SSL_CERTFILE=""
+SSL_KEYFILE=""
+AUTH_TOKEN=""
+NO_AUTH=0
 MIN_PY_MAJOR=3
 MIN_PY_MINOR=10
 
@@ -18,8 +23,13 @@ while [[ $# -gt 0 ]]; do
     --host) HOST_ADDRESS="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --no-browser) OPEN_BROWSER=0; shift ;;
+    --https) HTTPS=1; shift ;;
+    --ssl-certfile) SSL_CERTFILE="$2"; shift 2 ;;
+    --ssl-keyfile) SSL_KEYFILE="$2"; shift 2 ;;
+    --auth-token) AUTH_TOKEN="$2"; shift 2 ;;
+    --no-auth) NO_AUTH=1; shift ;;
     -h|--help)
-      echo "Usage: ./run.sh [--host ADDRESS] [--port PORT] [--no-browser]"
+      echo "Usage: ./run.sh [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -128,7 +138,18 @@ fi
 echo "Installing/checking dependencies..."
 "$VENV_PYTHON" -m pip install --quiet --disable-pip-version-check -r "$ROOT_DIR/backend/requirements.txt"
 
-URL="http://${HOST_ADDRESS}:${PORT}"
+APP_ARGS=(--host "$HOST_ADDRESS" --port "$PORT")
+SCHEME="http"
+if [[ "$HTTPS" -eq 1 ]]; then
+  SCHEME="https"
+  APP_ARGS+=(--https)
+  [[ -n "$SSL_CERTFILE" ]] && APP_ARGS+=(--ssl-certfile "$SSL_CERTFILE")
+  [[ -n "$SSL_KEYFILE" ]] && APP_ARGS+=(--ssl-keyfile "$SSL_KEYFILE")
+fi
+[[ -n "$AUTH_TOKEN" ]] && APP_ARGS+=(--auth-token "$AUTH_TOKEN")
+[[ "$NO_AUTH" -eq 1 ]] && APP_ARGS+=(--no-auth)
+
+URL="${SCHEME}://${HOST_ADDRESS}:${PORT}"
 echo ""
 echo "Starting LDI Copilot at $URL"
 echo "Press Ctrl+C to stop."
@@ -150,4 +171,4 @@ if [[ "$OPEN_BROWSER" -eq 1 ]]; then
 fi
 
 cd "$ROOT_DIR/backend"
-exec "$VENV_PYTHON" app.py --host "$HOST_ADDRESS" --port "$PORT"
+exec "$VENV_PYTHON" app.py "${APP_ARGS[@]}"

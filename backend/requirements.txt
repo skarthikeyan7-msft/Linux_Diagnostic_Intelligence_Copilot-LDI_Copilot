@@ -2,3 +2,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 dpkt>=1.9.8
+cryptography>=42.0

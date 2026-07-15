@@ -8,7 +8,12 @@
 param(
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8756,
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [switch]$Https,
+    [string]$SslCertFile,
+    [string]$SslKeyFile,
+    [string]$AuthToken,
+    [switch]$NoAuth
 )
 
 $ErrorActionPreference = "Stop"
@@ -126,7 +131,7 @@ if (-not (Test-Path $venvPython)) {
 Write-Host "Installing/checking dependencies..." -ForegroundColor Cyan
 & $venvPython -m pip install --quiet --disable-pip-version-check -r (Join-Path $root "backend/requirements.txt")
 
-$url = "http://${HostAddress}:${Port}"
+$url = if ($Https) { "https://${HostAddress}:${Port}" } else { "http://${HostAddress}:${Port}" }
 Write-Host ""
 Write-Host "Starting LDI Copilot at $url" -ForegroundColor Green
 Write-Host "Press Ctrl+C to stop." -ForegroundColor DarkGray
@@ -146,9 +151,18 @@ if (-not $NoBrowser) {
     } -ArgumentList $url, $onWindows | Out-Null
 }
 
+$appArgs = @("--host", $HostAddress, "--port", $Port)
+if ($Https) {
+    $appArgs += "--https"
+    if ($SslCertFile) { $appArgs += @("--ssl-certfile", $SslCertFile) }
+    if ($SslKeyFile) { $appArgs += @("--ssl-keyfile", $SslKeyFile) }
+}
+if ($AuthToken) { $appArgs += @("--auth-token", $AuthToken) }
+if ($NoAuth) { $appArgs += "--no-auth" }
+
 Push-Location (Join-Path $root "backend")
 try {
-    & $venvPython app.py --host $HostAddress --port $Port
+    & $venvPython app.py @appArgs
 } finally {
     Pop-Location
 }

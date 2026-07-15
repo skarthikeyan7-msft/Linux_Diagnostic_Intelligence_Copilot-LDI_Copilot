@@ -551,6 +551,7 @@ async function loadResults(jobIdOverride) {
   $("btnDownloadReport").classList.add("hidden");
   $("chatSection").classList.add("hidden");
   $("chatThread").innerHTML = "";
+  renderRedactionCallout(null);
   const existingReport = await fetch(`/api/jobs/${jobId}/ai_report`).then((r) => r.text()).catch(() => "");
   if (existingReport) {
     $("aiRender").innerHTML = markdownToHtml(existingReport);
@@ -558,6 +559,8 @@ async function loadResults(jobIdOverride) {
     $("btnSynthesize").textContent = "Regenerate log analysis";
     $("chatSection").classList.remove("hidden");
     await restoreChatHistory(jobId);
+    const existingRedaction = await fetch(`/api/jobs/${jobId}/redaction`).then((r) => r.json()).catch(() => null);
+    renderRedactionCallout(existingRedaction);
   } else {
     $("btnSynthesize").textContent = "Generate log analysis";
   }
@@ -609,6 +612,39 @@ function renderFocusCallout(summary) {
     ? ` &nbsp;·&nbsp; keywords: ${focus.keywords.map((k) => `<code>${escapeHtml(k)}</code>`).join(", ")}`
     : "";
   el.innerHTML = `🎯 <strong>Focused on:</strong> "${escapeHtml(focus.text)}" &nbsp;·&nbsp; ${focus.num_matching_findings} finding(s) matched${kwHtml}`;
+  el.classList.remove("hidden");
+}
+
+// `data` is the {summary, legend} object emitted by the backend's
+// synthesize() SSE stream (and persisted at GET /api/jobs/{id}/redaction) -
+// or null/undefined when the most recent report used a local provider
+// (Ollama) or had redaction turned off, in which case the callout hides.
+// Renders the token->original mapping grouped by kind (hostnames vs IPs)
+// inside a collapsible <details> so it doesn't dominate the page when
+// there are many redacted values, matching the always-visible one-line
+// summary engineers need at a glance plus the full mapping on demand.
+function renderRedactionCallout(data) {
+  const el = $("redactionCallout");
+  const legend = data && data.legend;
+  if (!legend || !legend.length) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  const hosts = legend.filter((e) => e.token.startsWith("HOST-"));
+  const ips = legend.filter((e) => e.token.startsWith("IP-"));
+  const parts = [];
+  if (hosts.length) parts.push(`${hosts.length} hostname(s)`);
+  if (ips.length) parts.push(`${ips.length} IP address(es)`);
+  const renderGroup = (title, items) => (items.length
+    ? `<div class="redaction-group"><h5>${escapeHtml(title)}</h5>${items.map((e) => `<code>${escapeHtml(e.token)}=${escapeHtml(e.original)}</code>`).join("")}</div>`
+    : "");
+  el.innerHTML = `
+    <div class="redaction-summary">🔒 <strong>Redacted ${escapeHtml(parts.join(" and "))} before sending.</strong> Local-only mapping - never sent to the AI provider:</div>
+    <details class="redaction-details">
+      <summary>View mapping (${legend.length} value(s))</summary>
+      <div class="redaction-columns">${renderGroup("Hostnames", hosts)}${renderGroup("IP Addresses", ips)}</div>
+    </details>`;
   el.classList.remove("hidden");
 }
 
@@ -1170,6 +1206,7 @@ async function runSynthesis() {
   // chat thread from the UI so it doesn't look like it still applies.
   $("chatSection").classList.add("hidden");
   $("chatThread").innerHTML = "";
+  renderRedactionCallout(null);
 
   if (payload.provider === "ollama") {
     try {
@@ -1215,6 +1252,7 @@ async function runSynthesis() {
         if (parsed.error) throw new Error(parsed.error);
         if (parsed.redaction) {
           logTerminal(`🔒 ${parsed.redaction.summary}`, "info");
+          renderRedactionCallout(parsed.redaction);
         }
         if (parsed.delta) {
           accumulated += parsed.delta;

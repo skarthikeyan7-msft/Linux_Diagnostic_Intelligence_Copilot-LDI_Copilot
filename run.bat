@@ -9,6 +9,11 @@ rem all three do the same thing.
 set "HOSTADDR=127.0.0.1"
 set "PORT=8756"
 set "NOBROWSER=0"
+set "HTTPS=0"
+set "SSLCERTFILE="
+set "SSLKEYFILE="
+set "AUTHTOKEN="
+set "NOAUTH=0"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -29,13 +34,41 @@ if /i "%~1"=="--no-browser" (
     shift
     goto parse_args
 )
+if /i "%~1"=="--https" (
+    set "HTTPS=1"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--ssl-certfile" (
+    set "SSLCERTFILE=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--ssl-keyfile" (
+    set "SSLKEYFILE=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--auth-token" (
+    set "AUTHTOKEN=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--no-auth" (
+    set "NOAUTH=1"
+    shift
+    goto parse_args
+)
 if /i "%~1"=="-h" goto usage
 if /i "%~1"=="--help" goto usage
 echo Unknown option: %~1
 exit /b 1
 
 :usage
-echo Usage: run.bat [--host ADDRESS] [--port PORT] [--no-browser]
+echo Usage: run.bat [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth]
 exit /b 0
 
 :args_done
@@ -137,6 +170,15 @@ echo Installing/checking dependencies...
 "%VENVPY%" -m pip install --quiet --disable-pip-version-check -r "%ROOT%backend\requirements.txt"
 
 set "URL=http://%HOSTADDR%:%PORT%"
+set "APPARGS=--host %HOSTADDR% --port %PORT%"
+if "%HTTPS%"=="1" (
+    set "URL=https://%HOSTADDR%:%PORT%"
+    set "APPARGS=%APPARGS% --https"
+    if defined SSLCERTFILE set "APPARGS=%APPARGS% --ssl-certfile %SSLCERTFILE%"
+    if defined SSLKEYFILE set "APPARGS=%APPARGS% --ssl-keyfile %SSLKEYFILE%"
+)
+if defined AUTHTOKEN set "APPARGS=%APPARGS% --auth-token %AUTHTOKEN%"
+if "%NOAUTH%"=="1" set "APPARGS=%APPARGS% --no-auth"
 echo.
 echo Starting LDI Copilot at %URL%
 echo Press Ctrl+C to stop.
@@ -147,5 +189,5 @@ if "%NOBROWSER%"=="0" (
 )
 
 pushd "%ROOT%backend"
-"%VENVPY%" app.py --host %HOSTADDR% --port %PORT%
+"%VENVPY%" app.py %APPARGS%
 popd

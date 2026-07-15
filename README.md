@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.2.4-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.3.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -19,14 +19,15 @@ The CLI (`sosreport-rca`) is great for scripting/automation. This project wraps 
 - **Never have to remember to start Ollama** — clicking "Generate log analysis" with Ollama selected starts `ollama serve` automatically if it isn't already running, with progress visible in the activity terminal; a toolbar also gives direct manual Start/Stop/Refresh control any time
 - **Move freely between Provide Bundle / Analyzing / Results** at any time via a persistent top tab bar, instead of being forced through a linear wizard
 - **Watch background progress from a full-height activity terminal docked along the entire right edge** — bundle selection, scan progress, AI synthesis, Ollama start/stop, downloads — without needing to be on a specific tab
-- **Reduce exposure automatically when using a public AI model** — known hostnames and IP addresses are redacted from the evidence digest before it's sent to any non-local provider, with an explicit confirmation required before any external send (see [SECURITY.md](SECURITY.md))
+- **Reduce exposure automatically when using a public AI model** — known hostnames and IP addresses are redacted from the evidence digest before it's sent to any non-local provider, with an explicit confirmation required before any external send, and the exact redaction mapping shown right on the Results page (see [SECURITY.md](SECURITY.md))
+- **Optionally serve over HTTPS and behind a shared-secret auth gate** — if you need to reach this from more than just `localhost` (e.g. a team sharing one instance on a cloud VM), `--https` adds TLS and a non-loopback `--host` automatically requires an HTTP Basic Auth credential (see "Sharing with a team" below)
 - Get a live, readable dashboard (summary cards, cluster status, findings by category, chronological timeline) instead of a markdown file
 - Analyze `crm_report`/`hb_report` bundles too, with per-node attribution across a multi-node cluster
 - Keep everything on your machine — the server binds to `127.0.0.1` only by default, and bundle data is only ever sent off-box if you explicitly choose a cloud AI provider for the synthesis step
 
 ## Quick start
 
-Requirements: Python 3.10+ (uses only the standard library plus `dpkt` for the engine; FastAPI/uvicorn for the server). Runs on **Windows, Linux, and macOS** — pick the launcher matching whatever shell you're already in; all three do exactly the same thing (create/reuse a local `.venv`, install dependencies, start the server, open your browser):
+Requirements: Python 3.10+ (uses only the standard library plus `dpkt` for the engine, `cryptography` for optional `--https` self-signed certs, and FastAPI/uvicorn for the server). Runs on **Windows, Linux, and macOS** — pick the launcher matching whatever shell you're already in; all three do exactly the same thing (create/reuse a local `.venv`, install dependencies, start the server, open your browser):
 
 | Shell | Command |
 |---|---|
@@ -40,24 +41,44 @@ Stop any of them with `Ctrl+C`.
 
 > **RHEL/CentOS/Alma/Rocky Linux 8 users:** the default `python3` on RHEL 8.x is Python 3.6 — years past upstream end-of-life and too old for this project (FastAPI/Pydantic need 3.8+; this codebase's own type hints need 3.10+). All three launchers detect this and fail with a clear message rather than a confusing `pip` error — `run.sh` specifically auto-detects a newer `python3.10`/`3.11`/`3.12`/`3.13` on `PATH` ahead of the too-old default, so installing one (`sudo dnf install python3.11`) and rerunning is usually all that's needed; you don't have to touch the system default `python3`.
 
-Options (same three flags on every launcher, just spelled per that shell's own convention):
+Options (same flags on every launcher, just spelled per that shell's own convention):
 ```powershell
 .\run.ps1 -Port 9000            # use a different port
 .\run.ps1 -NoBrowser             # don't auto-open a browser tab
-.\run.ps1 -HostAddress 0.0.0.0   # allow LAN access (not recommended - see Privacy below)
+.\run.ps1 -HostAddress 0.0.0.0   # allow LAN/internet access (see "Sharing with a team" below)
+.\run.ps1 -HostAddress 0.0.0.0 -Https                        # + TLS (self-signed cert, auto-generated)
+.\run.ps1 -HostAddress 0.0.0.0 -AuthToken "a-shared-secret"   # + pin a stable shared password
 ```
 ```bat
 .\run.bat --port 9000
 .\run.bat --no-browser
 .\run.bat --host 0.0.0.0
+.\run.bat --host 0.0.0.0 --https
+.\run.bat --host 0.0.0.0 --auth-token a-shared-secret
 ```
 ```bash
 ./run.sh --port 9000
 ./run.sh --no-browser
 ./run.sh --host 0.0.0.0
+./run.sh --host 0.0.0.0 --https
+./run.sh --host 0.0.0.0 --auth-token a-shared-secret
 ```
 
-> **Cloud VM users (Azure/AWS/GCP):** never pass your VM's *public* IP to `--host`/`-HostAddress`. Cloud public IPs are NAT'd at the platform level and are never actually configured on the VM's own network interface, so the OS refuses to bind to it (`[Errno 99] Cannot assign requested address`). Bind to `0.0.0.0` (or leave the default `127.0.0.1`) instead - the public IP is only ever used from *outside* the VM to reach whatever's bound there. **Safer option:** don't expose the port at all - `ssh -L 8756:127.0.0.1:8756 user@your-vm-ip` and browse to `http://127.0.0.1:8756` on your own machine, keeping the default localhost-only bind and zero new attack surface. If you do need `--host 0.0.0.0`, also open the port in your cloud provider's firewall (Azure NSG / AWS security group / GCP firewall rule) scoped to your own IP specifically, not `0.0.0.0/0` - see [SECURITY.md](SECURITY.md) before exposing this beyond localhost, especially with real customer bundle data.
+> **Cloud VM users (Azure/AWS/GCP):** never pass your VM's *public* IP to `--host`/`-HostAddress`. Cloud public IPs are NAT'd at the platform level and are never actually configured on the VM's own network interface, so the OS refuses to bind to it (`[Errno 99] Cannot assign requested address`) — this project detects and explains that specific case before it can happen. Bind to `0.0.0.0` (or leave the default `127.0.0.1`) instead - the public IP is only ever used from *outside* the VM to reach whatever's bound there. **Safer option:** don't expose the port at all - `ssh -L 8756:127.0.0.1:8756 user@your-vm-ip` and browse to `http://127.0.0.1:8756` on your own machine, keeping the default localhost-only bind and zero new attack surface. If you do need `--host 0.0.0.0`, also open the port in your cloud provider's firewall (Azure NSG / AWS security group / GCP firewall rule) scoped to your own IP specifically, not `0.0.0.0/0`, and see "Sharing with a team" below for the auth gate this project adds automatically in that case — see [SECURITY.md](SECURITY.md) before exposing this beyond localhost, especially with real customer bundle data.
+
+## Sharing with a team over the internet
+
+**Read this before pointing `--host` at anything other than `127.0.0.1`.** [SECURITY.md](SECURITY.md)'s primary recommendation is still **one instance per engineer** — running a single shared instance means every user of that instance sees the same job list and uploaded bundles (there's no per-user isolation; see "What this doesn't provide" below). If you need a single shared instance anyway (e.g. a global support team without per-engineer VMs), this project gives you two independent safety nets, both automatic:
+
+- **`--https`** — serves over TLS instead of plain HTTP. Without `--ssl-certfile`/`--ssl-keyfile`, a self-signed certificate is generated once and reused on every restart (`certs/`, gitignored) covering `localhost`/`127.0.0.1`/`::1` plus whatever `--host` you passed. Browsers will show a one-time "connection isn't private" warning for it — expected for any self-signed cert; click through ("Advanced" → "Continue"), or pass your own trusted certificate via `--ssl-certfile`/`--ssl-keyfile` instead to avoid the warning entirely.
+- **A shared-secret auth gate** — the moment `--host` is anything other than a loopback address (`127.0.0.1`/`localhost`/`::1`) and you haven't passed `--auth-token` or `--no-auth`, a random password is generated and printed once at startup, and every request (API and the page itself) requires it as an HTTP Basic Auth credential (any username, that exact password). Your browser prompts for it once per browsing session and remembers it after that — no code or frontend changes needed. Share the printed password with your team over a channel you trust (not a public ticket/chat). Pass `--auth-token "your-own-password"` to pin a stable one instead of a fresh random one every restart. `/api/health` is deliberately excluded (for uptime monitoring) since it reveals nothing beyond `{"status": "ok"}`.
+- **`--no-auth`** disables the gate even on a non-loopback host — only do this if network-level access is *already* restricted (VPN-only, or a firewall rule scoped to specific known IPs), since this basic auth gate is a courtesy speed bump against a stray internet scanner, not a substitute for real network controls.
+
+Realistic setup for a globally-distributed support team on one Azure VM:
+```bash
+./run.sh --host 0.0.0.0 --https --auth-token "your-team-shared-password"
+```
+Then open the VM's NSG for the chosen port (scoped to your team's known IP ranges/VPN CIDR if at all possible, not `0.0.0.0/0`), and share `https://<vm-public-ip>:<port>` plus the password with your team over a trusted channel.
 
 ### Manual setup (alternative to the run scripts)
 
@@ -85,7 +106,7 @@ The top of the page has three always-clickable tabs — **1. Provide Bundle**, *
 2. **Say what you're investigating** — in the "🎯 What are you investigating?" box, describe the specific issue, e.g. *"find root cause of NC and IP cluster resource restart issue"*. This steers both the mechanical scan (a dedicated Focused Findings section, keyword-tagged results) and the AI report (which answers that question directly and demotes unrelated findings to a short closing section). Leave it blank for a generic full-bundle analysis.
 3. **Configure your AI model** — right below, in the same panel: pick a provider, then (for Azure OpenAI) pick an **authentication type** — API Key or Microsoft Entra ID — and fill in the fields for that choice. Optionally check "Remember these settings on this device". Filling this in now means a full AI-reasoned report generates **automatically** as soon as the scan finishes — no extra click. This panel lives permanently on tab 1; use the "✏️ Edit focus & AI settings" shortcut on the Results tab to jump straight back to it.
 4. **(Optional) scope the analysis** — expand "Advanced options" to restrict the scan to a specific date/time range or a time ± window, or narrow which **analysis focus areas** (SAR, crash, boot, security, packages, cascade, containers, network) actually show up in the digest/report. Useful when you already know roughly when an incident happened, or which axes matter for this investigation.
-5. **Run analysis** — the view auto-advances to tab 2 to show live progress, then to tab 3 once done. Results open on the **AI Root Cause Report** tab by default, streaming in automatically if you configured a model in step 3 (or click "Generate log analysis" there if you didn't). A disclaimer is always shown above the report — ⚠️ AI-generated content may be incorrect or incomplete; verify against the evidence before acting. Other tabs: a **📊 Performance** sub-tab with SAR charts (when SAR data was found), the full evidence **Digest**, a filterable **Findings** list (with a "show only findings matching my focus 🎯" toggle), and a cross-file **Timeline**.
+5. **Run analysis** — the view auto-advances to tab 2 to show live progress, then to tab 3 once done. Results open on the **AI Root Cause Report** tab by default, streaming in automatically if you configured a model in step 3 (or click "Generate log analysis" there if you didn't). A disclaimer is always shown above the report — ⚠️ AI-generated content may be incorrect or incomplete; verify against the evidence before acting. When a non-local provider redacted anything, a **"🔒 Redacted N hostname(s)/IP address(es)"** callout appears right above the report with the full local-only token↔real-value mapping available in a collapsible detail view — so you can always translate `HOST-1`/`IP-1` back to what the AI actually saw without that mapping ever having left the machine. Other tabs: a **📊 Performance** sub-tab with SAR charts (when SAR data was found), the full evidence **Digest**, a filterable **Findings** list (with a "show only findings matching my focus 🎯" toggle), and a cross-file **Timeline**.
 6. **Ask follow-up questions** — once a report is generated, an "💬 Ask a follow-up" thread appears below it. Type a custom instruction and the model replies in the context of the report it just gave you, without re-running the mechanical scan.
 7. **Regenerate or refine** — click "✏️ Edit focus & AI settings" to jump back to tab 1, tweak the focus text or switch AI providers/auth type, then return to tab 3 and click Generate again to regenerate (this also resets the follow-up chat thread) without re-running the mechanical scan.
 8. **Download** the combined AI report + evidence digest as a single Markdown file.
@@ -167,9 +188,9 @@ If authentication succeeds but the chat call still fails, double-check step 3 �
 **See [SECURITY.md](SECURITY.md) for the full picture** — recommended team deployment model (one instance per engineer, not a shared server), exactly what data leaves the machine and when, the redaction feature and its limitations, a provider risk ordering, retention guidance, and an explicit list of what this tool does *not* provide (encryption at rest, audit logging, RBAC, DLP, formal compliance certification).
 
 Summary:
-- The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0`, which isn't recommended given what these bundles contain.
+- The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0` (or another real address), which automatically turns on a shared-secret auth gate and offers `--https` for TLS - see "Sharing with a team" above.
 - Uploaded archives and their extracted contents/analysis output are kept under `backend/data/jobs/<job_id>/` for the lifetime of the server process. Delete a job's data any time via the API (`DELETE /api/jobs/{id}`) or just delete the folder; nothing is auto-uploaded anywhere.
-- The AI synthesis step sends the **evidence digest** (system/cluster names, log excerpts, IPs, timestamps, etc. — not the raw uploaded archive) to whichever provider you pick, with known hostnames/IPs redacted by default for non-local providers. Use **Ollama** (the default) if the bundle must never leave the machine.
+- The AI synthesis step sends the **evidence digest** (system/cluster names, log excerpts, IPs, timestamps, etc. — not the raw uploaded archive) to whichever provider you pick, with known hostnames/IPs redacted by default for non-local providers — and now shown directly on the Results page, not just the activity terminal. Use **Ollama** (the default) if the bundle must never leave the machine.
 - The frontend has zero external/CDN dependencies (including its own small Markdown renderer) so the UI itself works with no internet access — only the AI synthesis step (for non-Ollama providers) and the optional "Check available models" call need connectivity.
 
 ## Architecture

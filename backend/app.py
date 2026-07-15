@@ -16,10 +16,13 @@ Binds to 127.0.0.1 (localhost only) by default - this tool processes
 sosreport/supportconfig/crm_report bundles that routinely contain
 hostnames, internal IPs, and configuration data, so it deliberately
 does not listen on all interfaces unless you explicitly opt in (see
---host in the CLI args below).
+--host in the CLI args below). When --host is pointed at a non-loopback
+address, a shared-secret auth gate (HTTP Basic Auth) turns on
+automatically - see backend/auth.py and --auth-token/--no-auth below.
 """
 import argparse
 import json
+import os
 import shutil
 import socket
 import sys
@@ -46,7 +49,25 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="4.2.4")
+app = FastAPI(title="LDI Copilot", version="4.3.0")
+
+# Auth gate (backend/auth.py), wired here at module level rather than
+# inside main(). uvicorn.run("app:app", ...) resolves that string by
+# re-importing this file under the module name "app" - a SEPARATE module
+# object from the "__main__" copy actually executing main() (this
+# supports --reload's ability to re-import fresh on file changes). Any
+# mutation main() made directly on ITS OWN `app` reference (e.g. calling
+# app.add_middleware() there) would silently apply to a FastAPI instance
+# that's never actually served. Reading an environment variable here
+# instead works correctly for both copies, since os.environ is shared
+# process-wide rather than per-module state: main() sets this variable
+# before calling uvicorn.run(), and this line then runs again - and
+# picks it up - during uvicorn's fresh re-import.
+_LDI_AUTH_TOKEN_ENV = "LDI_COPILOT_AUTH_TOKEN"
+_auth_token = os.environ.get(_LDI_AUTH_TOKEN_ENV)
+if _auth_token:
+    from auth import BasicAuthMiddleware
+    app.add_middleware(BasicAuthMiddleware, token=_auth_token)
 
 # --------------------------------------------------------------------------
 # In-memory job store. This is a local, single-user tool - jobs live for
@@ -76,6 +97,7 @@ def _new_job(name, focus_text=None):
             "ai_report": "",
             "focus_text": focus_text,
             "conversation": [],  # [{role, content}, ...] - system+digest+report turn, then follow-up chat exchanges
+            "redaction": None,  # {"summary": str, "legend": [{"token", "original"}, ...]} from the most recent synthesize() call, or None if that call didn't redact anything
         }
     return job_id
 
@@ -427,6 +449,19 @@ async def synthesize(job_id: str, payload: dict):
         hostnames = collect_known_hostnames(job["result"].get("facts") or {})
         digest_markdown, redact_legend = redact_text(digest_markdown, hostnames)
 
+    # Persisted immediately (not just streamed) so the Results page still
+    # shows what was redacted after a page reload or a return visit via
+    # "Recent analyses" - overwrites any redaction info from a previous
+    # generate/regenerate call on this job, since that's the one now
+    # reflected by job["ai_report"].
+    redaction_info = (
+        {"summary": build_redaction_summary(redact_legend), "legend": redact_legend}
+        if should_redact else None
+    )
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id]["redaction"] = redaction_info
+
     messages = build_messages(
         job["result"]["kind"], digest_markdown,
         extra_context=payload.get("extra_context"), focus_text=focus_text,
@@ -434,8 +469,8 @@ async def synthesize(job_id: str, payload: dict):
     provider_kwargs = {k: v for k, v in payload.items() if k not in ("provider", "extra_context", "focus_text", "redact")}
 
     def event_stream():
-        if should_redact:
-            yield f"data: {json.dumps({'redaction': {'summary': build_redaction_summary(redact_legend), 'legend': redact_legend}})}\n\n"
+        if redaction_info:
+            yield f"data: {json.dumps({'redaction': redaction_info})}\n\n"
         accumulated = []
         try:
             for chunk in stream_chat(provider, messages, **provider_kwargs):
@@ -577,6 +612,18 @@ def get_ai_report(job_id: str):
     return PlainTextResponse(job.get("ai_report", ""))
 
 
+@app.get("/api/jobs/{job_id}/redaction")
+def get_redaction(job_id: str):
+    """Local-only record of what the most recent Generate/Regenerate call
+    on this job redacted before sending the digest to a non-local AI
+    provider - or null if that call used a local provider (Ollama) or had
+    redaction turned off. Never reflects data actually sent anywhere;
+    it's purely for the engineer to see what would be hidden from a
+    third-party AI provider."""
+    job = _get_job_or_404(job_id)
+    return job.get("redaction")
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": app.version}
@@ -588,7 +635,7 @@ def health():
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
 
 
-def _preflight_check_host(host):
+def _preflight_check_host(host, scheme="http"):
     """Proactively verifies `host` is actually bindable on THIS machine
     before starting uvicorn at all, so a bad --host value fails with an
     immediately actionable message instead of the raw OS error
@@ -627,9 +674,9 @@ def _preflight_check_host(host):
             "127.0.0.1 (localhost only, safest), then either:\n"
             "  - reach it via an SSH tunnel from your own machine (no exposed port\n"
             "    at all): ssh -L 8756:127.0.0.1:8756 user@<vm-public-ip>\n"
-            "    then browse to http://127.0.0.1:8756 locally, or\n"
+            f"    then browse to {scheme}://127.0.0.1:8756 locally, or\n"
             "  - open the port in your cloud firewall (scoped to your own IP, not\n"
-            "    0.0.0.0/0) and browse to http://<vm-public-ip>:<port> from outside.\n"
+            f"    0.0.0.0/0) and browse to {scheme}://<vm-public-ip>:<port> from outside.\n"
             "See README.md's Quick start section and SECURITY.md before exposing\n"
             "this beyond localhost, especially with real customer bundle data.\n",
             file=sys.stderr,
@@ -643,10 +690,68 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="Bind address (default 127.0.0.1 = localhost only; use 0.0.0.0 to allow LAN access - not recommended for sensitive bundles)")
     ap.add_argument("--port", type=int, default=8756, help="Port (default 8756)")
     ap.add_argument("--reload", action="store_true", help="Auto-reload on code changes (development only)")
+    ap.add_argument("--https", action="store_true", help="Serve over HTTPS/TLS instead of plain HTTP. Without --ssl-certfile/--ssl-keyfile, auto-generates and reuses a self-signed certificate under ../certs (browsers show a one-time trust warning for it - see README.md's HTTPS section).")
+    ap.add_argument("--ssl-certfile", default=None, help="Path to a PEM certificate file - supply your own trusted cert instead of the auto-generated self-signed one (use together with --ssl-keyfile)")
+    ap.add_argument("--ssl-keyfile", default=None, help="Path to the PEM private key matching --ssl-certfile")
+    ap.add_argument("--auth-token", default=None, help="Shared secret required (as an HTTP Basic Auth password, any username) to reach this server. If --host is non-loopback and this is omitted, a random token is generated and printed once at startup - use --no-auth to disable this gate instead (not recommended for anything but a network already restricted to trusted users, e.g. VPN-only).")
+    ap.add_argument("--no-auth", action="store_true", help="Disable the shared-secret auth gate even when --host is non-loopback. Only safe when something else already restricts who can reach this address (VPN, firewall rule scoped to known IPs).")
     args = ap.parse_args()
-    _preflight_check_host(args.host)
-    print(f"LDI Copilot starting at http://{args.host}:{args.port}")
-    uvicorn.run("app:app", host=args.host, port=args.port, reload=args.reload)
+    scheme = "https" if args.https else "http"
+    _preflight_check_host(args.host, scheme=scheme)
+
+    is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
+    auth_token = args.auth_token
+    if args.no_auth and auth_token:
+        print("ERROR: --auth-token and --no-auth are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+    if not args.no_auth and not auth_token and not is_loopback:
+        from auth import generate_token
+        auth_token = generate_token()
+
+    if auth_token:
+        os.environ[_LDI_AUTH_TOKEN_ENV] = auth_token
+        print(
+            "Auth gate ENABLED - every request needs an HTTP Basic Auth credential.\n"
+            "  Username: (anything, e.g. \"ldi\")\n"
+            f"  Password: {auth_token}\n"
+            "Share this password only with your team, over a channel you trust (not\n"
+            "in a public chat/ticket). Your browser will prompt for it once and cache\n"
+            "it for the session. To pin a stable password instead of a random one each\n"
+            "restart, pass --auth-token yourself. To disable this gate entirely\n"
+            "(only if something else already restricts access, e.g. VPN), pass\n"
+            "--no-auth. See SECURITY.md before exposing this beyond localhost.\n"
+        )
+    else:
+        os.environ.pop(_LDI_AUTH_TOKEN_ENV, None)
+        if not is_loopback:
+            print(
+                "WARNING: auth gate DISABLED (--no-auth) while bound to a non-loopback\n"
+                f"address ({args.host}). Anyone who can reach this address can use this\n"
+                "tool and any customer data uploaded to it. Make sure network-level\n"
+                "access (VPN/firewall) is already locked down. See SECURITY.md.\n"
+            )
+
+    ssl_certfile, ssl_keyfile = args.ssl_certfile, args.ssl_keyfile
+    if args.https and not (ssl_certfile and ssl_keyfile):
+        from certs import ensure_self_signed_cert
+        cert_dir = Path(__file__).resolve().parent.parent / "certs"
+        ssl_certfile, ssl_keyfile = ensure_self_signed_cert(cert_dir, args.host)
+        print(
+            f"Using auto-generated self-signed certificate ({cert_dir}).\n"
+            "Browsers will show a one-time trust warning (e.g. \"Your connection isn't\n"
+            "private\") for it - this is expected for a self-signed cert; proceed past\n"
+            "it (\"Advanced\" -> \"Continue\"), or supply a certificate your team already\n"
+            "trusts via --ssl-certfile/--ssl-keyfile instead. See README.md's HTTPS\n"
+            "section for details.\n"
+        )
+    elif args.https:
+        print(f"Using certificate {ssl_certfile} (key: {ssl_keyfile})\n")
+
+    print(f"LDI Copilot starting at {scheme}://{args.host}:{args.port}")
+    uvicorn.run(
+        "app:app", host=args.host, port=args.port, reload=args.reload,
+        ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile,
+    )
 
 
 if __name__ == "__main__":

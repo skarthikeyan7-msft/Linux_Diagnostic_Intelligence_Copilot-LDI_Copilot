@@ -8,14 +8,38 @@ LDI Copilot is built to analyze real customer Linux VM diagnostics (sosreport, s
 
 **LDI Copilot is a single-user, localhost-only tool by design** — not a shared, centrally-hosted service:
 - The server binds to `127.0.0.1` by default; nothing on your network can reach it unless you explicitly pass `--host 0.0.0.0` (or `.\run.ps1 -HostAddress 0.0.0.0` / `.\run.bat --host 0.0.0.0` / `./run.sh --host 0.0.0.0`), which is **strongly discouraged** for exactly this reason.
-- Job state (uploaded bundles, extracted files, analysis output) lives in-memory and under `backend/data/jobs/<id>/` **on the machine running the server** — there is no shared database, no multi-tenant job store, and no user accounts.
+- Job state (uploaded bundles, extracted files, analysis output) lives in-memory and under `backend/data/jobs/<id>/` **on the machine running the server** — there is no shared database, no multi-tenant job store, and no per-user accounts, regardless of the auth gate described below.
 
 **The recommended way to roll this out to your entire CSS team is for each engineer to clone the repo and run their own local instance on their own machine** (`.\run.ps1` / `.\run.bat` / `./run.sh`, whichever matches their shell — the tool runs on Windows, Linux, and macOS), the same way they'd run a local dev tool. This means:
 - No single point of failure or single repository of customer bundles across the team.
 - No new network-accessible attack surface — each instance is exactly as exposed as the engineer's own laptop already is.
 - No additional authentication/authorization system needs to be built or trusted, because there isn't a shared service to authenticate against.
 
-Do **not** deploy this as a shared server reachable by the team over a network. That would turn a "run it on your own machine" tool into an unauthenticated multi-tenant service holding multiple customers' diagnostic data — a fundamentally different (and much riskier) architecture that this codebase was not built for.
+This remains the recommended default. If your situation genuinely calls for one shared instance instead (e.g. a globally-distributed support team without per-engineer VMs), read "Running one shared instance instead" below — it is a materially different, riskier architecture, and the mitigations described there reduce but don't eliminate that risk.
+
+## Running one shared instance instead (if you can't avoid it)
+
+As of v4.3.0, if you do run a single instance reachable by more than one person, two independent controls are available and are turned on **automatically** the moment `--host` is anything other than a loopback address:
+
+- **A shared-secret auth gate** (`backend/auth.py`) — every request (every API route and the page itself, except `/api/health`) requires an HTTP Basic Auth credential. A random password is generated and printed once at startup unless you pass `--auth-token` yourself (to pin a stable one) or `--no-auth` (to disable the gate entirely - only if network-level access is already restricted, e.g. VPN-only). This is a single shared secret, not per-user accounts — anyone with the password has the exact same access as everyone else with it, including to every other person's uploaded bundles and generated reports on that instance.
+- **`--https`** — TLS via a self-signed certificate (auto-generated and reused under `certs/`, gitignored) or your own certificate via `--ssl-certfile`/`--ssl-keyfile`. Without this, a shared instance sends the auth password and every bundle/report over plain HTTP, readable by anyone positioned on the network path between a user and the server.
+
+**What this combination does and does not give you:**
+- ✅ Blocks a stranger who finds the address/port from reaching the tool or any data on it at all.
+- ✅ Encrypts traffic between each user and the server (with `--https`), so the shared password and bundle data aren't sent in the clear.
+- ❌ Does **not** give per-user isolation. Every authenticated user sees the exact same job list (`GET /api/jobs`) and can open, chat about, or delete any job on the instance — including bundles a different teammate uploaded. If your team analyzes different customers' data on the same shared instance, every team member with the password can see every customer's bundle.
+- ❌ Does **not** give audit logging, RBAC, or per-user rate limiting/quotas against a shared AI provider budget.
+- ❌ Is not a substitute for real network-layer controls. Combine it with a cloud firewall rule scoped to your team's known IP ranges/VPN CIDR (not `0.0.0.0/0`) whenever possible — the auth gate is a safety net behind that, not instead of it.
+
+If any of the ❌ items above are unacceptable for the customer engagements you support, go back to one-instance-per-engineer instead.
+
+Example for a globally-distributed team on one Azure VM, combining both controls with a firewall rule:
+```bash
+./run.sh --host 0.0.0.0 --https --auth-token "your-team-shared-password"
+```
+Then scope the cloud NSG/security group rule for that port to your team's IP ranges, and share the URL and password with your team over a channel you trust — never in a public ticket or chat.
+
+Do **not** run a shared instance with `--no-auth` unless network-level access is independently locked down (VPN-only, or a firewall rule scoped to known IPs) — without either the auth gate or a network restriction, this would be an unauthenticated multi-tenant service holding multiple customers' diagnostic data on the open internet.
 
 ## What data leaves the machine, and when
 
@@ -35,7 +59,7 @@ The interactive follow-up chat (Results → AI tab, "Ask a follow-up") continues
 As of v2.2.0, whenever a **non-local** provider is selected, LDI Copilot automatically redacts the evidence digest before sending it:
 - **Known hostnames/node names** (pulled from this analysis's own facts — e.g. the sosreport/supportconfig's captured hostname, or crm_report's detected cluster node names) are replaced with stable tokens (`HOST-1`, `HOST-2`, …).
 - **IPv4 addresses** are replaced with stable tokens (`IP-1`, `IP-2`, …), consistently per unique address, so the AI can still reason about repetition (e.g. "the same node appears in three unrelated log lines") without ever seeing the real identifier.
-- A **local-only legend** mapping each token back to its real value is shown in the activity terminal — this mapping is generated *after* redaction and is never part of the outbound request.
+- A **local-only legend** mapping each token back to its real value is shown in the activity terminal **and** (as of v4.3.0) in a dedicated callout on the Results page itself, right above the AI report — this mapping is generated *after* redaction, persists with the job so it's still visible after navigating away and back, and is never part of the outbound request.
 - The checkbox controlling this ("🔒 Redact known hostnames & IP addresses before sending") is **checked by default** whenever a non-local provider is selected, and hidden entirely for Ollama (nothing to redact — nothing leaves the machine).
 
 **Limitations — read before relying on this for genuinely sensitive engagements:**
@@ -84,7 +108,7 @@ The GitHub repository itself is private. To share it with your CSS team:
 Be clear-eyed about the gaps before treating this as a complete solution for handling regulated or highly sensitive customer data:
 - No encryption at rest for uploaded bundles or analysis output on disk.
 - No audit logging of who analyzed what, when.
-- No role-based access control, authentication, or multi-user support (by design — see "Recommended deployment model").
+- No role-based access control or per-user accounts/isolation — the optional shared-secret auth gate (v4.3.0+, see "Running one shared instance instead") blocks unauthenticated outsiders, but every authenticated user of a shared instance has identical access to every job on it, by design.
 - No data-loss-prevention (DLP) scanning beyond the hostname/IP redaction described above.
 - No formal compliance certification of any kind.
 
