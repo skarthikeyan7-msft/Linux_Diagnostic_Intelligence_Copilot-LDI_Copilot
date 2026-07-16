@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.0] - 2026-07-16
+
+### Added
+- **Stop scripts** (`stop.sh`/`stop.bat`/`stop.ps1`) - the counterpart to `run.sh`/`run.bat`/`run.ps1`, for stopping a server you can't just `Ctrl+C` (started detached/in the background, or in a window/session you're no longer attached to). Each one: (1) if the server responds, calls its own `POST /api/ollama/stop` first so any Ollama instance it's managing gets stopped too - reusing the exact same "only ever stop what we started" safeguard as the in-app Stop button; (2) finds whatever process is actually listening on the target port and verifies its command line looks like LDI Copilot (`app.py`/`uvicorn`) before stopping it, printing a warning and leaving it alone otherwise unless `--force`/`-Force` is passed; (3) optionally, with `--kill-ollama`/`-KillOllama`, force-stops every Ollama process on the machine regardless of who started it (off by default, mirroring the in-app Stop button's own conservative default).
+
+### Fixed
+- **`stop.sh` silently failed to actually stop anything when run via Git Bash on Windows** - caught during testing, before release. Three separate, compounding issues specific to Git Bash/MSYS2 (none of which affect real Linux/macOS/WSL, where the script worked correctly from the start):
+  1. None of `ss`/`lsof`/`fuser` exist in a default Git Bash install, so the port-to-PID lookup silently found nothing at all - fixed with a `netstat.exe`-based fallback (Windows' own netstat is reachable from Git Bash via PATH).
+  2. Git Bash's `ps` is a from-scratch reimplementation with no view into a real Windows process's actual command line, so the "does this look like our server" safety check always saw a blank command line and refused to proceed - fixed with a PowerShell/WMI (`Get-CimInstance Win32_Process`) fallback for reading it.
+  3. The most subtle one: MSYS bash's `kill`/`kill -0` builtins silently no-op on a genuine Windows PID that wasn't spawned from within that same MSYS process tree, rather than erroring - so the script went on to print "stopped" even though nothing had actually happened. Fixed by detecting that case (no corresponding `/proc/<pid>` entry) and falling back to `taskkill.exe`/`tasklist.exe` instead, which work correctly regardless of which subsystem started the target process - and setting `MSYS_NO_PATHCONV=1`, since Git Bash's automatic POSIX-to-Windows path conversion otherwise mangles bare `/PID`/`/FI` switches (e.g. rewriting `/PID` into a literal Windows path) before `taskkill.exe`/`tasklist.exe` ever see them.
+
+  Caught by genuinely running the script via Git Bash and checking the real process/port state afterward at each step, rather than trusting the script's own "Done - stopped" message - a good reminder that a script reporting success and a script actually having succeeded are two different claims worth verifying independently, especially when shelling out across a subsystem boundary like MSYS2/Git-Bash-on-Windows.
+
+Verified via live end-to-end runs of all three scripts against a real running server on Windows: PowerShell (`stop.ps1`) directly, Command Prompt (`stop.bat`, via a genuine interactive `cmd.exe` session), and bash (`stop.sh`, via Git Bash) - each covering the normal stop path, the "nothing running" idempotent case, the safety check correctly refusing to stop an unrelated process occupying the same port, and `--force`/`-Force` correctly overriding that refusal when passed.
+
 ## [4.5.0] - 2026-07-16
 
 ### Added
@@ -206,6 +221,7 @@ Verified via 23 automated checks (installer/pull generators for each OS branch a
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.6.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.6.0
 [4.5.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.5.0
 [4.4.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.4.0
 [4.3.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.3.0

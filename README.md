@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.5.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.6.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -35,7 +35,7 @@ Requirements: Python 3.10+ (uses only the standard library plus `dpkt` for the e
 | **Command Prompt (cmd.exe)** | `.\run.bat` |
 | **bash** (Linux, macOS, WSL, Git Bash) | `./run.sh` (first: `chmod +x run.sh`) |
 
-Stop any of them with `Ctrl+C`.
+Stop any of them with `Ctrl+C` (that's enough on its own - the sections below are for the less common case where you need to stop a server you started in another window/session, or one left running in the background).
 
 > **Command Prompt users:** always type `.\run.bat` (or `call run.bat`), not a bare `run.bat`. Many Windows machines — including Microsoft-managed corporate devices — have the `NoDefaultCurrentDirectoryInExePath` security policy enabled, which blocks cmd.exe from finding a bare `run.bat` in the current folder at all (`'run.bat' is not recognized...`) even when you're sitting right in this directory. The explicit `.\` prefix sidesteps that policy entirely and always works.
 
@@ -70,6 +70,33 @@ Options (same flags on every launcher, just spelled per that shell's own convent
 ```
 
 > **Cloud VM users (Azure/AWS/GCP):** never pass your VM's *public* IP to `--host`/`-HostAddress`. Cloud public IPs are NAT'd at the platform level and are never actually configured on the VM's own network interface, so the OS refuses to bind to it (`[Errno 99] Cannot assign requested address`) — this project detects and explains that specific case before it can happen. Bind to `0.0.0.0` (or leave the default `127.0.0.1`) instead - the public IP is only ever used from *outside* the VM to reach whatever's bound there. **Safer option:** don't expose the port at all - `ssh -L 8756:127.0.0.1:8756 user@your-vm-ip` and browse to `http://127.0.0.1:8756` on your own machine, keeping the default localhost-only bind and zero new attack surface. If you do need `--host 0.0.0.0`, also open the port in your cloud provider's firewall (Azure NSG / AWS security group / GCP firewall rule) scoped to your own IP specifically, not `0.0.0.0/0`, and see "Sharing with a team" below for the auth gate this project adds automatically in that case — see [SECURITY.md](SECURITY.md) before exposing this beyond localhost, especially with real customer bundle data.
+
+### Stopping the server
+
+`Ctrl+C` in the same window is always enough. If the server is running somewhere you can't `Ctrl+C` it from (a detached/background launch, an SSH session you've disconnected from, or you just don't remember which window it's in), use the matching stop script instead - same pattern as the run scripts, pick whichever matches your shell:
+
+| Shell | Command |
+|---|---|
+| **PowerShell** | `.\stop.ps1` |
+| **Command Prompt (cmd.exe)** | `.\stop.bat` |
+| **bash** | `./stop.sh` |
+
+Each one, in order:
+1. If the server responds at the given `--host`/`--port` (default `127.0.0.1:8756` - pass the same values you started it with if you customized either), asks it to stop any Ollama instance it's managing via its own API - this reuses the exact same safeguard as the in-app Stop button, so it only ever stops an Ollama instance LDI Copilot itself started, never an externally-running one (e.g. the Ollama desktop app).
+2. Finds whatever process is actually listening on that port and stops it - after first checking that the process genuinely looks like LDI Copilot's server (its command line mentions `app.py`/`uvicorn`). If something else altogether happens to be using that port, it warns and leaves that process alone rather than guessing; pass `--force` (`-Force` in PowerShell) if you're certain it's safe to stop anyway.
+
+Options:
+```powershell
+.\stop.ps1 -Port 9000          # match a non-default --port you started the server with
+.\stop.ps1 -Force              # also stop whatever's on that port even if it doesn't look like our server
+.\stop.ps1 -KillOllama         # also force-stop EVERY 'ollama serve' process on this machine, not just one this app manages
+```
+```bash
+./stop.sh --port 9000
+./stop.sh --force
+./stop.sh --kill-ollama
+```
+(`stop.bat` takes the same `--port`/`--force`/`--kill-ollama` flags as `stop.sh`.)
 
 ## Sharing with a team over the internet
 
