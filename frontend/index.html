@@ -19,8 +19,16 @@
       <span class="privacy-pill" title="This app runs entirely on your machine. Bundle data never leaves localhost unless you choose a cloud AI provider for synthesis.">🔒 Local-only</span>
       <span id="whoamiPill" class="whoami-pill hidden"></span>
       <button id="btnRecent" class="btn btn-ghost">Recent analyses</button>
+      <button id="btnStopProject" class="btn btn-ghost btn-danger" title="Stops the LDI Copilot server itself (and any Ollama instance it's managing) - in-app equivalent of stop.sh/stop.bat/stop.ps1">⏹ Stop project</button>
     </div>
   </header>
+
+  <div id="shutdownOverlay" class="modal-overlay hidden">
+    <div class="modal-card">
+      <h3>⏹ LDI Copilot has been stopped</h3>
+      <p>The server process has been shut down. You can close this browser tab now - reopening it or refreshing won't reconnect to anything, since nothing is listening anymore. Restart it from a terminal (<code>./run.sh</code> / <code>.\run.bat</code> / <code>.\run.ps1</code>) when you need it again.</p>
+    </div>
+  </div>
 
   <aside id="recentPanel" class="recent-panel hidden">
     <div class="recent-panel-head">
@@ -199,6 +207,14 @@
         <div class="tabs">
           <button class="tab-btn active" data-tab="ai">AI Root Cause Report</button>
           <button class="tab-btn" data-tab="performance">📊 Performance</button>
+          <button class="tab-btn" data-tab="crash">💥 Crash</button>
+          <button class="tab-btn" data-tab="boot">🥾 Boot</button>
+          <button class="tab-btn" data-tab="security">🛡️ Security</button>
+          <button class="tab-btn" data-tab="packages">📦 Packages</button>
+          <button class="tab-btn" data-tab="cascade">🔗 Cascade</button>
+          <button class="tab-btn" data-tab="containers">🐳 Containers</button>
+          <button class="tab-btn" data-tab="network">🌐 Network</button>
+          <button class="tab-btn" data-tab="osconfig">🐧 OS &amp; Config</button>
           <button class="tab-btn" data-tab="digest">Digest</button>
           <button class="tab-btn" data-tab="findings">Findings</button>
           <button class="tab-btn" data-tab="timeline">Timeline</button>
@@ -238,6 +254,18 @@
             <p class="muted small" id="perfSummaryNote"></p>
             <div class="chart-grid" id="chartGrid"></div>
           </div>
+        </div>
+
+        <div class="tab-panel hidden" id="tab-crash"><div id="factPanel-crash_analysis"></div></div>
+        <div class="tab-panel hidden" id="tab-boot"><div id="factPanel-boot_performance"></div></div>
+        <div class="tab-panel hidden" id="tab-security"><div id="factPanel-security_mac"></div></div>
+        <div class="tab-panel hidden" id="tab-packages"><div id="factPanel-package_drift"></div></div>
+        <div class="tab-panel hidden" id="tab-cascade"><div id="factPanel-systemd_cascade"></div></div>
+        <div class="tab-panel hidden" id="tab-containers"><div id="factPanel-container_logs"></div></div>
+        <div class="tab-panel hidden" id="tab-network"><div id="factPanel-network_capture"></div></div>
+        <div class="tab-panel hidden" id="tab-osconfig">
+          <div id="factPanel-os_knowledge"></div>
+          <div id="factPanel-config_anomalies"></div>
         </div>
 
         <div class="tab-panel hidden" id="tab-digest">

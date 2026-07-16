@@ -280,6 +280,8 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #071018; font-weight: 600; }
 .btn-primary:hover { background: #6bb4ff; }
 .btn-ghost { background: transparent; }
+.btn-danger { color: var(--critical); border-color: rgba(255, 84, 112, 0.35); }
+.btn-danger:hover { background: rgba(255, 84, 112, 0.12); border-color: var(--critical); }
 .btn-lg { padding: 12px 22px; font-size: 15px; margin-top: 8px; }
 .btn-sm { padding: 4px 8px; font-size: 12px; }
 
@@ -362,13 +364,33 @@ select option:disabled { color: #4a5163; font-style: italic; }
 .confidentiality-panel .checkbox-row { margin-bottom: 0; }
 .confidentiality-panel .checkbox-row + .checkbox-row { margin-top: 8px; }
 
-.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
 .tab-btn {
   background: transparent; border: none; color: var(--text-muted);
   padding: 10px 14px; cursor: pointer; font-size: 13.5px; border-bottom: 2px solid transparent;
 }
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
 .tab-panel { }
+
+.fact-panel-empty { color: var(--text-muted); font-style: italic; padding: 16px 0; }
+.fact-card {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.fact-card h4 { margin: 0 0 8px; font-size: 13.5px; }
+.fact-card table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.fact-card table th, .fact-card table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+.fact-card table th { color: var(--text-muted); font-weight: 500; }
+.fact-card pre { background: var(--bg-input); padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.fact-card a { color: var(--accent); }
+.fact-card ul { margin: 0; padding-left: 20px; font-size: 13px; }
+.fact-card ul li { margin-bottom: 6px; }
+.fact-kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 4px; }
+.fact-kv .kv-item .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .02em; }
+.fact-kv .kv-item .value { font-size: 14px; font-weight: 600; }
 
 .findings-toolbar { margin-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
 .findings-toolbar input[type="text"] { width: 100%; }
@@ -487,9 +509,27 @@ select option:disabled { color: #4a5163; font-style: italic; }
 }
 .chart-card h4 { margin: 0 0 4px; font-size: 13.5px; }
 .chart-card .chart-stats { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
-.chart-card canvas { width: 100%; height: 160px; display: block; }
+.chart-canvas-wrap { position: relative; }
+.chart-card canvas { width: 100%; height: 160px; display: block; cursor: crosshair; }
 .chart-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 11.5px; color: var(--text-muted); }
 .chart-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+.chart-tooltip {
+  position: absolute;
+  top: 0; left: 0;
+  transform: translate(0, 0);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  z-index: 5;
+}
+.chart-tooltip .tt-time { color: var(--text-muted); font-family: Consolas, monospace; margin-bottom: 2px; }
+.chart-tooltip .tt-row .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
 
 /* Interactive AI follow-up chat, below the generated report */
 .chat-section {

@@ -51,7 +51,7 @@ Do **not** run a shared instance with `--no-auth` unless network-level access is
 Nothing leaves the machine **except** the evidence digest sent to an AI provider for root-cause synthesis, and only when you explicitly click "Generate root-cause report" (or it auto-runs because you pre-filled AI settings before starting analysis):
 
 - **Ollama (local, fully offline) — the default provider as of v2.2.0.** The model runs on your own machine; the evidence digest never leaves it. If Ollama isn't already running, LDI Copilot starts it for you (`ollama serve`), visible in the activity terminal.
-- **OpenAI / Anthropic / Azure OpenAI** — the evidence digest (not the raw uploaded archive) is sent to that provider's API over HTTPS, for that one request. Credentials are used only for that request and are never written to disk unless you explicitly opt in to "Remember these settings on this device" (browser `localStorage` only).
+- **OpenAI / Anthropic / Azure OpenAI / Mistral AI / DeepSeek / GitHub Models (v4.7.0+)** — the evidence digest (not the raw uploaded archive) is sent to that provider's API over HTTPS, for that one request. Credentials are used only for that request and are never written to disk unless you explicitly opt in to "Remember these settings on this device" (browser `localStorage` only). GitHub Models is a single gateway that can route to several underlying model publishers (OpenAI, Meta, Microsoft, Mistral AI, DeepSeek, and more) through one GitHub personal access token — from a data-flow perspective it's still "your digest goes to one more API over HTTPS for one request," same as the others in this list.
 
 The raw uploaded archive itself is **never** sent anywhere — only the mechanically-produced Markdown digest (pattern-matched findings, structured fact-checks, a chronological timeline) is ever transmitted, and only to the provider you explicitly chose.
 
@@ -83,6 +83,13 @@ As of v4.0.0, you can optionally attach a standalone packet capture alongside a 
 
 If your organization's policy is stricter than "metadata only" for packet captures specifically, don't attach one — every other part of this tool works identically without it.
 
+## OS knowledge base and config-anomaly checks (v4.7.0+): no new network calls
+
+`backend/engine/os_knowledge.py` adds an OS/version knowledge base and a config-file anomaly scanner (see CHANGELOG.md for what these check). Both are **pure, offline, local parsing** with the same guarantees as every other mechanical analyzer:
+
+- The "known issues" and "official docs" reference links shown in the UI/digest are **hardcoded strings baked into this file at development time** (each one verified to resolve before being added) — the tool never fetches, pings, or validates them at analysis time, and never sends any bundle content to them. Clicking a link in the UI is the only way one of these URLs is ever actually requested, and that's a normal outbound browser navigation you control, not something LDI Copilot does on your behalf.
+- Both checks read only files already inside the bundle you provided (`/etc/os-release`, `sysctl.conf`, `corosync.conf`, etc.) and produce structured findings that flow into the same digest/redaction pipeline as every other analyzer above — no separate data path, no new destination.
+
 ## Installing Ollama itself (v4.5.0+): what runs, and only with your say-so
 
 If Ollama isn't installed yet, both the launcher scripts (`run.sh`/`run.bat`/`run.ps1`) and the browser's Ollama **Start** button (`backend/ai/ollama_manager.py`) can install it for you - but only after an explicit confirmation each time (a `[y/N]` prompt in the launcher, a confirm dialog in the browser), never automatically, and this choice is never remembered anywhere - declining once doesn't suppress being asked again later.
@@ -102,7 +109,7 @@ Before generating a report with any non-local provider, you must check **"I conf
 
 1. **Ollama (local, fully offline)** — nothing leaves the machine. The default provider as of v2.2.0. Best choice for any bundle you're not fully comfortable sending to a third party.
 2. **Azure OpenAI via Microsoft Entra ID, using your organization's own Azure tenant/subscription** — data is processed within your org's own governed Azure environment rather than a public consumer API. If your organization already has an approved Azure OpenAI deployment for handling customer-derived data, this is generally a better fit for CSS work than a personal API key with a public provider.
-3. **OpenAI / Anthropic public consumer APIs, or Azure OpenAI via a personal API key** — treat these as "public AI model" in every sense: only use them for customer data if your organization has explicitly cleared that practice, and use the redaction toggle every time.
+3. **OpenAI / Anthropic / Mistral AI / DeepSeek / GitHub Models public consumer APIs, or Azure OpenAI via a personal API key** — treat these as "public AI model" in every sense: only use them for customer data if your organization has explicitly cleared that practice, and use the redaction toggle every time.
 
 This ordering reflects data-locality and organizational-governance properties only — it is not a statement about model quality or accuracy for RCA purposes.
 

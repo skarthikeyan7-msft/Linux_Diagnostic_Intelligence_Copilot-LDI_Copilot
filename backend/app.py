@@ -53,7 +53,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="4.6.0")
+app = FastAPI(title="LDI Copilot", version="4.7.0")
 
 USERS_PATH = BASE_DIR / "backend" / "data" / "users.json"
 USER_STORE = UserStore(USERS_PATH)
@@ -774,6 +774,49 @@ def health():
     return {"status": "ok", "version": app.version}
 
 
+@app.post("/api/shutdown")
+def shutdown_endpoint():
+    """Stops the whole LDI Copilot server process itself - the in-app
+    equivalent of running stop.sh/stop.bat/stop.ps1 (see those scripts
+    for the out-of-process version, needed when the server isn't
+    reachable to ask nicely). Frontend gating: the "⏹ Stop Project"
+    topbar button always confirms via the same themed modal used for
+    the Ollama install flow before ever calling this - there is no
+    "undo" once this responds, so a stray click must not be enough to
+    take the server down.
+
+    Sequencing matters here: any Ollama instance this app is managing
+    is stopped first (mirrors stop.*'s own best-effort step, reusing
+    the exact same "never touch an externally-started instance"
+    safeguard in ollama_manager.stop_ollama()), then the actual process
+    exit is scheduled on a short delay on a background thread so this
+    response has time to actually reach the browser before the process
+    disappears - an immediate os._exit() here would race the response
+    write and could leave the frontend with nothing but a dropped
+    connection instead of a clean acknowledgement.
+
+    os._exit() (not sys.exit()) is deliberate: this is a synchronous
+    request handler running on uvicorn's event loop, and sys.exit()
+    there would only raise SystemExit inside a worker context asyncio
+    would just log and swallow - it would never actually stop the
+    process. os._exit() unconditionally terminates the process
+    immediately. This app has no buffered, not-yet-flushed state that
+    a normal interpreter shutdown would need to clean up (every job's
+    files are written as they're produced, not held in memory until
+    exit), so skipping normal interpreter teardown is safe here."""
+    try:
+        ollama_manager.stop_ollama()
+    except Exception:
+        pass  # best-effort - a stuck Ollama stop must never block the server from shutting down when asked to
+
+    def _delayed_exit():
+        time.sleep(0.4)
+        os._exit(0)
+
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+    return {"stopping": True}
+
+
 # Static frontend - mounted last so it acts as a catch-all fallback
 # behind the /api/* routes registered above (Starlette matches routes
 # in registration order).
@@ -927,8 +970,12 @@ def main():
             "Browsers will show a one-time trust warning (e.g. \"Your connection isn't\n"
             "private\") for it - this is expected for a self-signed cert; proceed past\n"
             "it (\"Advanced\" -> \"Continue\"), or supply a certificate your team already\n"
-            "trusts via --ssl-certfile/--ssl-keyfile instead. See README.md's HTTPS\n"
-            "section for details.\n"
+            "trusts via --ssl-certfile/--ssl-keyfile instead. To make the warning go away\n"
+            "permanently for Chrome/Edge (Safari/Chrome on macOS, most Linux distros'\n"
+            "Chrome), run .\\trust-cert.ps1 / .\\trust-cert.bat / ./trust-cert.sh once - it\n"
+            "trusts this exact certificate only, on this machine, for this user (never a\n"
+            "general-purpose CA). See README.md's HTTPS section for details, including\n"
+            "the separate manual step Firefox always needs.\n"
         )
     elif args.https:
         print(f"Using certificate {ssl_certfile} (key: {ssl_keyfile})\n")

@@ -1,11 +1,18 @@
 """
 Pluggable AI provider clients behind one common streaming chat interface.
 
-Supported providers: OpenAI, Anthropic (Claude), Azure OpenAI, and Ollama
-(local, fully offline). Each stream_xxx() function is a generator that
-yields plain-text chunks as they arrive from the provider, so the
-FastAPI layer can relay them to the browser via Server-Sent Events for
-a responsive "typing" UI instead of a long silent wait.
+Supported providers: OpenAI, Anthropic (Claude), Azure OpenAI, Mistral AI,
+DeepSeek, GitHub Models (a single gateway covering OpenAI/Meta/Microsoft/
+Mistral AI/DeepSeek/others behind one GitHub token), and Ollama (local,
+fully offline). Each stream_xxx() function is a generator that yields
+plain-text chunks as they arrive from the provider, so the FastAPI layer
+can relay them to the browser via Server-Sent Events for a responsive
+"typing" UI instead of a long silent wait.
+
+Mistral AI and DeepSeek both expose an OpenAI-SDK-compatible chat
+completions endpoint, so they're dispatched straight to stream_openai()
+with their own base_url rather than duplicating near-identical HTTP
+logic in dedicated functions - see stream_chat()'s dispatcher below.
 
 Azure OpenAI supports two authentication methods, modeled as
 "auth_types" in the PROVIDERS registry below:
@@ -221,6 +228,38 @@ def stream_ollama(model, messages, base_url="http://localhost:11434"):
     yield from _post_stream(url, headers, body, extract, timeout=600)  # local models on modest hardware can be slow
 
 
+def stream_github_models(token, model, messages):
+    """GitHub Models (https://docs.github.com/en/rest/models) - a single
+    gateway covering models from OpenAI, Meta (Llama), Microsoft (Phi),
+    Mistral AI, DeepSeek, and others, all behind one GitHub personal
+    access token (needs the `models: read` scope) rather than a
+    separate account/key per vendor. `model` must be in the catalog's
+    `{publisher}/{model_name}` ID format (e.g. "openai/gpt-4.1",
+    "meta/Llama-3.3-70B-Instruct") - see list_models_github() /
+    the "Check available models" button for the live, authoritative
+    list, since publisher-defined naming/casing can change.
+
+    Uses the personal (non-organization-attributed) inference endpoint;
+    response shape matches the same choices[].delta.content structure
+    as OpenAI's own streaming format, so this reuses the same
+    _post_stream() extractor pattern as stream_openai()."""
+    url = "https://models.github.ai/inference/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/vnd.github+json",
+    }
+
+    def extract(obj):
+        choices = obj.get("choices") or []
+        if not choices:
+            return None
+        return choices[0].get("delta", {}).get("content")
+
+    body = {"model": model, "messages": messages, "stream": True, "temperature": 0.2}
+    yield from _post_stream(url, headers, body, extract)
+
+
 def _get_json(url, headers=None, timeout=15):
     """GET url and parse the JSON response body. Raises ProviderError with
     a clean, human-readable message on any HTTP/network/timeout/parse
@@ -274,6 +313,31 @@ def list_models_ollama(base_url="http://localhost:11434"):
     return sorted(m["name"] for m in obj.get("models", []) if m.get("name"))
 
 
+def list_models_mistral(api_key):
+    """Live model list from Mistral AI's OpenAI-compatible Models API."""
+    obj = _get_json("https://api.mistral.ai/v1/models", {"Authorization": f"Bearer {api_key}"})
+    return sorted(m["id"] for m in obj.get("data", []) if m.get("id"))
+
+
+def list_models_deepseek(api_key):
+    """Live model list from DeepSeek's OpenAI-compatible Models API."""
+    obj = _get_json("https://api.deepseek.com/v1/models", {"Authorization": f"Bearer {api_key}"})
+    return sorted(m["id"] for m in obj.get("data", []) if m.get("id"))
+
+
+def list_models_github(token):
+    """Live catalog from GitHub Models (GET /catalog/models) - the
+    authoritative, always-current list across every publisher (OpenAI,
+    Meta, Microsoft, Mistral AI, DeepSeek, ...) behind this one gateway,
+    since the static KNOWN_MODELS seed below can't track every catalog
+    change/rename. Unlike the other list_models_* functions, the
+    response is a bare JSON array, not {"data": [...]}."""
+    obj = _get_json("https://models.github.ai/catalog/models", {
+        "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+    })
+    return sorted(m["id"] for m in obj if m.get("id"))
+
+
 def list_models(provider, **kwargs):
     """Best-effort live availability check dispatcher. Raises
     ProviderError on failure (network/auth/timeout/unsupported
@@ -287,6 +351,12 @@ def list_models(provider, **kwargs):
         return list_models_anthropic(kwargs["api_key"])
     elif provider == "ollama":
         return list_models_ollama(kwargs.get("base_url") or "http://localhost:11434")
+    elif provider == "mistral":
+        return list_models_mistral(kwargs["api_key"])
+    elif provider == "deepseek":
+        return list_models_deepseek(kwargs["api_key"])
+    elif provider == "github_models":
+        return list_models_github(kwargs["api_key"])
     else:
         raise ProviderError(f"live model listing is not supported for provider {provider!r} (Azure OpenAI deployment names are user-defined and can't be enumerated this way)")
 
@@ -313,6 +383,20 @@ KNOWN_MODELS = {
         "claude-3-7-sonnet-20250219", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
     ],
     "ollama": ["llama3.1", "llama3.2", "qwen2.5", "mistral", "phi3", "gemma2"],
+    "mistral": ["mistral-large-latest", "mistral-small-latest", "codestral-latest", "open-mistral-nemo", "ministral-8b-latest"],
+    "deepseek": ["deepseek-chat", "deepseek-reasoner"],
+    # {publisher}/{model_name} catalog IDs - GitHub Models' own naming
+    # convention (see stream_github_models()). A small, deliberately
+    # non-exhaustive seed spanning the vendors this project's users most
+    # often ask for (OpenAI, Meta, Microsoft, Mistral AI, DeepSeek) -
+    # "Check available models" pulls the full, authoritative, always-
+    # current catalog live rather than relying on this list to track
+    # every rename/addition.
+    "github_models": [
+        "openai/gpt-4.1", "openai/gpt-4o-mini",
+        "meta/Llama-3.3-70B-Instruct", "microsoft/Phi-4",
+        "mistral-ai/Mistral-Large-2411", "deepseek/DeepSeek-R1",
+    ],
 }
 
 PROVIDERS = {
@@ -367,6 +451,39 @@ PROVIDERS = {
         "model_hint": "your Azure OpenAI deployment name (not the base model name)",
         "local": False,
     },
+    "mistral": {
+        "label": "Mistral AI",
+        "auth_types": {
+            "api_key": {"label": "API Key", "fields": ["api_key", "model"]},
+        },
+        "default_auth_type": "api_key",
+        "default_model": "mistral-large-latest",
+        "model_hint": "e.g. mistral-large-latest, mistral-small-latest, codestral-latest",
+        "known_models": KNOWN_MODELS["mistral"],
+        "local": False,
+    },
+    "deepseek": {
+        "label": "DeepSeek",
+        "auth_types": {
+            "api_key": {"label": "API Key", "fields": ["api_key", "model"]},
+        },
+        "default_auth_type": "api_key",
+        "default_model": "deepseek-chat",
+        "model_hint": "deepseek-chat (general) or deepseek-reasoner (chain-of-thought)",
+        "known_models": KNOWN_MODELS["deepseek"],
+        "local": False,
+    },
+    "github_models": {
+        "label": "GitHub Models (OpenAI, Meta, Microsoft, Mistral AI, DeepSeek, and more via one token)",
+        "auth_types": {
+            "api_key": {"label": "Personal Access Token", "fields": ["api_key", "model"]},
+        },
+        "default_auth_type": "api_key",
+        "default_model": "openai/gpt-4o-mini",
+        "model_hint": "{publisher}/{model} catalog ID, e.g. openai/gpt-4.1, meta/Llama-3.3-70B-Instruct - use \"Check available models\" for the live catalog",
+        "known_models": KNOWN_MODELS["github_models"],
+        "local": False,
+    },
 }
 
 
@@ -392,5 +509,18 @@ def stream_chat(provider, messages, **kwargs):
             yield from stream_azure_openai(kwargs["endpoint"], kwargs["deployment"], messages, api_version, api_key=kwargs.get("api_key"))
     elif provider == "ollama":
         yield from stream_ollama(kwargs["model"], messages, kwargs.get("base_url") or "http://localhost:11434")
+    elif provider == "mistral":
+        # Mistral AI's chat-completions API is OpenAI-SDK-compatible
+        # (same request/response shape) - reuses stream_openai() with
+        # Mistral's own base URL rather than duplicating the same HTTP
+        # logic in a near-identical new function.
+        yield from stream_openai(kwargs["api_key"], kwargs["model"], messages, base_url="https://api.mistral.ai/v1")
+    elif provider == "deepseek":
+        # Same OpenAI-compatibility story as Mistral above - DeepSeek's
+        # own docs explicitly recommend pointing an OpenAI client at
+        # this base URL.
+        yield from stream_openai(kwargs["api_key"], kwargs["model"], messages, base_url="https://api.deepseek.com/v1")
+    elif provider == "github_models":
+        yield from stream_github_models(kwargs["api_key"], kwargs["model"], messages)
     else:
         raise ProviderError(f"unknown provider: {provider!r}")

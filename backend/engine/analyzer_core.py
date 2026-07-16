@@ -58,7 +58,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.6.0"
+__version__ = "4.7.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -877,7 +877,24 @@ def parse_user_datetime(s: str, end_of_day: bool = False):
 
 def try_parse_full_date(text: str):
     text = re.sub(r"\s+", " ", text.strip())
-    candidates = [text, re.sub(r"\s+[A-Z]{2,5}\s+(\d{4})$", r" \1", text)]
+    # Strip a trailing timezone-abbreviation-like token before parsing,
+    # regardless of whether it appears at the very end ("... 15:22:10
+    # IST") or before a trailing year ("... 15:22:10 IST 2026") - the
+    # two real orderings `rpm -qa --last`/`zypper` output actually uses.
+    # Python's %Z directive only reliably recognizes "UTC"/"GMT" (and
+    # inconsistently, the machine's OWN configured local abbreviation) -
+    # verified directly: strptime("...IST", "%a %d %b %Y %H:%M:%S %Z")
+    # raises ValueError even though the string is perfectly well-formed.
+    # Any real customer server using a non-UTC/GMT abbreviation (IST,
+    # EST, PST, CST, JST, ... - the overwhelmingly common real-world
+    # case) would otherwise silently fail here, producing ZERO dated
+    # package-drift results even from a file full of them. Nothing
+    # downstream needs genuine timezone-aware arithmetic (every
+    # comparison is against another naive timestamp from the SAME
+    # bundle), so the abbreviation is discarded rather than converted -
+    # it's only used to recognize where to cut the string.
+    tz_stripped = re.sub(r"\s+[A-Za-z]{2,5}(\s+\d{4})?\s*$", r"\1", text)
+    candidates = [text, tz_stripped, re.sub(r"\s+[A-Z]{2,5}\s+(\d{4})$", r" \1", text)]
     fmts = [
         "%a %b %d %H:%M:%S %Z %Y", "%a %b %d %H:%M:%S %Y",
         "%a %d %b %Y %H:%M:%S %Z", "%a %d %b %Y %H:%M:%S",
@@ -2067,6 +2084,35 @@ def run_structured_checks(root, kind, inventory):
     except Exception as e:
         facts["container_logs_error"] = str(e)
 
+    # --- v4.7.0: OS/version knowledge base + config-file anomaly detection.
+    # os_knowledge.py is imported the same sys.path-safe way as
+    # pcap_analyzer.py below (this file supports being run both as a
+    # standalone script and as part of the engine package).
+    os_kb = None
+    _build_os_knowledge = _check_config_anomalies = None
+    try:
+        _engine_dir = str(Path(__file__).resolve().parent)
+        if _engine_dir not in sys.path:
+            sys.path.insert(0, _engine_dir)
+        from os_knowledge import build_os_knowledge as _build_os_knowledge, check_config_anomalies as _check_config_anomalies
+    except Exception as e:
+        facts["os_knowledge_error"] = str(e)
+    if _build_os_knowledge:
+        try:
+            os_kb = _build_os_knowledge(root, kind, inventory, find_inventory, get_text, extract_supportconfig_section)
+            if os_kb:
+                facts["os_knowledge"] = os_kb
+        except Exception as e:
+            facts["os_knowledge_error"] = str(e)
+    if _check_config_anomalies:
+        try:
+            facts["config_anomalies"] = _check_config_anomalies(
+                root, kind, inventory, find_inventory, get_text, extract_supportconfig_section,
+                security_mac=facts.get("security_mac"), os_detected=(os_kb or {}).get("detected"),
+            )
+        except Exception as e:
+            facts["config_anomalies_error"] = str(e)
+
     return facts
 
 
@@ -2139,6 +2185,42 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
             lines.append(f"- **{k}:** {v}")
         if facts.get("capture_date_raw"):
             lines.append(f"- **capture_date:** {facts['capture_date_raw']}")
+        lines.append("")
+
+    os_kb = facts.get("os_knowledge") or {}
+    if os_kb:
+        det = os_kb.get("detected", {})
+        lines.append("## 🐧 OS Knowledge")
+        lines.append(f"- **Detected:** {det.get('pretty_name') or det.get('name') or '?'} — {os_kb.get('family_label', '?')}" + (f" (source: `{os_kb['source_file']}`)" if os_kb.get("source_file") else ""))
+        if os_kb.get("lifecycle_hint"):
+            lines.append(f"- **Support lifecycle:** {os_kb['lifecycle_hint']}")
+        if os_kb.get("docs_hub_link"):
+            lines.append(f"- **Official docs for this version:** {os_kb['docs_hub_link']}")
+        if os_kb.get("cve_search_link"):
+            lines.append(f"- **Vendor security-advisory/CVE search:** {os_kb['cve_search_link']}")
+        if os_kb.get("version_notes"):
+            lines.append("- **What's different about this major version (quick orientation, not exhaustive):**")
+            for note in os_kb["version_notes"]:
+                lines.append(f"  - {note}")
+        if os_kb.get("known_issues"):
+            lines.append(f"- ⚠️ **{len(os_kb['known_issues'])} known version-specific item(s) worth checking against this bundle:**")
+            for ki in os_kb["known_issues"]:
+                lines.append(f"  - **{ki['title']}** — {ki['detail']}" + (f" ({ki['doc_link']})" if ki.get("doc_link") else ""))
+        lines.append("")
+
+    cfg = facts.get("config_anomalies") or {}
+    if cfg.get("anomalies"):
+        lines.append("## ⚙️ Configuration File Anomalies")
+        lines.append(f"_Checked {len(cfg.get('files_checked', []))} configuration file(s) present in this bundle against a fixed set of known-risky/known-inconsistent settings — not an exhaustive audit, but a fast pass over the files that most often matter for support cases._")
+        lines.append("")
+        for a in cfg["anomalies"]:
+            marker = "⚠️" if a["severity"] == "WARNING" else "ℹ️"
+            lines.append(f"- {marker} **[{a['severity']}]** `{a['file']}` — **{a['title']}**")
+            lines.append(f"  - {a['detail']}" + (f" ({a['doc_link']})" if a.get("doc_link") else ""))
+        lines.append("")
+    elif cfg.get("files_checked"):
+        lines.append("## ⚙️ Configuration File Anomalies")
+        lines.append(f"_Checked {len(cfg['files_checked'])} configuration file(s) present in this bundle ({', '.join('`'+f+'`' for f in cfg['files_checked'][:10])}) — no anomalies found among the fixed set of known-risky/known-inconsistent settings this project currently checks for._")
         lines.append("")
 
     if kind == "crm_report":

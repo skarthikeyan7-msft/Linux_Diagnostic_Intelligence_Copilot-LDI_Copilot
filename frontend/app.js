@@ -235,6 +235,35 @@ function showConfirmModal(title, body, confirmLabel) {
 }
 
 // --------------------------------------------------------------------------
+// Stop the whole server (topbar "⏹ Stop project" button) - the in-app
+// equivalent of running stop.sh/stop.bat/stop.ps1. Always confirms first
+// (this has no undo - any in-progress analysis is lost, and the page
+// becomes unusable afterward) via the same themed modal used for the
+// Ollama install flow above.
+// --------------------------------------------------------------------------
+async function stopProject() {
+  const confirmed = await showConfirmModal(
+    "Stop LDI Copilot?",
+    "This shuts down the server process itself (and any Ollama instance it's managing) - not just this browser tab. Any analysis currently in progress will be lost. You'll need to restart it from a terminal (run.sh/run.bat/run.ps1) to use it again.",
+    "Stop project",
+  );
+  if (!confirmed) return;
+
+  logTerminal("⏹ Stopping the server…", "info");
+  try {
+    await fetch("/api/shutdown", { method: "POST" });
+  } catch {
+    // Expected: the connection drops mid-response as the process exits
+    // right after sending it - not a failure from the user's point of
+    // view, so this is deliberately swallowed rather than shown as an
+    // error. Either way, show the "stopped" overlay below.
+  }
+  $("shutdownOverlay").classList.remove("hidden");
+  if (state.ollamaPollTimer) clearInterval(state.ollamaPollTimer);
+  if (state.pollTimer) clearInterval(state.pollTimer);
+}
+
+// --------------------------------------------------------------------------
 // Ollama lifecycle control - the terminal's toolbar (status badge +
 // Start/Stop/Refresh) gives direct manual control, and runSynthesis()
 // calls ensureOllamaRunning() automatically whenever Ollama is the
@@ -668,6 +697,7 @@ async function loadResults(jobIdOverride) {
   renderFindings(findings);
   renderTimeline(timeline);
   loadSarSeries(jobId);
+  renderFactPanels(facts);
 
   // Reset AI tab for the (possibly new) job
   $("aiRender").innerHTML = "";
@@ -847,6 +877,251 @@ function renderFindings(findings) {
 // --------------------------------------------------------------------------
 // Timeline tab
 // --------------------------------------------------------------------------
+// Dedicated Results tabs for each of the 8 always-on analyzer categories
+// (💥 Crash, 🥾 Boot, 🛡️ Security, 📦 Packages, 🔗 Cascade, 🐳 Containers,
+// 🌐 Network - SAR/Performance has its own richer chart-based tab above).
+// Every category runs unconditionally on every analysis (see
+// backend/engine/analyzer_core.py's run_structured_checks()) - these
+// panels exist purely to surface whatever it found (or didn't) directly
+// in the UI, rather than only inside the Digest/AI report text. Each
+// renderer shares the same "nothing found" fallback wording so it's
+// never ambiguous whether an empty tab means "no problem detected" vs.
+// "this broke."
+// --------------------------------------------------------------------------
+const NO_FACT_DATA_MSG = "No relevant data found from the sosreport or supportconfig.";
+
+function factPanelEmpty(msg) {
+  return `<p class="fact-panel-empty">${escapeHtml(msg || NO_FACT_DATA_MSG)}</p>`;
+}
+
+function factCard(title, bodyHtml) {
+  return `<div class="fact-card"><h4>${escapeHtml(title)}</h4>${bodyHtml}</div>`;
+}
+
+function factKv(pairs) {
+  const items = pairs.filter(([, v]) => v !== undefined && v !== null && v !== "");
+  if (!items.length) return "";
+  return `<div class="fact-kv">${items.map(([label, value]) => `<div class="kv-item"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(String(value))}</div></div>`).join("")}</div>`;
+}
+
+function factTable(headers, rows) {
+  if (!rows.length) return "";
+  const thead = `<tr>${headers.map((h) => `<th>${escapeHtml(h)}</th>`).join("")}</tr>`;
+  const tbody = rows.map((r) => `<tr>${r.map((c) => `<td>${escapeHtml(String(c ?? ""))}</td>`).join("")}</tr>`).join("");
+  return `<table>${thead}${tbody}</table>`;
+}
+
+function factLink(url, label) {
+  if (!url) return "";
+  return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label || url)}</a>`;
+}
+
+function renderCrashPanel(crash) {
+  if (!crash || Object.keys(crash).length === 0) return factPanelEmpty();
+  let html = "";
+  if (crash.abrt_reports && crash.abrt_reports.length) {
+    html += crash.abrt_reports.map((r) => factCard(
+      `ABRT crash report — ${r.executable || r.dir}`,
+      factKv([["Crash time", r.crash_time], ["Reason", r.reason], ["Command line", r.cmdline], ["UID", r.uid], ["Directory", r.dir]])
+      + (r.backtrace ? `<pre>${escapeHtml(r.backtrace)}</pre>` : ""),
+    )).join("");
+  }
+  if (crash.vmcore_files && crash.vmcore_files.length) {
+    html += factCard("Kernel vmcore files", factTable(["Path", "Size"], crash.vmcore_files.map((v) => [v.path, v.size_human])));
+  }
+  if (crash.kdump_configured !== undefined) {
+    html += factCard("kdump configuration", factKv([["Configured", crash.kdump_configured ? "Yes" : "No"], ["Path", crash.kdump_path]]));
+  }
+  if (crash.kernel_oops_signature_count) {
+    html += factCard("Kernel oops/panic signatures", factKv([["Count found in dmesg/kernel log", crash.kernel_oops_signature_count]]));
+  }
+  return html || factPanelEmpty();
+}
+
+function renderBootPanel(boot) {
+  if (!boot || Object.keys(boot).length === 0) return factPanelEmpty();
+  let html = "";
+  if (boot.startup_breakdown_raw || boot.total_boot_seconds !== undefined) {
+    html += factCard("Startup breakdown", factKv([["Raw systemd-analyze output", boot.startup_breakdown_raw], ["Total boot time (s)", boot.total_boot_seconds]]));
+  }
+  if (boot.slowest_units && boot.slowest_units.length) {
+    html += factCard("Slowest units", factTable(["Unit", "Seconds"], boot.slowest_units.map((u) => [u.unit, u.seconds])));
+  }
+  if (boot.critical_chain_raw) {
+    html += factCard("Critical chain", `<pre>${escapeHtml(boot.critical_chain_raw)}</pre>`);
+  }
+  return html || factPanelEmpty();
+}
+
+function renderSecurityPanel(sec) {
+  if (!sec || Object.keys(sec).length === 0) return factPanelEmpty();
+  let html = "";
+  if (sec.selinux_status || sec.selinux_mode) {
+    html += factCard("SELinux status", factKv([["Status", sec.selinux_status], ["Mode", sec.selinux_mode]]));
+  }
+  if (sec.apparmor_profiles_enforce !== undefined || sec.apparmor_profiles_complain !== undefined) {
+    html += factCard("AppArmor status", factKv([["Profiles in enforce mode", sec.apparmor_profiles_enforce], ["Profiles in complain mode", sec.apparmor_profiles_complain]]));
+  }
+  if (sec.selinux_top_denials && sec.selinux_top_denials.length) {
+    html += factCard(`SELinux denials (${sec.selinux_denial_total} total)`, factTable(
+      ["Source context", "Target context", "Class", "Count"],
+      sec.selinux_top_denials.map((d) => [d.scontext, d.tcontext, d.tclass, d.count]),
+    ));
+  }
+  if (sec.apparmor_top_denials && sec.apparmor_top_denials.length) {
+    html += factCard(`AppArmor denials (${sec.apparmor_denial_total} total)`, factTable(
+      ["Profile", "Operation", "Count"],
+      sec.apparmor_top_denials.map((d) => [d.profile, d.operation, d.count]),
+    ));
+  }
+  return html || factPanelEmpty();
+}
+
+function renderPackagesPanel(pkg) {
+  if (!pkg || Object.keys(pkg).length === 0) return factPanelEmpty();
+  let html = "";
+  html += factCard("Package change summary", factKv([
+    ["Total dated packages found", pkg.total_dated_packages],
+    ["Most recent change", pkg.most_recent_change ? `${pkg.most_recent_change.package} (${pkg.most_recent_change.when})` : null],
+    ["Changes in the 7 days before capture", pkg.recent_changes_7d_count],
+  ]));
+  if (pkg.recent_changes_7d && pkg.recent_changes_7d.length) {
+    html += factCard("Changed in the 7 days before capture", factTable(
+      ["Package", "When", "Action"],
+      pkg.recent_changes_7d.map((c) => [c.package, c.when, c.action]),
+    ));
+  }
+  return html || factPanelEmpty();
+}
+
+function renderCascadePanel(cascade) {
+  if (!cascade || Object.keys(cascade).length === 0) return factPanelEmpty();
+  let html = "";
+  if (cascade.cascade_events_found) {
+    html += factCard("Cascade events found", factKv([["Total dependency-failure/OnFailure/unit-failed events", cascade.cascade_events_found]]));
+  }
+  if (cascade.cascades && cascade.cascades.length) {
+    html += cascade.cascades.map((c) => factCard(
+      `Cascade: ${c.likely_trigger} → ${c.cascaded_units.length} unit(s)`,
+      factKv([["Start", c.start_ts], ["End", c.end_ts], ["Likely trigger", c.likely_trigger]])
+      + `<p class="muted small">Cascaded units: ${c.cascaded_units.map(escapeHtml).join(", ")}</p>`,
+    )).join("");
+  }
+  if (cascade.dependency_failures_untimed && cascade.dependency_failures_untimed.length) {
+    html += factCard("Dependency failures (no timestamp available)", `<p class="muted small">${cascade.dependency_failures_untimed.map(escapeHtml).join(", ")}</p>`);
+  }
+  return html || factPanelEmpty();
+}
+
+function renderContainersPanel(containers) {
+  if (!containers || Object.keys(containers).length === 0) return factPanelEmpty();
+  let html = "";
+  if (containers.total_containers_seen) {
+    html += factCard("Container summary", factKv([["Total containers seen", containers.total_containers_seen]]));
+  }
+  if (containers.exited_nonzero && containers.exited_nonzero.length) {
+    html += factCard("Exited with non-zero code", factTable(
+      ["Name", "Exit code", "Note"],
+      containers.exited_nonzero.map((c) => [c.name, c.exit_code, c.note]),
+    ));
+  }
+  if (containers.currently_restarting && containers.currently_restarting.length) {
+    html += factCard("Currently restart-looping", factTable(
+      ["Name", "Exit code"],
+      containers.currently_restarting.map((c) => [c.name, c.exit_code]),
+    ));
+  }
+  return html || factPanelEmpty();
+}
+
+function renderNetworkPanel(net) {
+  if (!net || Object.keys(net).length === 0) {
+    return factPanelEmpty("No relevant data found from the sosreport or supportconfig. (Network capture is not part of a standard sosreport/supportconfig bundle — attach a .pcap/.pcapng file in Step 1 to enable this analysis.)");
+  }
+  if (net.error) return factPanelEmpty(net.error);
+  let html = factCard("Capture summary", factKv([
+    ["Total packets", net.total_packets], ["Total bytes", net.total_bytes_human],
+    ["Duration (s)", net.duration_seconds], ["Packets/sec", net.packets_per_second],
+    ["Possible port-scan pattern", net.possible_port_scan_pattern ? "Yes — worth a look" : "No"],
+  ]));
+  if (net.protocol_counts) {
+    html += factCard("Protocol mix", factTable(["Protocol", "Packets"], Object.entries(net.protocol_counts)));
+  }
+  if (net.top_talkers && net.top_talkers.length) {
+    html += factCard("Top talkers", factTable(["Source", "Destination", "Bytes"], net.top_talkers.map((t) => [t.src, t.dst, t.bytes_human])));
+  }
+  html += factCard("TCP anomaly counts", factKv([
+    ["SYN", net.tcp_syn], ["SYN-ACK", net.tcp_synack], ["RST", net.tcp_reset], ["Suspected retransmits", net.tcp_retransmits_suspected],
+  ]));
+  if (net.dns_top_queries && net.dns_top_queries.length) {
+    html += factCard("Top DNS queries", factTable(["Query", "Count"], net.dns_top_queries.map((q) => [q.qname, q.count])));
+  }
+  return html;
+}
+
+function renderOsKnowledgePanel(osk) {
+  if (!osk || Object.keys(osk).length === 0) {
+    return factPanelEmpty("No relevant data found from the sosreport or supportconfig. (No OS-release identification file — /etc/os-release, /etc/redhat-release, or the supportconfig equivalent — could be found or parsed in this bundle.)");
+  }
+  const det = osk.detected || {};
+  const links = [
+    osk.docs_hub_link ? factLink(osk.docs_hub_link, "Official docs for this version") : "",
+    osk.cve_search_link ? factLink(osk.cve_search_link, "Vendor security-advisory / CVE search") : "",
+  ].filter(Boolean).join("  ·  ");
+  let html = factCard("Detected OS", factKv([
+    ["Name", det.pretty_name || det.name],
+    ["Family", osk.family_label],
+    ["Version", det.version],
+    ["Identified from", osk.source_file],
+  ]) + (osk.lifecycle_hint ? `<p class="muted small" style="margin-top:8px">🕒 ${escapeHtml(osk.lifecycle_hint)}</p>` : "")
+    + (links ? `<p class="muted small">${links}</p>` : ""));
+
+  if (osk.version_notes && osk.version_notes.length) {
+    html += factCard("What's different about this major version (quick orientation, not exhaustive)", `<ul>${osk.version_notes.map((n) => `<li>${escapeHtml(n)}</li>`).join("")}</ul>`);
+  }
+  if (osk.known_issues && osk.known_issues.length) {
+    html += osk.known_issues.map((ki) => factCard(
+      `⚠️ ${ki.title}`,
+      `<p>${escapeHtml(ki.detail)}</p>` + (ki.doc_link ? `<p class="muted small">${factLink(ki.doc_link, "Reference")}</p>` : ""),
+    )).join("");
+  }
+  return html;
+}
+
+function renderConfigAnomaliesPanel(cfg) {
+  if (!cfg || (!(cfg.anomalies || []).length && !(cfg.files_checked || []).length)) {
+    return factPanelEmpty("No relevant data found from the sosreport or supportconfig. (None of the configuration files this project currently checks — sysctl, limits.conf, fstab, corosync.conf, multipath.conf, chrony/ntp.conf, resolv.conf, selinux config — were found in this bundle.)");
+  }
+  let html = "";
+  if (cfg.anomalies && cfg.anomalies.length) {
+    html += cfg.anomalies.map((a) => factCard(
+      a.title,
+      `<span class="sev-badge sev-${a.severity}">${escapeHtml(a.severity)}</span><span class="muted small">${escapeHtml(a.file)}</span>`
+      + `<p style="margin-top:8px">${escapeHtml(a.detail)}</p>`
+      + (a.doc_link ? `<p class="muted small">${factLink(a.doc_link, "Reference")}</p>` : ""),
+    )).join("");
+  } else {
+    html += factCard("Result", `<p>✅ Checked ${cfg.files_checked.length} configuration file(s) present in this bundle — no anomalies found among the known-risky/known-inconsistent settings this project currently checks for.</p>`);
+  }
+  if (cfg.files_checked && cfg.files_checked.length) {
+    html += factCard("Files checked", `<p class="muted small">${cfg.files_checked.map((f) => escapeHtml(f)).join(", ")}</p>`);
+  }
+  return html;
+}
+
+function renderFactPanels(facts) {
+  $("factPanel-crash_analysis").innerHTML = renderCrashPanel(facts.crash_analysis);
+  $("factPanel-boot_performance").innerHTML = renderBootPanel(facts.boot_performance);
+  $("factPanel-security_mac").innerHTML = renderSecurityPanel(facts.security_mac);
+  $("factPanel-package_drift").innerHTML = renderPackagesPanel(facts.package_drift);
+  $("factPanel-systemd_cascade").innerHTML = renderCascadePanel(facts.systemd_cascade);
+  $("factPanel-container_logs").innerHTML = renderContainersPanel(facts.container_logs);
+  $("factPanel-network_capture").innerHTML = renderNetworkPanel(facts.network_capture);
+  $("factPanel-os_knowledge").innerHTML = renderOsKnowledgePanel(facts.os_knowledge);
+  $("factPanel-config_anomalies").innerHTML = renderConfigAnomaliesPanel(facts.config_anomalies);
+}
+
+// --------------------------------------------------------------------------
 function renderTimeline(timeline) {
   if (!timeline.length) {
     $("timelineList").innerHTML = '<p class="muted">No dated CRITICAL/high-signal events were found to place on a timeline.</p>';
@@ -872,10 +1147,14 @@ const CHART_COLORS = ["#4da3ff", "#f2c94c", "#6fcf97", "#ff5470", "#bb86fc", "#f
 
 // Draws one or more named value-series (each an array of {ts, value})
 // sharing a single time axis onto `canvas`, auto-scaling both axes.
-// Deliberately simple (no zoom/pan/tooltips) - this is a diagnostic
-// glance, not a full charting library; findings.json/facts.json retain
-// the exact numbers for anything requiring precision.
-function drawLineChart(canvas, namedSeries) {
+// Optional `hoverT` (an x-axis timestamp) draws a crosshair + a marker dot
+// on the nearest point of every series and returns that hover info so the
+// caller (buildChartCard's mousemove handler) can render a text tooltip;
+// omit it (or pass null) for a plain static draw. The computed axis layout
+// is stashed on the canvas element itself so the mousemove handler can
+// convert a raw pixel position back into a timestamp without redoing all
+// the min/max/scale math on every mouse event.
+function drawLineChart(canvas, namedSeries, hoverT) {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
   const w = Math.max(rect.width, 300);
@@ -891,7 +1170,8 @@ function drawLineChart(canvas, namedSeries) {
     ctx.fillStyle = "#8b94a7";
     ctx.font = "12px sans-serif";
     ctx.fillText("No data points", 10, h / 2);
-    return;
+    canvas._chartLayout = null;
+    return null;
   }
   const padL = 46, padR = 10, padT = 10, padB = 22;
   const plotW = w - padL - padR;
@@ -906,6 +1186,13 @@ function drawLineChart(canvas, namedSeries) {
 
   const xOf = (t) => padL + (xMax === xMin ? 0 : ((t - xMin) / (xMax - xMin)) * plotW);
   const yOf = (v) => padT + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+
+  // Stashed so the mousemove handler in buildChartCard() can convert a raw
+  // canvas-relative pixel position back into a timestamp/plot-area test
+  // without duplicating this layout math (and without going stale, since
+  // this is rewritten on every draw - including the tab-activation redraw
+  // that fixes up charts first drawn while their tab was still hidden).
+  canvas._chartLayout = { padL, padR, padT, padB, w, h, plotW, plotH, xMin, xMax, yMin, yMax };
 
   // Gridlines + y-axis labels (4 bands)
   ctx.strokeStyle = "#2a313f";
@@ -940,6 +1227,47 @@ function drawLineChart(canvas, namedSeries) {
     });
     ctx.stroke();
   });
+
+  if (hoverT == null) return null;
+
+  // Hover pass: nearest point per series (by timestamp) gets a filled dot;
+  // a dashed vertical crosshair marks the hovered x position. Returned so
+  // the caller can render a text tooltip alongside it.
+  const hoverInfo = { t: hoverT, x: xOf(hoverT), items: [] };
+  namedSeries.forEach((s, idx) => {
+    if (!s.points.length) return;
+    let nearest = s.points[0];
+    let bestDiff = Math.abs(nearest.t - hoverT);
+    for (const p of s.points) {
+      const diff = Math.abs(p.t - hoverT);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        nearest = p;
+      }
+    }
+    const color = s.color || CHART_COLORS[idx % CHART_COLORS.length];
+    const mx = xOf(nearest.t), my = yOf(nearest.v);
+    ctx.beginPath();
+    ctx.arc(mx, my, 3.4, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(mx, my, 3.4, 0, Math.PI * 2);
+    ctx.strokeStyle = "#0e1117";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    hoverInfo.items.push({ label: s.label, color, v: nearest.v, t: nearest.t });
+  });
+  ctx.save();
+  ctx.setLineDash([3, 3]);
+  ctx.strokeStyle = "#c7ccd6";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(hoverInfo.x, padT);
+  ctx.lineTo(hoverInfo.x, padT + plotH);
+  ctx.stroke();
+  ctx.restore();
+  return hoverInfo;
 }
 
 // facts.json timestamps from the engine are naive VM-local wall-clock
@@ -955,14 +1283,73 @@ function seriesPoints(rows, valueKey, filter) {
     .filter((p) => Number.isFinite(p.t));
 }
 
+// Full HH:MM:SS (vs. the axis labels' HH:MM) for the hover tooltip's time
+// line - same "treat as UTC" convention as drawLineChart's fmtT, so it
+// matches the VM-local wall clock printed by `sar` on the analyzed host.
+function fmtFullTime(t) {
+  const d = new Date(t);
+  return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}:${String(d.getUTCSeconds()).padStart(2, "0")}`;
+}
+
+// Rounds to 2 decimal places without forcing trailing zeros, so a hovered
+// value reads "45.2" or "100" rather than "45.20"/"100.00".
+function formatChartValue(v) {
+  return Number.isFinite(v) ? String(Math.round(v * 100) / 100) : String(v);
+}
+
 function buildChartCard(title, statsText, namedSeries) {
   const card = document.createElement("div");
   card.className = "chart-card";
   const legend = namedSeries
     .map((s, i) => `<span><span class="swatch" style="background:${s.color || CHART_COLORS[i % CHART_COLORS.length]}"></span>${escapeHtml(s.label)}</span>`)
     .join("");
-  card.innerHTML = `<h4>${escapeHtml(title)}</h4><div class="chart-stats">${escapeHtml(statsText)}</div><canvas></canvas><div class="chart-legend">${legend}</div>`;
-  requestAnimationFrame(() => drawLineChart(card.querySelector("canvas"), namedSeries));
+  card.innerHTML = `<h4>${escapeHtml(title)}</h4><div class="chart-stats">${escapeHtml(statsText)}</div><div class="chart-canvas-wrap"><canvas></canvas><div class="chart-tooltip hidden"></div></div><div class="chart-legend">${legend}</div>`;
+  const canvas = card.querySelector("canvas");
+  const tooltip = card.querySelector(".chart-tooltip");
+  // Read back by activateTab()'s redraw-on-activate fix, since the very
+  // first draw below can happen while the Performance tab (and therefore
+  // this canvas's real width) is still hidden - see drawLineChart's comment.
+  canvas._namedSeries = namedSeries;
+  requestAnimationFrame(() => drawLineChart(canvas, namedSeries));
+
+  const hideHover = () => {
+    tooltip.classList.add("hidden");
+    drawLineChart(canvas, namedSeries);
+  };
+  canvas.addEventListener("mousemove", (ev) => {
+    const layout = canvas._chartLayout;
+    if (!layout) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+    if (mx < layout.padL || mx > layout.w - layout.padR || layout.plotW <= 0) {
+      hideHover();
+      return;
+    }
+    const hoverT = layout.xMin + ((mx - layout.padL) / layout.plotW) * (layout.xMax - layout.xMin);
+    const info = drawLineChart(canvas, namedSeries, hoverT);
+    if (!info || !info.items.length) {
+      tooltip.classList.add("hidden");
+      return;
+    }
+    tooltip.innerHTML =
+      `<div class="tt-time">${fmtFullTime(info.items[0].t)}</div>` +
+      info.items
+        .map((it) => `<div class="tt-row"><span class="swatch" style="background:${it.color}"></span>${escapeHtml(it.label)}: <strong>${formatChartValue(it.v)}</strong></div>`)
+        .join("");
+    tooltip.classList.remove("hidden");
+    // Position near the cursor, measured after the content above is set so
+    // offsetWidth/Height reflect the tooltip's real rendered size; flips to
+    // the left/below once it would overflow the canvas's right/top edge.
+    const ttW = tooltip.offsetWidth, ttH = tooltip.offsetHeight;
+    let left = mx + 14;
+    if (left + ttW > layout.w) left = mx - ttW - 14;
+    let top = my - ttH - 12;
+    if (top < 0) top = my + 14;
+    tooltip.style.left = `${Math.max(0, left)}px`;
+    tooltip.style.top = `${Math.max(0, top)}px`;
+  });
+  canvas.addEventListener("mouseleave", hideHover);
   return card;
 }
 
@@ -1048,6 +1435,18 @@ async function loadSarSeries(jobId) {
 function activateTab(tabName) {
   document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tabName));
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("hidden", p.id !== `tab-${tabName}`));
+  if (tabName === "performance") {
+    // Chart canvases are laid out at their container's real pixel width,
+    // but the Performance tab starts hidden (display:none) - so the very
+    // first draw (requestAnimationFrame at chart-card creation, before the
+    // user has ever clicked here) can see a zero-width container and fall
+    // back to a fixed 300px layout. Redraw now that the tab is genuinely
+    // visible so both the rendered scale and the hover-tooltip's pixel<->
+    // timestamp math (which depends on this same width) are accurate.
+    document.querySelectorAll("#chartGrid canvas").forEach((c) => {
+      if (c._namedSeries) drawLineChart(c, c._namedSeries);
+    });
+  }
 }
 
 function initTabs() {
@@ -1644,6 +2043,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btnEditFocusAi").addEventListener("click", () => activateMainTab("upload"));
   $("btnRecent").addEventListener("click", () => { $("recentPanel").classList.toggle("hidden"); loadRecentJobs(); });
   $("btnCloseRecent").addEventListener("click", () => $("recentPanel").classList.add("hidden"));
+  $("btnStopProject").addEventListener("click", stopProject);
   $("btnSendChat").addEventListener("click", sendChatMessage);
   $("btnResetChat").addEventListener("click", resetChat);
   $("chatInput").addEventListener("keydown", (e) => {
