@@ -53,7 +53,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="4.4.0")
+app = FastAPI(title="LDI Copilot", version="4.5.0")
 
 USERS_PATH = BASE_DIR / "backend" / "data" / "users.json"
 USER_STORE = UserStore(USERS_PATH)
@@ -680,6 +680,75 @@ def stop_ollama_endpoint():
 @app.get("/api/ollama/status")
 def ollama_status_endpoint():
     return ollama_manager.get_ollama_status()
+
+
+@app.post("/api/ollama/install")
+async def install_ollama_endpoint(payload: dict = None):
+    """Explicit, user-confirmed installation of Ollama itself (when
+    is_ollama_installed() is False - see the "install?" confirmation
+    modal in the frontend, triggered from the Start button and from the
+    auto-start path before Generate/chat) plus pulling one model
+    afterward, streamed as Server-Sent Events so a multi-minute
+    download shows live progress in the activity terminal instead of a
+    silent spinner. `payload.model` defaults to "llama3.1" (the same
+    default the model dropdown itself defaults to) - pass whichever
+    model the user actually has selected so the pulled model matches
+    what they're about to use.
+
+    Declining this (the user clicks Cancel in the frontend's
+    confirmation modal, which never calls this endpoint at all) is a
+    complete no-op - nothing here remembers "the user said no" anywhere,
+    so the next Start click / auto-start attempt asks again."""
+    model = ((payload or {}).get("model") or "llama3.1").strip() or "llama3.1"
+
+    def event_stream():
+        yield f"data: {json.dumps({'log': f'Installing Ollama and pulling {model!r}…'})}\n\n"
+        install_failed = False
+        for ok, line in ollama_manager.install_ollama_stream():
+            yield f"data: {json.dumps({'log': line, 'ok': ok})}\n\n"
+            if not ok:
+                install_failed = True
+        if install_failed:
+            yield f"data: {json.dumps({'done': True, 'error': 'Ollama installation did not complete - see the log above.'})}\n\n"
+            return
+
+        start_result = ollama_manager.start_ollama()
+        if start_result["status"] == "error":
+            yield f"data: {json.dumps({'log': start_result['error'], 'ok': False})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'error': start_result['error']})}\n\n"
+            return
+        # start_ollama() itself only kicks off background readiness
+        # polling (see ollama_manager._wait_until_ready_thread) - wait
+        # here for it to actually finish before attempting a pull,
+        # since `ollama pull` needs a reachable server.
+        deadline = time.time() + ollama_manager.READY_POLL_TIMEOUT_SECONDS + 5
+        while time.time() < deadline:
+            status = ollama_manager.get_ollama_status()
+            if status["status"] == "running":
+                break
+            if status["status"] == "error":
+                yield f"data: {json.dumps({'log': status['error'], 'ok': False})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'error': status['error']})}\n\n"
+                return
+            time.sleep(1)
+        else:
+            err = "Timed out waiting for Ollama to become reachable after installation."
+            yield f"data: {json.dumps({'log': err, 'ok': False})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'error': err})}\n\n"
+            return
+
+        pull_failed = False
+        for ok, line in ollama_manager.pull_model_stream(model):
+            yield f"data: {json.dumps({'log': line, 'ok': ok})}\n\n"
+            if not ok:
+                pull_failed = True
+        if pull_failed:
+            yield f"data: {json.dumps({'done': True, 'error': f'Failed to pull model {model!r} - see the log above. Ollama itself is installed and running.'})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/api/jobs/{job_id}/ai_report")

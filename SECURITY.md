@@ -83,6 +83,17 @@ As of v4.0.0, you can optionally attach a standalone packet capture alongside a 
 
 If your organization's policy is stricter than "metadata only" for packet captures specifically, don't attach one — every other part of this tool works identically without it.
 
+## Installing Ollama itself (v4.5.0+): what runs, and only with your say-so
+
+If Ollama isn't installed yet, both the launcher scripts (`run.sh`/`run.bat`/`run.ps1`) and the browser's Ollama **Start** button (`backend/ai/ollama_manager.py`) can install it for you - but only after an explicit confirmation each time (a `[y/N]` prompt in the launcher, a confirm dialog in the browser), never automatically, and this choice is never remembered anywhere - declining once doesn't suppress being asked again later.
+
+What actually runs, always going straight to Ollama's own official distribution channels (this project never bundles, mirrors, or hosts the Ollama binary itself):
+- **Linux:** `curl -fsSL https://ollama.com/install.sh | sh` - Ollama's own published install script.
+- **Windows:** `winget install --id Ollama.Ollama` if `winget` is available, otherwise downloading `https://ollama.com/download/OllamaSetup.exe` directly from ollama.com and launching it for you to complete.
+- **macOS:** `brew install ollama` via Homebrew, if installed - otherwise you're pointed at a manual download; a macOS `.dmg` app install isn't driven automatically.
+
+After installation, pulling a model runs the exact CLI command you'd otherwise type yourself: `ollama pull <model>`. Both installation and the model pull need outbound internet access to ollama.com's CDN and are genuinely multi-gigabyte downloads for some models - progress streams live into the activity terminal (or the launcher's own console output) rather than running silently.
+
 ## An explicit confirmation gate before any external send
 
 Before generating a report with any non-local provider, you must check **"I confirm I'm authorized to share this bundle's data with an external AI provider"** — this is enforced at generate-time (not just as a passive warning), so sending data externally is always a deliberate, acknowledged action rather than an accidental default.

@@ -15,6 +15,7 @@ set "SSLKEYFILE="
 set "AUTHTOKEN="
 set "NOAUTH=0"
 set "REQUIREAUTH=0"
+set "SKIPOLLAMACHECK=0"
 
 :parse_args
 if "%~1"=="" goto args_done
@@ -68,13 +69,18 @@ if /i "%~1"=="--require-auth" (
     shift
     goto parse_args
 )
+if /i "%~1"=="--skip-ollama-check" (
+    set "SKIPOLLAMACHECK=1"
+    shift
+    goto parse_args
+)
 if /i "%~1"=="-h" goto usage
 if /i "%~1"=="--help" goto usage
 echo Unknown option: %~1
 exit /b 1
 
 :usage
-echo Usage: run.bat [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth] [--require-auth]
+echo Usage: run.bat [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth] [--require-auth] [--skip-ollama-check]
 exit /b 0
 
 :args_done
@@ -175,6 +181,8 @@ if not exist "%VENVPY%" (
 echo Installing/checking dependencies...
 "%VENVPY%" -m pip install --quiet --disable-pip-version-check -r "%ROOT%backend\requirements.txt"
 
+call :check_ollama
+
 set "URL=http://%HOSTADDR%:%PORT%"
 set "APPARGS=--host %HOSTADDR% --port %PORT%"
 if "%HTTPS%"=="1" (
@@ -198,3 +206,65 @@ if "%NOBROWSER%"=="0" (
 pushd "%ROOT%backend"
 "%VENVPY%" app.py %APPARGS%
 popd
+exit /b 0
+
+rem ---------------------------------------------------------------------
+rem Ollama is this project's default, fully-offline AI provider - most
+rem users will want it, but it's a separate download this script doesn't
+rem bundle. Prompts once per run (skipped entirely with --skip-ollama-check).
+rem Declining here is never remembered anywhere: the browser's own Start
+rem button (and the auto-start before Generate/chat) independently offers
+rem to install it again any time it's still missing, exactly like a fresh
+rem ask. Installs via Ollama's OWN official path for Windows - this script
+rem never bundles or downloads the Ollama binary itself: winget if
+rem available, else the official installer (downloaded and launched for
+rem the user to click through - silent CLI flags for that installer
+rem aren't officially documented/stable enough to rely on).
+rem ---------------------------------------------------------------------
+:check_ollama
+if "%SKIPOLLAMACHECK%"=="1" exit /b 0
+where ollama >nul 2>nul
+if not errorlevel 1 exit /b 0
+echo.
+echo Ollama ^(this project's default, fully-offline AI provider^) was not found on PATH.
+set "OLLAMAREPLY="
+set /p "OLLAMAREPLY=Install Ollama now? [y/N]: "
+if /i "%OLLAMAREPLY%"=="y" goto install_ollama
+if /i "%OLLAMAREPLY%"=="yes" goto install_ollama
+echo Skipping Ollama installation. Pick a different AI provider in the UI, or
+echo install it later - the browser's Ollama 'Start' button will offer to
+echo install it again whenever you're ready.
+exit /b 0
+
+:install_ollama
+where winget >nul 2>nul
+if errorlevel 1 goto ollama_download_installer
+echo winget found - running "winget install --id Ollama.Ollama"...
+winget install --id Ollama.Ollama -e --silent --accept-package-agreements --accept-source-agreements
+where ollama >nul 2>nul
+if not errorlevel 1 (
+    echo Ollama installed. Pull a model any time with: ollama pull llama3.1
+    exit /b 0
+)
+echo winget install did not result in 'ollama' being available - falling back to a direct download...
+
+:ollama_download_installer
+echo Downloading the official Ollama installer ^(OllamaSetup.exe^)...
+set "OLLAMAINSTALLER=%TEMP%\OllamaSetup.exe"
+powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://ollama.com/download/OllamaSetup.exe' -OutFile '%OLLAMAINSTALLER%' } catch { exit 1 }"
+if errorlevel 1 (
+    echo Failed to download the Ollama installer. Download and run it manually from
+    echo https://ollama.com/download/windows.
+    exit /b 0
+)
+echo Download complete. Launching the installer - complete the setup wizard that just opened...
+start /wait "" "%OLLAMAINSTALLER%"
+where ollama >nul 2>nul
+if not errorlevel 1 (
+    echo Ollama installed. Pull a model any time with: ollama pull llama3.1
+) else (
+    echo Ollama installation did not complete - you can still pick a different AI
+    echo provider in the UI, or try again later ^(rerun this script, or use the
+    echo browser's Ollama 'Start' button, which offers to install it too^).
+)
+exit /b 0

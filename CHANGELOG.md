@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] - 2026-07-16
+
+### Added
+- **Ollama install-on-demand**: hitting `'ollama' executable not found on PATH` used to be a dead end. Now, whenever Ollama isn't installed, both the launcher scripts and the browser offer to install it with one confirmation:
+  - **`run.sh`/`run.bat`/`run.ps1`**: right after setting up this project's own Python dependencies, each launcher checks for `ollama` on PATH and - if missing, and the session is interactive - asks `Install Ollama now? [y/N]` once. Confirming runs Ollama's own official install path for the detected OS (Linux: `install.sh`; Windows: `winget`, falling back to downloading and launching the official installer; macOS: Homebrew). A non-interactive session (no TTY on stdin) or the new `--skip-ollama-check`/`-SkipOllamaCheck` flag skips the prompt automatically rather than hanging. Declining doesn't stick - the browser will still offer to install it later.
+  - **Browser (`backend/ai/ollama_manager.py`, new `POST /api/ollama/install` SSE endpoint)**: clicking the Ollama **Start** button (or the automatic start-before-Generate/chat/Test-connectivity path) now checks installation status first. If missing, a confirm dialog appears ("Ollama isn't installed on this machine yet. Install it now and pull the '\<model\>' model?") instead of an error. Confirming streams live installer + `ollama pull <model>` progress into the activity terminal, then starts Ollama automatically once ready. The model pulled matches whichever model is currently selected in the UI (defaults to `llama3.1`). Declining is a complete no-op - nothing is remembered, so the next Start click (or auto-start attempt) asks again exactly like a fresh request, per explicit design.
+  - A small reusable confirm-modal component (`#confirmModalOverlay` in `frontend/index.html`) backs the browser-side dialog, matching the existing dark theme instead of a native `window.confirm()`.
+  - `GET /api/ollama/status` now includes `"installed": bool` so the frontend can distinguish "not installed" from "installed but stopped/erroring".
+
+Verified via 23 automated checks (installer/pull generators for each OS branch and failure mode, the status/install endpoints via FastAPI's TestClient) plus a full live Playwright walkthrough with the real `/api/ollama/status` and `/api/ollama/install` responses mocked (since Ollama is already installed on the dev machine): clicking Start shows the confirm dialog, Cancel logs a clear skip message, clicking Start again asks again, and confirming streams install+pull progress into the terminal end-to-end before starting Ollama. Also verified `run.bat`'s new prompt live in a genuine interactive `cmd.exe` session (temporarily renaming the installed `ollama.exe` to exercise the "not found" path) for both the decline and `--skip-ollama-check` cases.
+
 ## [4.4.0] - 2026-07-16
 
 ### Added
@@ -195,6 +206,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.5.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.5.0
 [4.4.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.4.0
 [4.3.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.3.0
 [4.2.4]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.2.4

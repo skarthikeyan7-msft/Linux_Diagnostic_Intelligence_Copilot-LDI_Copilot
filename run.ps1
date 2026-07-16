@@ -14,7 +14,8 @@ param(
     [string]$SslKeyFile,
     [string]$AuthToken,
     [switch]$NoAuth,
-    [switch]$RequireAuth
+    [switch]$RequireAuth,
+    [switch]$SkipOllamaCheck
 )
 
 $ErrorActionPreference = "Stop"
@@ -131,6 +132,92 @@ if (-not (Test-Path $venvPython)) {
 
 Write-Host "Installing/checking dependencies..." -ForegroundColor Cyan
 & $venvPython -m pip install --quiet --disable-pip-version-check -r (Join-Path $root "backend/requirements.txt")
+
+# Installs Ollama via its OWN official install path for the detected
+# platform - this script never bundles or downloads the Ollama binary
+# itself. Only ever called after the user has explicitly confirmed via
+# Invoke-OllamaCheck below.
+function Install-Ollama {
+    if ($onWindows -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "winget found - running 'winget install --id Ollama.Ollama'..." -ForegroundColor Cyan
+        try {
+            winget install --id Ollama.Ollama -e --silent --accept-package-agreements --accept-source-agreements
+            if (Get-Command ollama -ErrorAction SilentlyContinue) { return $true }
+        } catch {
+            Write-Host "winget install failed ($($_.Exception.Message)) - falling back to a direct download..." -ForegroundColor Yellow
+        }
+    }
+    if ($onWindows) {
+        Write-Host "Downloading the official Ollama installer (OllamaSetup.exe)..." -ForegroundColor Cyan
+        $installerPath = Join-Path $env:TEMP "OllamaSetup.exe"
+        try {
+            Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $installerPath
+        } catch {
+            Write-Host "Failed to download the Ollama installer: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Download and run it manually from https://ollama.com/download/windows." -ForegroundColor Yellow
+            return $false
+        }
+        Write-Host "Download complete. Launching the installer - complete the setup wizard that just opened..." -ForegroundColor Cyan
+        try {
+            Start-Process -FilePath $installerPath -Wait
+        } catch {
+            Write-Host "Failed to launch the installer: $($_.Exception.Message). Run $installerPath manually." -ForegroundColor Red
+            return $false
+        }
+        return [bool](Get-Command ollama -ErrorAction SilentlyContinue)
+    }
+    if (Get-Command brew -ErrorAction SilentlyContinue) {
+        Write-Host "Homebrew found - running 'brew install ollama'..." -ForegroundColor Cyan
+        try {
+            brew install ollama
+            return [bool](Get-Command ollama -ErrorAction SilentlyContinue)
+        } catch {
+            Write-Host "brew install failed: $($_.Exception.Message)" -ForegroundColor Red
+            return $false
+        }
+    }
+    Write-Host "Automatic Ollama installation isn't supported on this platform without winget or Homebrew." -ForegroundColor Yellow
+    Write-Host "Install it manually from https://ollama.com." -ForegroundColor Yellow
+    return $false
+}
+
+# Ollama is this project's default, fully-offline AI provider - most
+# users will want it, but it's a separate download this script doesn't
+# bundle. Prompts once per run (only when interactive - a non-interactive
+# session, e.g. CI or a redirected/background launch, skips the prompt
+# entirely rather than hanging forever waiting for input that will never
+# arrive). Declining here is never remembered anywhere: the browser's
+# own Start button (and the auto-start before Generate/chat) independently
+# offers to install it again any time it's still missing, exactly like a
+# fresh ask.
+function Invoke-OllamaCheck {
+    if ($SkipOllamaCheck) { return }
+    if (Get-Command ollama -ErrorAction SilentlyContinue) { return }
+    Write-Host ""
+    Write-Host "Ollama (this project's default, fully-offline AI provider) was not found on PATH." -ForegroundColor Yellow
+    if ([Console]::IsInputRedirected) {
+        Write-Host "Non-interactive session - skipping the install prompt. You can still install it" -ForegroundColor Yellow
+        Write-Host "later: rerun this script interactively, use the browser's Ollama 'Start' button" -ForegroundColor Yellow
+        Write-Host "(it will offer to install it too), or install manually from https://ollama.com." -ForegroundColor Yellow
+        return
+    }
+    $reply = Read-Host "Install Ollama now? [y/N]"
+    if ($reply -match '^(y|yes)$') {
+        if (Install-Ollama) {
+            Write-Host "Ollama installed. Pull a model any time with: ollama pull llama3.1" -ForegroundColor Green
+        } else {
+            Write-Host "Ollama installation did not complete - you can still pick a different AI" -ForegroundColor Yellow
+            Write-Host "provider in the UI, or try again later (rerun this script, or use the" -ForegroundColor Yellow
+            Write-Host "browser's Ollama 'Start' button, which offers to install it too)." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "Skipping Ollama installation. Pick a different AI provider in the UI, or" -ForegroundColor DarkGray
+        Write-Host "install it later - the browser's Ollama 'Start' button will offer to" -ForegroundColor DarkGray
+        Write-Host "install it again whenever you're ready." -ForegroundColor DarkGray
+    }
+}
+
+Invoke-OllamaCheck
 
 $url = if ($Https) { "https://${HostAddress}:${Port}" } else { "http://${HostAddress}:${Port}" }
 Write-Host ""

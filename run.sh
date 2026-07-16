@@ -16,6 +16,7 @@ SSL_KEYFILE=""
 AUTH_TOKEN=""
 NO_AUTH=0
 REQUIRE_AUTH=0
+SKIP_OLLAMA_CHECK=0
 MIN_PY_MAJOR=3
 MIN_PY_MINOR=10
 
@@ -30,8 +31,9 @@ while [[ $# -gt 0 ]]; do
     --auth-token) AUTH_TOKEN="$2"; shift 2 ;;
     --no-auth) NO_AUTH=1; shift ;;
     --require-auth) REQUIRE_AUTH=1; shift ;;
+    --skip-ollama-check) SKIP_OLLAMA_CHECK=1; shift ;;
     -h|--help)
-      echo "Usage: ./run.sh [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth] [--require-auth]"
+      echo "Usage: ./run.sh [--host ADDRESS] [--port PORT] [--no-browser] [--https] [--ssl-certfile FILE] [--ssl-keyfile FILE] [--auth-token TOKEN] [--no-auth] [--require-auth] [--skip-ollama-check]"
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -73,6 +75,87 @@ _python_not_found_help() {
   echo "point at it explicitly:" >&2
   echo "    PYTHON=/path/to/python3.11 ./run.sh" >&2
 }
+
+# Installs Ollama via its OWN official install path for the detected OS -
+# this script never bundles or downloads the Ollama binary itself. Only
+# ever called after the user has explicitly confirmed via _check_ollama
+# below.
+_install_ollama() {
+  case "$(uname -s)" in
+    Linux)
+      if command -v curl >/dev/null 2>&1; then
+        echo "Running Ollama's official installer (curl -fsSL https://ollama.com/install.sh | sh)..."
+        curl -fsSL https://ollama.com/install.sh | sh
+      else
+        echo "curl isn't available, so this can't run Ollama's installer automatically." >&2
+        echo "Install curl (e.g. 'sudo dnf install curl' / 'sudo apt install curl') and rerun," >&2
+        echo "or install Ollama manually from https://ollama.com/download/linux." >&2
+        return 1
+      fi
+      ;;
+    Darwin)
+      if command -v brew >/dev/null 2>&1; then
+        echo "Running 'brew install ollama'..."
+        brew install ollama
+      else
+        echo "Homebrew isn't installed, so this can't install Ollama automatically on macOS." >&2
+        echo "Install Homebrew (https://brew.sh) and rerun, or download Ollama manually" >&2
+        echo "from https://ollama.com/download/mac." >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "Automatic Ollama installation isn't supported on this OS ($(uname -s))." >&2
+      echo "Install it manually from https://ollama.com." >&2
+      return 1
+      ;;
+  esac
+}
+
+# Ollama is this project's default, fully-offline AI provider - most
+# users will want it, but it's a separate download this script doesn't
+# bundle. Prompts once per run (only when interactive - a non-TTY
+# session, e.g. CI or a background/detached launch, skips the prompt
+# entirely rather than hanging forever waiting for input that will
+# never arrive). Declining here is never remembered anywhere: the
+# browser's own Start button (and the auto-start before Generate/chat)
+# independently offers to install it again any time it's still missing,
+# exactly like a fresh ask.
+_check_ollama() {
+  if [[ "$SKIP_OLLAMA_CHECK" -eq 1 ]]; then
+    return 0
+  fi
+  if command -v ollama >/dev/null 2>&1; then
+    return 0
+  fi
+  echo ""
+  echo "Ollama (this project's default, fully-offline AI provider) was not found on PATH."
+  if [[ ! -t 0 ]]; then
+    echo "Non-interactive session - skipping the install prompt. You can still install it" >&2
+    echo "later: rerun this script interactively, use the browser's Ollama 'Start' button" >&2
+    echo "(it will offer to install it too), or install manually from https://ollama.com." >&2
+    return 0
+  fi
+  read -r -p "Install Ollama now? [y/N] " _ollama_reply || _ollama_reply=""
+  case "$_ollama_reply" in
+    [yY]|[yY][eE][sS])
+      if _install_ollama; then
+        echo "Ollama installed. Pull a model any time with: ollama pull llama3.1"
+      else
+        echo "Ollama installation did not complete - you can still pick a different AI" >&2
+        echo "provider in the UI, or try again later (rerun this script, or use the" >&2
+        echo "browser's Ollama 'Start' button, which offers to install it too)." >&2
+      fi
+      ;;
+    *)
+      echo "Skipping Ollama installation. Pick a different AI provider in the UI, or" >&2
+      echo "install it later - the browser's Ollama 'Start' button will offer to" >&2
+      echo "install it again whenever you're ready." >&2
+      ;;
+  esac
+}
+
+
 
 # Resolve a Python interpreter meeting the minimum version, in priority
 # order: an explicit $PYTHON override (respected even if it turns out too
@@ -139,6 +222,8 @@ fi
 
 echo "Installing/checking dependencies..."
 "$VENV_PYTHON" -m pip install --quiet --disable-pip-version-check -r "$ROOT_DIR/backend/requirements.txt"
+
+_check_ollama
 
 APP_ARGS=(--host "$HOST_ADDRESS" --port "$PORT")
 SCHEME="http"

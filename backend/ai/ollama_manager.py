@@ -6,6 +6,13 @@ first" step. This is what backs the "Generate root-cause report" button
 auto-starting Ollama when needed, and the Start/Stop buttons in the
 activity terminal's toolbar.
 
+Also handles the case where Ollama isn't installed on this machine at
+all (common on a freshly-provisioned VM - see README.md's Ollama
+section): is_ollama_installed()/install_ollama_stream()/
+pull_model_stream() below let the UI offer to install Ollama itself and
+pull a model, with the user's explicit confirmation, instead of just
+surfacing a dead-end "not found on PATH" error.
+
 Design notes:
 - Only ONE thing is ever managed: a single `ollama serve` subprocess
   spawned by this module. If Ollama is already reachable on the target
@@ -22,9 +29,18 @@ Design notes:
   app's job store.
 - The stdout/stderr reader thread is a daemon thread so it never blocks
   server shutdown.
+- Installation is always driven by an explicit user click (never
+  automatic) and always runs the *official* install path for the
+  detected OS (Ollama's own install.sh on Linux, winget/the official
+  Windows installer on Windows, Homebrew/manual on macOS) - this module
+  never bundles or downloads Ollama's binary itself.
 """
+import os
+import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -44,6 +60,9 @@ STATE = {
     "log_lines": [],
     "error": None,
     "base_url": "http://localhost:11434",
+    "not_installed": False,  # True specifically when the last start attempt failed because
+                              # the `ollama` executable itself isn't on PATH - lets the UI
+                              # offer to install it instead of just showing a dead-end error.
 }
 
 
@@ -64,6 +83,47 @@ def is_ollama_reachable(base_url="http://localhost:11434", timeout=6):
             return True
     except (urllib.error.URLError, TimeoutError, ConnectionError):
         return False
+
+
+def _extra_search_paths():
+    """A few well-known install locations that a *freshly installed*
+    Ollama might not yet be visible at via shutil.which() in THIS
+    already-running Python process - PATH changes made by an installer
+    (especially on Windows, where installers commonly update the
+    registry-backed user PATH) aren't picked up by os.environ in a
+    process that started before the install happened. Checked as a
+    fallback, never as the primary lookup."""
+    home = os.path.expanduser("~")
+    candidates = []
+    if sys.platform == "win32":
+        localappdata = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+        candidates.append(os.path.join(localappdata, "Programs", "Ollama", "ollama.exe"))
+    elif sys.platform == "darwin":
+        candidates += ["/usr/local/bin/ollama", "/opt/homebrew/bin/ollama", "/Applications/Ollama.app/Contents/Resources/ollama"]
+    else:
+        candidates += ["/usr/local/bin/ollama", "/usr/bin/ollama", os.path.join(home, ".local", "bin", "ollama")]
+    return candidates
+
+
+def find_ollama_executable():
+    """Resolves the `ollama` executable's path if it's available by any
+    means (PATH, or one of the fallback locations above) - or None."""
+    found = shutil.which("ollama")
+    if found:
+        return found
+    for candidate in _extra_search_paths():
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def is_ollama_installed():
+    return find_ollama_executable() is not None
+
+
+def detect_os_label():
+    system = platform.system()
+    return {"Linux": "linux", "Windows": "windows", "Darwin": "macos"}.get(system, "other")
 
 
 def _reader_thread(proc):
@@ -120,6 +180,7 @@ def start_ollama(base_url="http://localhost:11434"):
         if STATE["status"] == "starting":
             return dict(STATE, log_lines=list(STATE["log_lines"]))
         STATE["base_url"] = base_url
+        STATE["not_installed"] = False
 
     if is_ollama_reachable(base_url):
         with STATE_LOCK:
@@ -133,10 +194,11 @@ def start_ollama(base_url="http://localhost:11434"):
         STATE["error"] = None
     _append_log("Starting 'ollama serve'…")
 
+    ollama_exe = find_ollama_executable() or "ollama"
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         proc = subprocess.Popen(
-            ["ollama", "serve"],
+            [ollama_exe, "serve"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -148,6 +210,7 @@ def start_ollama(base_url="http://localhost:11434"):
             STATE["status"] = "error"
             STATE["error"] = "'ollama' executable not found on PATH. Install it from https://ollama.com, then try again (or pick a different AI provider)."
             STATE["process"] = None
+            STATE["not_installed"] = True
         _append_log(STATE["error"])
         return get_ollama_status()
     except OSError as e:
@@ -197,4 +260,194 @@ def get_ollama_status():
             "log_lines": list(STATE["log_lines"]),
             "error": STATE["error"],
             "base_url": STATE["base_url"],
+            "installed": is_ollama_installed(),
+            "not_installed": STATE["not_installed"],
         }
+
+
+# --------------------------------------------------------------------------
+# Installation + model pulling - both explicitly user-initiated (the "Ollama
+# isn't installed - install it now?" confirmation in the UI, or the
+# equivalent interactive prompt in run.sh/run.bat/run.ps1), and both stream
+# their progress as plain text lines via the generator functions below so
+# the caller (an SSE endpoint in backend/app.py) can forward them to the
+# activity terminal live instead of the browser just spinning silently for
+# however many minutes a real download takes.
+# --------------------------------------------------------------------------
+def _run_streaming(cmd, cwd=None, shell=False, input_text=None):
+    """Runs `cmd`, yielding its combined stdout/stderr as it's produced.
+    Splits on '\\r' as well as '\\n' because some tools (notably `ollama
+    pull`'s own download progress bar) rewrite a single line in place
+    with carriage returns rather than emitting newline-terminated lines -
+    without this, the entire multi-minute download would arrive as one
+    giant buffered chunk right at the end instead of live progress.
+    Yields (ok: bool, line: str) - ok is only False for the final
+    "process exited with code N" line on a nonzero exit."""
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, shell=shell,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+    except (FileNotFoundError, OSError) as e:
+        yield False, f"Failed to run {cmd!r}: {e}"
+        return
+
+    if input_text is not None:
+        try:
+            proc.stdin.write(input_text)
+            proc.stdin.close()
+        except Exception:
+            pass
+
+    buffer = ""
+    last_emit = 0.0
+    while True:
+        chunk = proc.stdout.read(1024)
+        if not chunk:
+            break
+        buffer += chunk
+        while True:
+            cut = min((i for i in (buffer.find("\n"), buffer.find("\r")) if i != -1), default=-1)
+            if cut == -1:
+                break
+            line, buffer = buffer[:cut], buffer[cut + 1:]
+            line = line.strip()
+            now = time.time()
+            # Throttle: a download progress line repeats many times a
+            # second - forwarding every single one would flood the
+            # activity terminal for no benefit. Always forward non-empty
+            # lines at most ~3/sec; never drop a blank-to-content
+            # transition since that's usually a genuinely new stage
+            # ("pulling manifest" -> "verifying sha256 digest" etc.).
+            if line and (now - last_emit > 0.33):
+                yield True, line
+                last_emit = now
+    if buffer.strip():
+        yield True, buffer.strip()
+
+    code = proc.wait()
+    if code != 0:
+        yield False, f"Command exited with code {code}: {' '.join(cmd) if isinstance(cmd, list) else cmd}"
+
+
+def install_ollama_stream():
+    """Generator yielding (ok: bool, line: str) progress lines while
+    installing Ollama for the detected OS via its OWN official install
+    path - this module never bundles or hosts the Ollama binary itself:
+    - Linux: the official install script (curl -fsSL https://ollama.com/install.sh | sh)
+    - macOS: Homebrew (`brew install ollama`) if available, else a
+      manual-download pointer (a .dmg/GUI app install can't be safely
+      driven headlessly from here)
+    - Windows: winget if available, else downloads the official
+      installer and launches it for the user to click through (silent
+      CLI flags for that installer aren't officially documented/stable
+      enough to rely on)
+    Stops (returns) as soon as a step fails - never raises."""
+    if is_ollama_installed():
+        yield True, "Ollama is already installed - skipping installation."
+        return
+
+    os_label = detect_os_label()
+    yield True, f"Detected OS: {os_label}. Starting Ollama installation…"
+
+    if os_label == "linux":
+        if not (shutil.which("curl") and shutil.which("sh")):
+            yield False, "Neither 'curl' nor 'sh' is available to run Ollama's official installer. Install curl (e.g. `sudo dnf install curl` / `sudo apt install curl`) and try again, or install Ollama manually from https://ollama.com/download/linux."
+            return
+        yield True, "Running Ollama's official installer (curl -fsSL https://ollama.com/install.sh | sh) - this needs internet access and may take a few minutes…"
+        ok_all = True
+        for ok, line in _run_streaming("curl -fsSL https://ollama.com/install.sh | sh", shell=True):
+            yield ok, line
+            if not ok:
+                ok_all = False
+        if not ok_all:
+            return
+
+    elif os_label == "macos":
+        if shutil.which("brew"):
+            yield True, "Homebrew found - running `brew install ollama`…"
+            ok_all = True
+            for ok, line in _run_streaming(["brew", "install", "ollama"]):
+                yield ok, line
+                if not ok:
+                    ok_all = False
+            if not ok_all:
+                return
+        else:
+            yield False, "Homebrew isn't installed, so this can't install Ollama automatically on macOS. Install Homebrew (https://brew.sh) and try again, or download Ollama directly from https://ollama.com/download/mac."
+            return
+
+    elif os_label == "windows":
+        if shutil.which("winget"):
+            yield True, "winget found - running `winget install --id Ollama.Ollama -e --silent`…"
+            ok_all = True
+            for ok, line in _run_streaming([
+                "winget", "install", "--id", "Ollama.Ollama", "-e",
+                "--silent", "--accept-package-agreements", "--accept-source-agreements",
+            ]):
+                yield ok, line
+                if not ok:
+                    ok_all = False
+            if not ok_all:
+                yield True, "winget install reported an error - falling back to downloading the official installer directly…"
+            else:
+                # winget updates the machine/user PATH registry key, but
+                # this already-running Python process's os.environ won't
+                # see that change - find_ollama_executable()'s fallback
+                # search paths cover the common winget/installer target,
+                # so a later is_ollama_installed() check still succeeds
+                # without needing to restart the server process.
+                pass
+        if not is_ollama_installed():
+            yield True, "Downloading the official Ollama installer (OllamaSetup.exe)…"
+            installer_path = os.path.join(tempfile.gettempdir(), "OllamaSetup.exe")
+            try:
+                urllib.request.urlretrieve("https://ollama.com/download/OllamaSetup.exe", installer_path)
+            except Exception as e:
+                yield False, f"Failed to download the Ollama installer: {e}. Download and run it manually from https://ollama.com/download/windows."
+                return
+            yield True, "Download complete. Launching the installer - please complete the setup wizard that just opened, then this will continue automatically once it detects Ollama is installed…"
+            try:
+                subprocess.Popen([installer_path])
+            except OSError as e:
+                yield False, f"Failed to launch the downloaded installer: {e}. Run {installer_path} manually."
+                return
+            deadline = time.time() + 600  # up to 10 minutes for the user to click through the GUI wizard
+            while time.time() < deadline:
+                if is_ollama_installed():
+                    break
+                time.sleep(3)
+            else:
+                yield False, "Timed out waiting for the installer to finish. If you completed the setup wizard, try clicking Start again."
+                return
+    else:
+        yield False, f"Automatic installation isn't supported on this OS ({platform.system()}). Install Ollama manually from https://ollama.com, then try again."
+        return
+
+    if is_ollama_installed():
+        yield True, "Ollama installed successfully."
+    else:
+        yield False, "Installation finished, but the 'ollama' executable still couldn't be found. You may need to open a new terminal/restart this server for a PATH update to take effect, or install manually from https://ollama.com."
+
+
+def pull_model_stream(model_name):
+    """Generator yielding (ok: bool, line: str) progress lines while
+    running `ollama pull <model_name>` - the exact CLI command a user
+    would otherwise have to run by hand after installing Ollama. Assumes
+    the caller has already confirmed Ollama itself is installed/running;
+    yields a clear error and returns immediately if not."""
+    ollama_exe = find_ollama_executable()
+    if not ollama_exe:
+        yield False, "Ollama is not installed - install it first."
+        return
+    model_name = (model_name or "").strip() or "llama3.1"
+    yield True, f"Pulling model '{model_name}' (this can take a while for larger models - it's a multi-gigabyte download)…"
+    ok_all = True
+    for ok, line in _run_streaming([ollama_exe, "pull", model_name]):
+        yield ok, line
+        if not ok:
+            ok_all = False
+    if ok_all:
+        yield True, f"Model '{model_name}' is ready to use."

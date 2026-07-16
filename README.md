@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.4.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.5.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -41,6 +41,8 @@ Stop any of them with `Ctrl+C`.
 
 > **RHEL/CentOS/Alma/Rocky Linux 8 users:** the default `python3` on RHEL 8.x is Python 3.6 — years past upstream end-of-life and too old for this project (FastAPI/Pydantic need 3.8+; this codebase's own type hints need 3.10+). All three launchers detect this and fail with a clear message rather than a confusing `pip` error — `run.sh` specifically auto-detects a newer `python3.10`/`3.11`/`3.12`/`3.13` on `PATH` ahead of the too-old default, so installing one (`sudo dnf install python3.11`) and rerunning is usually all that's needed; you don't have to touch the system default `python3`.
 
+> **Fresh VM / no Ollama yet:** right after setting up the Python venv, every launcher checks whether `ollama` is on `PATH` and — if not, and the session is interactive — asks once whether to install it (Ollama's own official installer for your OS). Say no and it just starts the server anyway (pick a different AI provider, or install Ollama later from the browser's Ollama **Start** button, which offers the same install prompt). Pass `--skip-ollama-check` (`-SkipOllamaCheck` in PowerShell) to skip the prompt outright.
+
 Options (same flags on every launcher, just spelled per that shell's own convention):
 ```powershell
 .\run.ps1 -Port 9000            # use a different port
@@ -48,6 +50,7 @@ Options (same flags on every launcher, just spelled per that shell's own convent
 .\run.ps1 -HostAddress 0.0.0.0   # allow LAN/internet access (see "Sharing with a team" below)
 .\run.ps1 -HostAddress 0.0.0.0 -Https                        # + TLS (self-signed cert, auto-generated)
 .\run.ps1 -HostAddress 0.0.0.0 -AuthToken "a-shared-secret"   # + pin a stable shared password
+.\run.ps1 -SkipOllamaCheck       # don't prompt to install Ollama even if it's missing
 ```
 ```bat
 .\run.bat --port 9000
@@ -55,6 +58,7 @@ Options (same flags on every launcher, just spelled per that shell's own convent
 .\run.bat --host 0.0.0.0
 .\run.bat --host 0.0.0.0 --https
 .\run.bat --host 0.0.0.0 --auth-token a-shared-secret
+.\run.bat --skip-ollama-check
 ```
 ```bash
 ./run.sh --port 9000
@@ -62,6 +66,7 @@ Options (same flags on every launcher, just spelled per that shell's own convent
 ./run.sh --host 0.0.0.0
 ./run.sh --host 0.0.0.0 --https
 ./run.sh --host 0.0.0.0 --auth-token a-shared-secret
+./run.sh --skip-ollama-check
 ```
 
 > **Cloud VM users (Azure/AWS/GCP):** never pass your VM's *public* IP to `--host`/`-HostAddress`. Cloud public IPs are NAT'd at the platform level and are never actually configured on the VM's own network interface, so the OS refuses to bind to it (`[Errno 99] Cannot assign requested address`) — this project detects and explains that specific case before it can happen. Bind to `0.0.0.0` (or leave the default `127.0.0.1`) instead - the public IP is only ever used from *outside* the VM to reach whatever's bound there. **Safer option:** don't expose the port at all - `ssh -L 8756:127.0.0.1:8756 user@your-vm-ip` and browse to `http://127.0.0.1:8756` on your own machine, keeping the default localhost-only bind and zero new attack surface. If you do need `--host 0.0.0.0`, also open the port in your cloud provider's firewall (Azure NSG / AWS security group / GCP firewall rule) scoped to your own IP specifically, not `0.0.0.0/0`, and see "Sharing with a team" below for the auth gate this project adds automatically in that case — see [SECURITY.md](SECURITY.md) before exposing this beyond localhost, especially with real customer bundle data.
@@ -126,9 +131,13 @@ Recent analyses from the current server session are listed under "Recent analyse
 
 The panel docked along the entire right edge of the page is a persistent, timestamped activity log — visible no matter which of the three tabs you're on. It mirrors background progress from every stage: bundle selection, the mechanical scan's own progress lines, AI synthesis start/completion, Ollama start/stop, model-availability checks, downloads, and resets. Its header has an Ollama status badge plus **Start**/**Stop**/**⟳ (refresh)** buttons for direct manual control, and a **Clear** button to wipe the log. It's session-only (not persisted), purely a live "what's happening" view.
 
-### Ollama auto-start
+### Ollama auto-start (and auto-install)
 
 Since Ollama is the default AI provider, clicking **"Generate log analysis"** with Ollama selected will automatically start `ollama serve` if it isn't already running — no need to remember to start it yourself first. Progress (including Ollama's own startup log lines) streams into the activity terminal while it comes up. You can also start/stop/check it manually any time via the terminal's toolbar — the **Start** button disables itself while Ollama is running/starting, and **Stop** becomes enabled at that point (it's a no-op with a clear message in the terminal if Ollama is running but wasn't started by LDI Copilot itself — e.g. the desktop app — rather than actually terminating an instance it didn't launch).
+
+**If Ollama isn't installed at all yet** (common on a fresh VM), clicking **Start** — or triggering auto-start via Generate/chat/Test connectivity — shows a confirmation dialog instead of a dead-end error: *"Ollama isn't installed on this machine yet. Install it now and pull the '\<model\>' model?"* Confirming runs Ollama's own official installer for your OS (the `install.sh` script on Linux, `winget`/the official installer on Windows, Homebrew on macOS — this project never bundles or downloads the Ollama binary itself) and then pulls whichever model is currently selected, streaming progress into the activity terminal the whole way through. **Declining is never remembered** — the next time you click Start (or the auto-start path runs again), it asks again, exactly like a fresh request.
+
+The three launcher scripts (`run.sh`/`run.bat`/`run.ps1`) offer the same install prompt once, interactively, right after installing this project's own Python dependencies — so a brand-new VM can get everything set up (Python venv, LDI Copilot's dependencies, *and* Ollama) from one command. Answering "no" there doesn't stick either — the browser's Start button will still offer to install it later. Pass `--skip-ollama-check` to any launcher to skip this prompt entirely (e.g. for a scripted/non-interactive deployment) — an already non-interactive session (no TTY on stdin) skips it automatically anyway.
 
 ### Testing AI connectivity before a full analysis
 

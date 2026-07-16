@@ -202,6 +202,39 @@ function initTerminal() {
 }
 
 // --------------------------------------------------------------------------
+// Small reusable confirm modal (used by the Ollama install-confirmation
+// flow below; kept generic in case something else needs a confirm step
+// later). Resolves true/false - never rejects, so callers can always
+// `await` it directly without a try/catch just for the dialog itself.
+// --------------------------------------------------------------------------
+function showConfirmModal(title, body, confirmLabel) {
+  return new Promise((resolve) => {
+    const overlay = $("confirmModalOverlay");
+    $("confirmModalTitle").textContent = title;
+    $("confirmModalBody").textContent = body;
+    const confirmBtn = $("confirmModalConfirm");
+    const cancelBtn = $("confirmModalCancel");
+    confirmBtn.textContent = confirmLabel || "Confirm";
+
+    const cleanup = (result) => {
+      overlay.classList.add("hidden");
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      overlay.removeEventListener("click", onOverlayClick);
+      resolve(result);
+    };
+    const onConfirm = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onOverlayClick = (e) => { if (e.target === overlay) cleanup(false); };
+
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+    overlay.addEventListener("click", onOverlayClick);
+    overlay.classList.remove("hidden");
+  });
+}
+
+// --------------------------------------------------------------------------
 // Ollama lifecycle control - the terminal's toolbar (status badge +
 // Start/Stop/Refresh) gives direct manual control, and runSynthesis()
 // calls ensureOllamaRunning() automatically whenever Ollama is the
@@ -260,13 +293,35 @@ function sleep(ms) {
 }
 
 // Used both by the manual "Start" button and automatically from
-// runSynthesis() when Ollama is the selected provider. Resolves once
-// Ollama is confirmed reachable; rejects with a human-readable message
-// if it fails to start or times out - callers must not proceed to an
-// actual synthesis call in that case.
-async function ensureOllamaRunning() {
+// runSynthesis()/chat/testConnectivity when Ollama is the selected
+// provider. Resolves once Ollama is confirmed reachable; rejects with a
+// human-readable message if it fails to start, times out, or the user
+// declines an install prompt - callers must not proceed to an actual
+// synthesis call in that case. `model` (optional) is whichever model
+// the caller has selected - used only if Ollama turns out to need
+// installing, so the model pulled afterward actually matches what the
+// user is about to use instead of always defaulting to llama3.1.
+async function ensureOllamaRunning(model) {
   let status = await refreshOllamaStatus();
   if (status.status === "running") return status;
+
+  if (!status.installed) {
+    const modelToPull = (model || "llama3.1").trim() || "llama3.1";
+    const confirmed = await showConfirmModal(
+      "Ollama isn't installed",
+      `Ollama isn't installed on this machine yet. Install it now and pull the "${modelToPull}" model?\n\nThis runs Ollama's official installer, then downloads the model (can be several GB depending on which one) - it may take a few minutes on a slower connection. Progress will show in the activity terminal.`,
+      "Install",
+    );
+    if (!confirmed) {
+      throw new Error("Ollama installation was skipped. Pick a different AI provider, or click Start again to install it later.");
+    }
+    await installAndPullOllama(modelToPull);
+    status = await refreshOllamaStatus();
+    if (status.status === "running") return status;
+    // Falls through to the normal start-and-poll flow below in the rare
+    // case installAndPullOllama() finished but readiness hasn't caught
+    // up to this exact instant yet.
+  }
 
   logTerminal("🦙 Ollama isn't running yet — starting it now…", "info");
   await fetch("/api/ollama/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
@@ -281,10 +336,54 @@ async function ensureOllamaRunning() {
   throw new Error("Timed out waiting for Ollama to start.");
 }
 
+// Streams backend/app.py's POST /api/ollama/install SSE response into
+// the activity terminal live - the install + model pull together can
+// take several minutes, so this gives real progress instead of a
+// silent wait. Throws if the backend reports a final error; resolves
+// (no return value) on success, with Ollama already started as part of
+// the same server-side flow.
+async function installAndPullOllama(model) {
+  logTerminal(`🦙 Installing Ollama and pulling model "${model}"…`, "info");
+  const resp = await fetch("/api/ollama/install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
+  if (!resp.ok || !resp.body) {
+    const detail = await resp.json().catch(() => ({}));
+    throw new Error(detail.detail || `Install request failed (HTTP ${resp.status})`);
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalError = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop(); // keep any incomplete trailing event
+    for (const evt of events) {
+      const line = evt.trim();
+      if (!line.startsWith("data:")) continue;
+      const parsed = JSON.parse(line.slice(5).trim());
+      if (parsed.log) {
+        logTerminal(`🦙 ${parsed.log}`, parsed.ok === false ? "error" : "info");
+      }
+      if (parsed.done && parsed.error) {
+        finalError = parsed.error;
+      }
+    }
+  }
+  if (finalError) throw new Error(finalError);
+}
+
 async function startOllama() {
   $("btnStartOllama").disabled = true;
   try {
-    await ensureOllamaRunning();
+    const { payload } = collectAiPayload();
+    const model = payload.provider === "ollama" ? payload.model : null;
+    await ensureOllamaRunning(model);
     logTerminal("✅ Ollama is running.", "success");
   } catch (err) {
     logTerminal(`❌ ${err.message}`, "error");
@@ -1235,7 +1334,7 @@ async function runSynthesis() {
 
   if (payload.provider === "ollama") {
     try {
-      await ensureOllamaRunning();
+      await ensureOllamaRunning(payload.model);
     } catch (err) {
       $("aiError").textContent = `Ollama startup failed: ${err.message}`;
       $("aiError").classList.remove("hidden");
@@ -1343,7 +1442,7 @@ async function sendChatMessage() {
 
   if (payload.provider === "ollama") {
     try {
-      await ensureOllamaRunning();
+      await ensureOllamaRunning(payload.model);
     } catch (err) {
       pendingEl.remove();
       $("chatError").textContent = `Ollama startup failed: ${err.message}`;
@@ -1434,7 +1533,7 @@ async function testConnectivity() {
 
   if (payload.provider === "ollama") {
     try {
-      await ensureOllamaRunning();
+      await ensureOllamaRunning(payload.model);
     } catch (err) {
       statusEl.textContent = `❌ ${err.message}`;
       logTerminal(`❌ Ollama startup failed: ${err.message}`, "error");
