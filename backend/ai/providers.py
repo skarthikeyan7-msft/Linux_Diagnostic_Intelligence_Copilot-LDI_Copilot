@@ -98,6 +98,52 @@ def _post_stream(url, headers, body, extract_fn, timeout=180):
         raise ProviderError(f"request timed out: {e}") from e
 
 
+_AADSTS_HINTS = {
+    "AADSTS53003": (
+        "Your Entra ID tenant has a Conditional Access policy blocking this sign-in - this is "
+        "your organization's security policy actively refusing the token, not a bug in this app. "
+        "It's usually a Conditional Access policy scoped to \"Workload identities\" (service "
+        "principals) requiring something an app-only client-credentials flow can never satisfy "
+        "(MFA, a compliant device, a trusted network location, etc.). Ask your Entra ID admin to "
+        "check Azure Portal -> Microsoft Entra ID -> Sign-in logs -> Service principal sign-ins "
+        "(filter by the Trace ID/Correlation ID above) - that log entry names the exact policy "
+        "that blocked it, and from there the admin can exclude this app registration's service "
+        "principal or add your network to a trusted location. In the meantime, API key auth (if "
+        "your org allows it) or a different AI provider both sidestep this entirely."
+    ),
+    "AADSTS7000215": (
+        "The client secret was rejected as invalid - double check it was copied in full (secret "
+        "*values* are only shown once at creation time in Azure Portal; the secret *ID* looks "
+        "similar but won't work here) and that it hasn't been revoked."
+    ),
+    "AADSTS7000222": (
+        "This client secret has expired. Generate a new one under your app registration's "
+        "Certificates & secrets page and update it here."
+    ),
+    "AADSTS700016": (
+        "This Application (client) ID wasn't found in the specified tenant. Double-check both "
+        "the client ID and the tenant (directory) ID - a client ID from a different tenant will "
+        "fail with exactly this error."
+    ),
+    "AADSTS90002": (
+        "This tenant ID wasn't found. Double-check the Directory (tenant) ID from your app "
+        "registration's Overview page."
+    ),
+}
+
+
+def _explain_aadsts_error(detail):
+    """Appends a plain-English hint for well-known AADSTS error codes -
+    Entra ID's own error_description text is accurate but assumes the
+    reader already knows Entra ID's internals; most people hitting this
+    from an AI-provider connectivity test don't. Returns detail
+    unchanged if no known code is recognized."""
+    for code, hint in _AADSTS_HINTS.items():
+        if code in detail:
+            return f"{detail}\n\n💡 {hint}"
+    return detail
+
+
 def get_entra_id_token(tenant_id, client_id, client_secret, scope="https://cognitiveservices.azure.com/.default"):
     """OAuth2 client-credentials flow against the Microsoft identity
     platform v2 token endpoint. Returns a bearer access token to use as
@@ -129,7 +175,8 @@ def get_entra_id_token(tenant_id, client_id, client_secret, scope="https://cogni
             detail = json.loads(detail).get("error_description", detail)
         except (json.JSONDecodeError, AttributeError):
             pass
-        raise ProviderError(f"Entra ID token request failed (HTTP {e.code}): {detail[:500]}") from e
+        detail = _explain_aadsts_error(detail[:500])
+        raise ProviderError(f"Entra ID token request failed (HTTP {e.code}): {detail}") from e
     except urllib.error.URLError as e:
         raise ProviderError(f"Entra ID token request connection error: {e.reason}") from e
     except TimeoutError as e:

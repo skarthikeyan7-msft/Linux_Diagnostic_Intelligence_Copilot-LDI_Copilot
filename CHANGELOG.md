@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.1] - 2026-07-16
+
+### Added
+- **Plain-English hints for well-known Entra ID (Azure AD) token errors**: hit live while testing Azure OpenAI Entra ID connectivity - `AADSTS53003` ("Access has been blocked by Conditional Access policies") is a real, correct response from Microsoft's identity platform, not a bug in this app, but the raw `error_description` text assumes the reader already knows Entra ID's internals. `get_entra_id_token()` now recognizes `AADSTS53003` (Conditional Access block - explains it's most likely a Conditional Access policy scoped to "Workload identities" requiring something an app-only client-credentials flow can never satisfy, and points at exactly where to find the specific blocking policy: Azure Portal → Entra ID → Sign-in logs → Service principal sign-ins, filterable by the Trace ID/Correlation ID already in the error) plus 4 other common codes (`AADSTS7000215`/`7000222` invalid/expired client secret, `AADSTS700016` app not found in tenant, `AADSTS90002` tenant not found) with a targeted hint for each.
+- The connectivity-test status indicator (a small inline span, not meant for long text) now shows just the concise headline plus "(see activity log for more detail)" when a hint was appended, while the full explanation always goes to the activity terminal, which already preserves line breaks. The larger `.alert-error` box used by the actual "Generate log analysis" error path gained `white-space: pre-line` so the same multi-paragraph hints render with a proper paragraph break there too.
+
+Verified live: a mocked `AADSTS53003` response through the real Azure OpenAI/Entra ID UI path renders the short headline in the compact status indicator and the full paragraph-separated explanation in the activity terminal, with zero new console errors.
+
 ## [4.7.0] - 2026-07-16
 
 ### Added

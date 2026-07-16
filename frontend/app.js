@@ -1952,8 +1952,10 @@ async function testConnectivity() {
       statusEl.textContent = `✅ Connected (replied: "${result.sample}")`;
       logTerminal(`✅ ${providerLabel} connectivity OK (replied: "${result.sample}")`, "success");
     } else {
-      statusEl.textContent = `❌ ${result.error || "Connection failed"}`;
-      logTerminal(`❌ ${providerLabel} connectivity failed: ${result.error || "unknown error"}`, "error");
+      const errMsg = result.error || "Connection failed";
+      const shortMsg = errMsg.split("\n\n")[0];
+      statusEl.textContent = `❌ ${shortMsg}` + (errMsg.length > shortMsg.length ? " (see activity log for more detail)" : "");
+      logTerminal(`❌ ${providerLabel} connectivity failed: ${errMsg}`, "error");
     }
   } catch (err) {
     statusEl.textContent = `❌ ${err.message}`;

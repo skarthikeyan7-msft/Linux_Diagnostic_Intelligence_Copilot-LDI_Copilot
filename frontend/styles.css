@@ -299,7 +299,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 }
 .progress-log .line { margin-bottom: 2px; }
 
-.alert { padding: 12px 14px; border-radius: 6px; margin-top: 12px; font-size: 13px; }
+.alert { padding: 12px 14px; border-radius: 6px; margin-top: 12px; font-size: 13px; white-space: pre-line; }
 .alert-error { background: rgba(255, 84, 112, 0.1); border: 1px solid rgba(255, 84, 112, 0.35); color: #ffb3c0; }
 
 .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 18px; }

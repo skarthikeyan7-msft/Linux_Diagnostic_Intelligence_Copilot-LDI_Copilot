@@ -58,7 +58,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.7.0"
+__version__ = "4.7.1"
 
 # --------------------------------------------------------------------------
 # Severity model
