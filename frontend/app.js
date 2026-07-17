@@ -476,6 +476,35 @@ async function initWhoami() {
   }
 }
 
+// Fetches this machine's detected CPU/memory capacity (v4.9.1) so the
+// "Parallel scanning workers" dropdown can show real, machine-specific
+// context (e.g. flagging which numeric choices exceed this machine's own
+// CPU core count) instead of listing bare numbers with no frame of
+// reference for whether they're realistic.
+async function initSystemInfo() {
+  const note = $("workersCpuNote");
+  try {
+    const resp = await fetch("/api/system-info");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const info = await resp.json();
+    const cpu = info.cpu_count;
+    note.textContent = `This machine reports ${cpu} logical CPU core(s)` + (info.available_memory_mb ? ` and ~${Math.round(info.available_memory_mb / 1024)} GB available memory` : "") + `. "Auto" would currently pick up to ${info.default_max_workers} worker(s) for a large-enough bundle.`;
+
+    const select = $("optWorkers");
+    Array.from(select.options).forEach((opt) => {
+      const n = parseInt(opt.value, 10);
+      if (!Number.isFinite(n) || n <= 1) return;
+      if (n > cpu) {
+        opt.textContent = `${n} (${Math.round((n / cpu) * 10) / 10}x this machine's ${cpu} cores — oversubscribed)`;
+      } else if (n === cpu) {
+        opt.textContent = `${n} (= this machine's core count)`;
+      }
+    });
+  } catch {
+    note.textContent = "Could not detect this machine's CPU core count - \"Auto\" still works, it just can't be previewed here.";
+  }
+}
+
 // --------------------------------------------------------------------------
 // Upload / dropzone
 // --------------------------------------------------------------------------
@@ -778,10 +807,11 @@ function renderFocusCallout(summary) {
 // synthesize() SSE stream (and persisted at GET /api/jobs/{id}/redaction) -
 // or null/undefined when the most recent report used a local provider
 // (Ollama) or had redaction turned off, in which case the callout hides.
-// Renders the token->original mapping grouped by kind (hostnames vs IPs)
-// inside a collapsible <details> so it doesn't dominate the page when
-// there are many redacted values, matching the always-visible one-line
-// summary engineers need at a glance plus the full mapping on demand.
+// Renders the token->original mapping grouped by kind (hostnames/IPv4/
+// IPv6/emails) inside a collapsible <details> so it doesn't dominate the
+// page when there are many redacted values, matching the always-visible
+// one-line summary engineers need at a glance plus the full mapping on
+// demand.
 function renderRedactionCallout(data) {
   const el = $("redactionCallout");
   const legend = data && data.legend;
@@ -791,10 +821,18 @@ function renderRedactionCallout(data) {
     return;
   }
   const hosts = legend.filter((e) => e.token.startsWith("HOST-"));
+  // IPv6/email prefixes must be checked BEFORE the plain "IP-" test below
+  // (v4.9.1) - "IPV6-1" does not start with "IP-" (the "V" breaks the
+  // match), so these are already mutually exclusive by construction, but
+  // filtering ipv6/email first keeps this readable regardless.
+  const ipv6s = legend.filter((e) => e.token.startsWith("IPV6-"));
+  const emails = legend.filter((e) => e.token.startsWith("EMAIL-"));
   const ips = legend.filter((e) => e.token.startsWith("IP-"));
   const parts = [];
   if (hosts.length) parts.push(`${hosts.length} hostname(s)`);
-  if (ips.length) parts.push(`${ips.length} IP address(es)`);
+  if (ips.length) parts.push(`${ips.length} IPv4 address(es)`);
+  if (ipv6s.length) parts.push(`${ipv6s.length} IPv6 address(es)`);
+  if (emails.length) parts.push(`${emails.length} email address(es)`);
   const renderGroup = (title, items) => (items.length
     ? `<div class="redaction-group"><h5>${escapeHtml(title)}</h5>${items.map((e) => `<code>${escapeHtml(e.token)}=${escapeHtml(e.original)}</code>`).join("")}</div>`
     : "");
@@ -802,7 +840,7 @@ function renderRedactionCallout(data) {
     <div class="redaction-summary">🔒 <strong>Redacted ${escapeHtml(parts.join(" and "))} before sending.</strong> Local-only mapping - never sent to the AI provider:</div>
     <details class="redaction-details">
       <summary>View mapping (${legend.length} value(s))</summary>
-      <div class="redaction-columns">${renderGroup("Hostnames", hosts)}${renderGroup("IP Addresses", ips)}</div>
+      <div class="redaction-columns">${renderGroup("Hostnames", hosts)}${renderGroup("IPv4 Addresses", ips)}${renderGroup("IPv6 Addresses", ipv6s)}${renderGroup("Email Addresses", emails)}</div>
     </details>`;
   el.classList.remove("hidden");
 }
@@ -2039,6 +2077,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initMainTabs();
   initAiProviders();
   initWhoami();
+  initSystemInfo();
   loadRecentJobs();
   updatePlaceholders();
 

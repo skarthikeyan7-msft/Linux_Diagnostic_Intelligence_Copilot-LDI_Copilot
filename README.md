@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.9.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.9.1-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -19,7 +19,7 @@ The CLI (`sosreport-rca`) is great for scripting/automation. This project wraps 
 - **Never have to remember to start Ollama** — clicking "Generate log analysis" with Ollama selected starts `ollama serve` automatically if it isn't already running, with progress visible in the activity terminal; a toolbar also gives direct manual Start/Stop/Refresh control any time
 - **Move freely between Provide Bundle / Analyzing / Results** at any time via a persistent top tab bar, instead of being forced through a linear wizard
 - **Watch background progress from a full-height activity terminal docked along the entire right edge** — bundle selection, scan progress, AI synthesis, Ollama start/stop, downloads — without needing to be on a specific tab
-- **Reduce exposure automatically when using a public AI model** — known hostnames and IP addresses are redacted from the evidence digest before it's sent to any non-local provider, with an explicit confirmation required before any external send, and the exact redaction mapping shown right on the Results page (see [SECURITY.md](SECURITY.md))
+- **Reduce exposure automatically when using a public AI model** — known hostnames, IPv4/IPv6 addresses, and email addresses are redacted from the evidence digest before it's sent to any non-local provider, with an explicit confirmation required before any external send, and the exact redaction mapping shown right on the Results page (see [SECURITY.md](SECURITY.md))
 - **Optionally serve over HTTPS and behind an auth gate** — if you need to reach this from more than just `localhost` (e.g. a team sharing one instance on a cloud VM), `--https` adds TLS and a non-loopback `--host` automatically requires signing in (per-user accounts if you provision any, else a shared password) - see "Sharing with a team" below
 - Get a live, readable dashboard (summary cards, cluster status, findings by category, chronological timeline) instead of a markdown file
 - Analyze `crm_report`/`hb_report` bundles too, with per-node attribution across a multi-node cluster
@@ -280,8 +280,8 @@ ldi-copilot/
 │   │   │                      # Ollama streaming clients, known_models registry, and
 │   │   │                      # list_models() live-availability checks
 │   │   ├── prompts.py         # focus-aware RCA synthesis system prompt + evidence-digest user prompt
-│   │   ├── redaction.py       # hostname/IPv4 redaction for non-local providers, with a
-│   │   │                      # local-only legend
+│   │   ├── redaction.py       # hostname/IPv4/IPv6/email redaction for non-local providers,
+│   │   │                      # with a local-only legend
 │   │   └── ollama_manager.py  # starts/stops/monitors a local `ollama serve` process on demand
 │   └── data/jobs/<id>/         # per-analysis uploaded file(s) + extracted tree + output (gitignored)
 ├── frontend/
@@ -325,7 +325,7 @@ Detects the crmsh `crm report` layout (`analysis.txt`, `cib.xml`, `members.txt`,
 - This is heuristic pattern-matching plus structured fact-checks, not a certified rules engine (e.g. Red Hat Insights, SUSE's SCA tool). Treat the digest as a strong evidence base for the AI/human review step, not an infallible verdict.
 - Focus-keyword matching is intentionally literal/simple; it cannot make causal leaps between differently-worded evidence on its own (that's the AI synthesis step's job) — if the Focused Findings section looks sparse, check the AI report and the full Digest/Timeline before concluding there's no relevant evidence.
 - Microsoft Entra ID auth requires network access to `login.microsoftonline.com` and your Azure OpenAI endpoint; it is not usable fully offline the way Ollama is.
-- The redaction feature is a best-effort mitigation, not a guarantee — it only catches known hostnames (from this analysis's own facts) and IPv4 addresses. It does not find customer/company names in free text, usernames, IPv6 addresses, or other identifiers. See [SECURITY.md](SECURITY.md) for the full picture.
+- The redaction feature is a best-effort mitigation, not a guarantee — it catches known hostnames (from this analysis's own facts, including when FQDN-qualified), IPv4 addresses, IPv6 addresses, and email addresses. It does not find customer/company names in free text, usernames, MAC addresses, or other identifiers — and a hostname mentioned only inside a large freeform verbatim block (e.g. crm_report's own analysis.txt cross-check) that this analysis never independently identified elsewhere won't be caught either. See [SECURITY.md](SECURITY.md) for the full picture.
 - Single-user, single-machine tool: job state is in-memory and does not survive a server restart (uploaded files/analysis output on disk do persist under `backend/data/jobs/` until deleted). Not designed to be deployed as a shared, centrally-reachable server for a team — see [SECURITY.md](SECURITY.md) for the recommended one-instance-per-engineer model.
 - No authentication on the local server itself — appropriate for local personal use; do not expose this server beyond localhost.
 - **SAR analysis** parses pre-rendered SAR *text* tables wherever a bundle stores them: sosreport's dedicated `sos_commands/sar/*` capture, sosreport's raw `var/log/sa/*` spool directory (checked too, but only the text files in it if any exist — the binary `saDD` files there are correctly skipped, not decoded), supportconfig's `sar/` directory (matched by directory membership, not filename, since supportconfig names files by date/day-of-month rather than anything containing "sar"), and crm_report's `sysstats.txt`. It does **not** decode raw binary sar data, which would require shelling out to the `sar`/`sadf` binary - a dependency this tool deliberately avoids so it stays portable across Windows/Linux/macOS without needing sysstat installed on the analysis machine itself. If sysstat wasn't installed on the customer's box, or no sar data was included in the capture at all, there's simply nothing to show — the Performance tab will say so rather than erroring.

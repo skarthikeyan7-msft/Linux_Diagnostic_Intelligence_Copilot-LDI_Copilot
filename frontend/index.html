@@ -110,7 +110,7 @@
         <div id="confidentialityPanel" class="confidentiality-panel hidden">
           <p class="muted small">⚠️ This sends the evidence digest (system/cluster names, log excerpts, IPs, etc. — not the raw uploaded archive) to <strong id="confidentialityProviderName">this provider</strong>, an external service. See <a href="SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a> for this project's full data-handling guidance.</p>
           <label class="checkbox-row">
-            <input type="checkbox" id="aiRedact" checked> 🔒 Redact known hostnames &amp; IP addresses before sending (recommended for customer data)
+            <input type="checkbox" id="aiRedact" checked> 🔒 Redact known hostnames, IPv4/IPv6 addresses &amp; email addresses before sending (recommended for customer data)
           </label>
           <label class="checkbox-row">
             <input type="checkbox" id="aiConfirmExternal"> I confirm I'm authorized to share this bundle's data with an external AI provider
@@ -142,10 +142,15 @@
               <option value="2">2</option>
               <option value="4">4</option>
               <option value="8">8</option>
+              <option value="16">16</option>
+              <option value="32">32</option>
+              <option value="64">64</option>
+              <option value="128">128</option>
             </select>
+            <p class="muted small" id="workersCpuNote">Detecting this machine's CPU core count…</p>
           </div>
         </div>
-        <p class="muted small">"Auto" detects CPU count and available memory and uses multiple processes to scan large bundles' files concurrently — small bundles stay single-process automatically since the speedup wouldn't be worth the overhead. Force "1" only if you need to compare timing or suspect a parallelism-related issue.</p>
+        <p class="muted small">"Auto" detects CPU count and available memory and uses multiple processes to scan large bundles' files concurrently — small bundles stay single-process automatically since the speedup wouldn't be worth the overhead. Picking a number above this machine's own CPU core count ("oversubscribing") can still help on bundles dominated by many small files (I/O-wait-bound — e.g. under real-time antivirus/EDR scanning overhead) but rarely helps, and can slightly hurt, on bundles dominated by a few huge files (CPU-bound regex scanning) — try it both ways if you're unsure which shape your bundle is. Force "1" to compare timing or rule out a parallelism-related issue.</p>
         <div class="scope-toggle">
           <label><input type="radio" name="scopeMode" value="full" checked> Analyze whole archive</label>
           <label><input type="radio" name="scopeMode" value="range"> Restrict to a date/time range</label>

@@ -58,19 +58,21 @@ import gzip
 import io
 import json
 import lzma
+import multiprocessing
 import os
 import platform
+import queue as queue_mod
 import re
 import sys
 import tarfile
 import time
 import zipfile
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.9.0"
+__version__ = "4.9.1"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -1119,7 +1121,23 @@ def classify_line(line: str, low: str):
 # --------------------------------------------------------------------------
 # Core scan
 # --------------------------------------------------------------------------
-def scan_file(root, relpath, kind, file_category, ctx, compression_kind=None):
+def scan_file(root, relpath, kind, file_category, ctx, compression_kind=None, progress_cb=None, progress_every_lines=5000):
+    """... (line-by-line pattern scan for one file - see module docstring
+    for the overall approach).
+
+    progress_cb (v4.9.1), if given, is called periodically as
+    progress_cb(lineno) while scanning THIS file - not just once per
+    file the way the outer scan loop already reports. This matters for
+    a single genuinely huge file (a real customer bundle had individual
+    rotated pacemaker logs in the 78-120MB range): without a hook at
+    this level, a multi-minute scan of ONE such file would still show
+    zero visible progress the whole time, even with per-file reporting
+    one level up - this closes that gap. Checked every
+    progress_every_lines lines (a cheap integer-counter check, not a
+    per-line function call) purely to bound the overhead of the check
+    itself on an ordinary-sized file; the caller (_scan_batch()) is
+    expected to further time-throttle its own actual reporting, since
+    line-count alone doesn't map predictably to wall-clock time."""
     fpath = root / relpath
     is_sc_txt = kind == "supportconfig"
     findings = ctx["findings"]
@@ -1164,6 +1182,8 @@ def scan_file(root, relpath, kind, file_category, ctx, compression_kind=None):
             gen = iter_supportconfig_lines(fh) if is_sc_txt else ((i, l.rstrip("\n"), None) for i, l in enumerate(fh, start=1))
             for lineno, line, source in gen:
                 stats["lines_scanned"] += 1
+                if progress_cb is not None and lineno % progress_every_lines == 0:
+                    progress_cb(lineno)
                 if compression_kind:
                     decompressed_bytes_seen += len(line) + 1
                     if decompressed_bytes_seen > _MAX_DECOMPRESSED_BYTES:
@@ -2786,10 +2806,29 @@ class _DigestArgs:
 #     untouched as the workers<=1 branch in run_analysis() - the
 #     multi-worker path is strictly additive, not a rewrite of the
 #     proven-correct single-threaded scan.
-_DEFAULT_MAX_WORKERS = 8  # hard ceiling regardless of CPU count - beyond
-# this, per-worker overhead (process startup, result-merging) and disk
-# I/O contention dominate any further gain for this workload; also keeps
-# a huge-core-count shared VM from being monopolized by one analysis job.
+_DEFAULT_MAX_WORKERS = 16  # ceiling for AUTO-DETECTION only (an explicit
+# user-requested worker count is handled separately below, capped by
+# _ABSOLUTE_MAX_WORKERS instead) - beyond this, per-worker overhead
+# (process startup, result-merging) and disk I/O contention dominate any
+# further gain for a typical CPU-bound scan; also keeps a huge-core-count
+# shared VM from being monopolized by one analysis job by default. Raised
+# from 8 (v4.9.0) to 16 (v4.9.1) to better fit real multi-core support
+# VMs without requiring a manual override for the common case.
+_ABSOLUTE_MAX_WORKERS = 128  # sanity ceiling applied ONLY to an EXPLICIT
+# user-requested worker count (never to auto-detection) - prevents an
+# obvious typo/misunderstanding from spawning an unreasonable number of
+# processes, while still letting an informed user genuinely test
+# oversubscription (more workers than CPU cores) up to a generous,
+# explicitly-chosen ceiling matching the highest option in the UI
+# dropdown. Deliberately NOT capped at this machine's CPU count the way
+# auto-detection is - oversubscription can genuinely help an I/O-wait-
+# dominated workload (e.g. many small files under real-time antivirus/
+# EDR scanning overhead, directly observed to add meaningful per-file
+# latency on at least one real deployment) even though it doesn't help
+# (and can mildly hurt, via context-switch overhead) a CPU-bound one
+# (regex-heavy scanning of a few huge files) - since which shape a given
+# bundle is can't be known in advance, this is offered as an informed,
+# explicit choice rather than something auto-detection would ever pick.
 _MIN_FILES_FOR_PARALLEL = 300      # below this, sequential is already fast
 _MIN_BYTES_FOR_PARALLEL = 20 * 1024 * 1024  # 20MB - ditto
 _EST_MB_PER_WORKER = 300  # conservative per-worker memory budget used to
@@ -2798,6 +2837,25 @@ _EST_MB_PER_WORKER = 300  # conservative per-worker memory budget used to
 # + that worker's share of accumulated findings; deliberately generous
 # rather than tightly tuned, since under-provisioning workers just costs
 # some speed, while over-provisioning them risks the VM's memory pressure.
+_CHUNKS_PER_WORKER = 6  # v4.9.1: submit this many times MORE work chunks
+# than worker processes, instead of exactly one large chunk per worker -
+# this is the actual fix for a real, directly-observed gap: with exactly
+# one static chunk per worker, a worker whose chunk happens to contain a
+# disproportionately large file (LPT partitioning balances by total
+# BYTES, but real scan cost isn't perfectly proportional to bytes alone -
+# regex-match density varies by content) becomes a "straggler" that runs
+# long after every other worker has already finished and exited, leaving
+# those other CPU cores sitting completely idle for the remainder of the
+# run even though the whole machine has spare capacity. Submitting many
+# more, smaller chunks than there are workers means concurrent.futures'
+# OWN internal task queue - not any custom scheduler - hands a newly-free
+# worker the next pending chunk immediately, so all cores stay busy until
+# the very last chunk is done, not just until each worker's own single
+# fixed assignment happens to run out.
+_MIN_ITEMS_PER_CHUNK = 3  # keeps a very high explicit worker request
+# (e.g. 128) on a modest-sized bundle from fragmenting into an excessive
+# number of near-empty chunks, each paying its own process-call/IPC
+# round-trip overhead for almost no actual scanning work.
 
 
 def _get_available_memory_mb():
@@ -2837,18 +2895,31 @@ def _get_available_memory_mb():
 
 def determine_worker_count(total_files, total_bytes, requested_workers=None):
     """Decides how many worker PROCESSES to use for the line-scanning
-    pass. requested_workers overrides auto-detection entirely when given
-    (1 forces the original sequential path; any other positive int is
-    used as-is, capped only by CPU count - an explicit request is
-    trusted over the heuristic). None (the default) auto-detects from:
-      - CPU count (os.cpu_count()) - the hard upper bound, since more
-        worker processes than cores cannot run truly concurrently;
+    pass. requested_workers overrides auto-detection entirely when given:
+      - 1 forces the original single-process sequential path;
+      - any other positive int is used AS-IS (an explicit request is
+        trusted over any heuristic), capped only by the generous
+        _ABSOLUTE_MAX_WORKERS sanity ceiling - deliberately NOT capped
+        at this machine's CPU count, unlike auto-detection below, since
+        oversubscription (more workers than cores) can genuinely help
+        an I/O-wait-dominated workload (e.g. many small files under
+        real-time antivirus/EDR scanning overhead) even though it won't
+        help - and can mildly hurt - a CPU-bound one. Which shape a
+        given bundle is can't be known in advance, so a higher explicit
+        request is honored rather than silently clamped back down to
+        "whatever this machine happens to have," which would make
+        offering those higher choices in the UI pointless.
+    None (the default) auto-detects from:
+      - CPU count (os.cpu_count()) - the hard upper bound here (but NOT
+        for an explicit request above), since more worker processes
+        than cores cannot run truly concurrently for CPU-bound work,
+        which is the safe assumption for an unspecified bundle;
       - available memory / _EST_MB_PER_WORKER - a soft cap so a
         memory-constrained VM doesn't get oversubscribed;
       - bundle size - below _MIN_FILES_FOR_PARALLEL/_MIN_BYTES_FOR_PARALLEL,
         returns 1 unconditionally, since process-pool startup overhead
         would outweigh any benefit on a small bundle;
-      - _DEFAULT_MAX_WORKERS - a hard ceiling regardless of how many
+      - _DEFAULT_MAX_WORKERS - a ceiling regardless of how many
         cores/memory are available (see constant comment above).
     Always returns at least 1.
     """
@@ -2858,8 +2929,7 @@ def determine_worker_count(total_files, total_bytes, requested_workers=None):
         except (TypeError, ValueError):
             requested_workers = None
     if requested_workers is not None and requested_workers >= 1:
-        cpu_count = os.cpu_count() or 1
-        return max(1, min(requested_workers, cpu_count))
+        return max(1, min(requested_workers, _ABSOLUTE_MAX_WORKERS))
 
     if total_files < _MIN_FILES_FOR_PARALLEL or total_bytes < _MIN_BYTES_FOR_PARALLEL:
         return 1
@@ -2895,7 +2965,7 @@ def _partition_items_by_size(items, num_partitions):
     return [p for p in partitions if p]  # drop any empty partition (more workers than items)
 
 
-def _scan_batch(root, kind, batch, window_start, window_end, max_examples, year_hint):
+def _scan_batch(root, kind, batch, window_start, window_end, max_examples, year_hint, worker_idx=None, progress_queue=None):
     """Worker-process entry point (must stay a plain top-level function -
     picklability across the process boundary depends on it). Scans every
     item in `batch` (a list of (relpath, category, compression_kind,
@@ -2904,7 +2974,32 @@ def _scan_batch(root, kind, batch, window_start, window_end, max_examples, year_
     needs zero locking. Reuses scan_file() completely unchanged; the only
     difference from the sequential path is that each worker gets its OWN
     ctx instead of all files sharing one - _merge_scan_contexts() below
-    combines them back into a single result afterward."""
+    combines them back into a single result afterward.
+
+    worker_idx/progress_queue (v4.9.1) let this batch report its own
+    live progress back to the main process while it's STILL RUNNING -
+    not just once the whole batch completes. This matters because a
+    single batch can legitimately take many minutes on a real bundle (a
+    batch with a share of several 100MB+ rotated logs, for example) -
+    without this, the only feedback during that whole stretch was
+    silence, which is easy to mistake for a hang. progress_queue is a
+    multiprocessing.Manager().Queue(), safely shareable across the
+    process boundary on both the "spawn" (Windows) and "fork"
+    (Linux/macOS) start methods. Both parameters are optional and default
+    to a no-op so this function still works exactly as before when
+    called directly (e.g. by tests) without them - and any failure to
+    report progress (a queue hiccup, the Manager process being briefly
+    unavailable) is swallowed silently rather than ever risking the
+    actual scan itself.
+
+    NOTE (v4.9.1): despite the parameter name, worker_idx is really a
+    CHUNK index, not a 1:1 worker-process index - since one worker
+    process now runs many chunks in sequence over the life of the pool
+    (see the dynamic-chunking rationale on _CHUNKS_PER_WORKER above),
+    not just the one fixed batch it got in earlier versions. The
+    parameter name was left as-is since callers only ever treat it as
+    an opaque label to report back in the progress tuple; it never
+    needed "worker identity" semantics even before this change."""
     local_ctx = {
         "findings": {}, "timeline": [], "log_spans": {},
         "max_examples": max_examples,
@@ -2914,7 +3009,19 @@ def _scan_batch(root, kind, batch, window_start, window_end, max_examples, year_
                    "lines_in_window": 0, "lines_out_of_window": 0,
                    "compressed_files_scanned": 0, "decompressed_size_capped": 0},
     }
-    for relpath, category, compression_kind, _size in batch:
+    last_progress_report = time.time()
+    for idx, (relpath, category, compression_kind, _size) in enumerate(batch, start=1):
+        # Reported BEFORE scan_file() runs, same rationale as the
+        # sequential path's own progress line: a single large/slow file
+        # shows up immediately as "currently scanning" instead of the
+        # whole ~3s reporting window going silent for however long that
+        # one file takes.
+        if progress_queue is not None and time.time() - last_progress_report > 3:
+            try:
+                progress_queue.put_nowait((worker_idx, relpath, idx, len(batch)))
+            except Exception:
+                pass
+            last_progress_report = time.time()
         scan_file(root, relpath, kind, category, local_ctx, compression_kind=compression_kind)
         local_ctx["stats"]["files_scanned"] += 1
         if compression_kind:
@@ -3029,8 +3136,15 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
     Pass 1 to force the original single-process sequential path
     unconditionally (e.g. for debugging, or on a memory-constrained
     system where you'd rather it just be slower than risk memory
-    pressure), or any other positive int to pin an explicit worker count
-    (still capped at the machine's actual CPU count).
+    pressure), or any other positive int to pin an explicit worker count -
+    capped only at the generous _ABSOLUTE_MAX_WORKERS sanity ceiling
+    (128), deliberately NOT at this machine's CPU count, since
+    oversubscription can genuinely help an I/O-wait-dominated workload
+    (v4.9.1; see determine_worker_count()'s docstring for the full
+    rationale). Actual scanning work is split into more, smaller chunks
+    than the worker count (v4.9.1) so a worker that finishes its share
+    early can immediately pick up more pending work instead of idling
+    while a "straggler" worker grinds on alone.
 
     progress_cb(message: str), if given, is called with human-readable
     progress strings instead of printing to stdout - used by the web
@@ -3148,41 +3262,117 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         # Original, proven-correct sequential path - unconditionally used
         # for small bundles (auto-detection already returns 1 for those)
         # or when workers=1 is explicitly forced. Zero behavior change
-        # from pre-v4.9.0 for this branch.
+        # from pre-v4.9.0 for this branch, plus the v4.9.1 mid-file
+        # progress_cb hook below (a single huge file - a real customer
+        # bundle had individual rotated logs in the 78-120MB range - can
+        # otherwise run for many minutes with zero visible progress even
+        # though the surrounding per-file loop reports every 5s).
         last_report = time.time()
         for idx, (relpath, category, compression_kind, _size) in enumerate(scannable, start=1):
             if time.time() - last_report > 5:
                 suffix = f" (decompressing {compression_kind})" if compression_kind else ""
                 report(f"  ...scanning {relpath}{suffix}  ({idx}/{len(scannable)} files, {len(ctx['findings'])} distinct findings so far)")
                 last_report = time.time()
-            scan_file(root, relpath, kind, category, ctx, compression_kind=compression_kind)
+
+            def _mid_file_progress(lineno, _relpath=relpath, _idx=idx):
+                nonlocal last_report
+                if time.time() - last_report > 5:
+                    report(f"  ...scanning {_relpath}  (line {lineno:,} - {_idx}/{len(scannable)} files, {len(ctx['findings'])} distinct findings so far)")
+                    last_report = time.time()
+
+            scan_file(root, relpath, kind, category, ctx, compression_kind=compression_kind, progress_cb=_mid_file_progress)
             ctx["stats"]["files_scanned"] += 1
             if compression_kind:
                 ctx["stats"]["compressed_files_scanned"] += 1
     else:
+        cpu_count = os.cpu_count() or 1
         why = "auto-detected from CPU/memory" if workers is None else "requested"
-        report(f"  Using {worker_count} parallel worker processes for {len(scannable)} files (~{human_size(total_scan_bytes)}) - {why}")
-        partitions = _partition_items_by_size(scannable, worker_count)
+        # Chunked into MANY MORE, smaller pieces than worker_count
+        # (_CHUNKS_PER_WORKER) rather than exactly one large chunk per
+        # worker - see that constant's comment for the full rationale.
+        # In short: this lets concurrent.futures' own internal task
+        # queue dynamically hand a newly-free worker the next pending
+        # chunk immediately, instead of every worker being stuck with a
+        # single large, fixed assignment for the whole run - which is
+        # what let some workers finish early and sit idle on spare CPU
+        # capacity while a few "unlucky" ones (whichever got assigned a
+        # disproportionately huge file) kept grinding away alone.
+        chunk_count = min(len(scannable), worker_count * _CHUNKS_PER_WORKER, max(1, len(scannable) // _MIN_ITEMS_PER_CHUNK))
+        chunk_count = max(chunk_count, 1)
+        chunks = _partition_items_by_size(scannable, chunk_count)
+        report(f"  Using {worker_count} parallel worker processes ({len(chunks)} work chunks, dynamically distributed) for {len(scannable)} files (~{human_size(total_scan_bytes)}) - {why} (this machine reports {cpu_count} logical CPU core(s))")
         try:
             partial_ctxs = []
-            with ProcessPoolExecutor(max_workers=len(partitions)) as pool:
-                futures = {
-                    pool.submit(_scan_batch, root, kind, part, start_dt, end_dt, max_examples, year_hint): (i, len(part), sum(x[3] for x in part))
-                    for i, part in enumerate(partitions, start=1)
-                }
-                for future in as_completed(futures):
-                    worker_idx, n_files, n_bytes = futures[future]
-                    try:
-                        partial_ctxs.append(future.result())
-                        report(f"  worker {worker_idx}/{len(partitions)} finished: {n_files} files (~{human_size(n_bytes)})")
-                    except Exception as e:
-                        # One worker failing (a genuinely unexpected bug,
-                        # not the routine per-file OSError/UnicodeDecodeError
-                        # scan_file() already handles internally) shouldn't
-                        # take down the whole analysis - report it clearly
-                        # and continue with whatever the OTHER workers did
-                        # produce, rather than losing all of their work too.
-                        report(f"  ⚠️ worker {worker_idx}/{len(partitions)} failed ({n_files} files skipped): {e}")
+            # multiprocessing.Manager().Queue() (not a plain
+            # multiprocessing.Queue()) is used here specifically because
+            # it's a proxy object, safely picklable/shareable across the
+            # process boundary on both the "spawn" (Windows) and "fork"
+            # (Linux/macOS) start methods without any extra setup - a
+            # plain multiprocessing.Queue() also works via inheritance on
+            # fork, but Manager's version is the more portable choice
+            # given this project runs on both platforms.
+            with multiprocessing.Manager() as manager:
+                progress_queue = manager.Queue()
+                with ProcessPoolExecutor(max_workers=worker_count) as pool:
+                    # Submitting all chunks up front (far more than
+                    # max_workers) is exactly what enables the dynamic
+                    # redistribution described above - the executor only
+                    # ever runs `worker_count` of these concurrently, and
+                    # automatically starts the next pending one on
+                    # whichever worker process finishes first, with zero
+                    # custom scheduling code needed on this end.
+                    futures = {
+                        pool.submit(_scan_batch, root, kind, chunk, start_dt, end_dt, max_examples, year_hint, i, progress_queue): (i, len(chunk), sum(x[3] for x in chunk))
+                        for i, chunk in enumerate(chunks, start=1)
+                    }
+                    total_chunks = len(futures)
+                    pending = set(futures.keys())
+                    completed = 0
+                    last_progress_report = time.time()
+                    # Polling loop (rather than a blocking as_completed()
+                    # iterator) so this can ALSO drain live per-file
+                    # progress messages from still-running chunks while
+                    # waiting - fixes a real gap where, before v4.9.1,
+                    # nothing was reported until an entire chunk finished,
+                    # which on a real multi-GB bundle can legitimately
+                    # take minutes of apparent silence that's easy to
+                    # mistake for a hang.
+                    while pending:
+                        newly_done = {f for f in pending if f.done()}
+                        for future in newly_done:
+                            chunk_idx, n_files, n_bytes = futures[future]
+                            completed += 1
+                            try:
+                                partial_ctxs.append(future.result())
+                            except Exception as e:
+                                # One chunk failing (a genuinely unexpected
+                                # bug, not the routine per-file
+                                # OSError/UnicodeDecodeError scan_file()
+                                # already handles internally) shouldn't
+                                # take down the whole analysis - report it
+                                # clearly and continue with whatever every
+                                # OTHER chunk did produce, rather than
+                                # losing all of that work too.
+                                report(f"  ⚠️ chunk {chunk_idx}/{total_chunks} failed ({n_files} files skipped): {e}")
+                        pending -= newly_done
+                        latest_progress = None
+                        while True:
+                            try:
+                                latest_progress = progress_queue.get_nowait()
+                            except queue_mod.Empty:
+                                break
+                            except Exception:
+                                break  # a Manager/proxy hiccup here must never abort the actual scan
+                        if time.time() - last_progress_report > 5:
+                            running_now = min(worker_count, sum(1 for f in pending if f.running()))
+                            if latest_progress:
+                                w_idx, relpath, i_in_chunk, chunk_len = latest_progress
+                                report(f"  ...scanning {relpath}  (chunk {w_idx}/{total_chunks}, {i_in_chunk}/{chunk_len} in that chunk) - {completed}/{total_chunks} chunks done, {running_now} active now")
+                            else:
+                                report(f"  ...{completed}/{total_chunks} chunks done, {running_now} active now, {len(pending)} remaining")
+                            last_progress_report = time.time()
+                        if pending:
+                            time.sleep(0.5)
             merged = _merge_scan_contexts(partial_ctxs, max_examples)
             ctx["findings"] = merged["findings"]
             ctx["timeline"] = merged["timeline"]

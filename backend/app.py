@@ -40,7 +40,7 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # allow `import engine`, `import ai` when run directly
 
-from engine import run_analysis, AnalysisError
+from engine import run_analysis, AnalysisError, determine_worker_count, _get_available_memory_mb, _DEFAULT_MAX_WORKERS, _ABSOLUTE_MAX_WORKERS
 from ai import (
     PROVIDERS, stream_chat, ProviderError, build_messages, list_models,
     collect_known_hostnames, redact_text, build_redaction_summary, ollama_manager,
@@ -510,9 +510,11 @@ async def synthesize(job_id: str, payload: dict):
 
     `redact` (bool, default True) - when the selected provider is not
     local (i.e. not Ollama), the evidence digest has its known
-    hostnames/node names and IPv4 addresses replaced with stable,
-    meaningless tokens (HOST-1, IP-1, ...) before it's sent externally.
-    A "legend" SSE event is emitted first (local-only - this mapping is
+    hostnames/node names, IPv4/IPv6 addresses, and email addresses
+    replaced with stable, meaningless tokens (HOST-1, IP-1, IPV6-1,
+    EMAIL-1, ...) before it's sent externally - see
+    backend/ai/redaction.py for exactly what is/isn't covered. A
+    "legend" SSE event is emitted first (local-only - this mapping is
     never part of the outbound request) so the browser can show what
     was redacted."""
     job = _get_job_or_404(job_id)
@@ -780,6 +782,25 @@ def get_redaction(job_id: str):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": app.version}
+
+
+@app.get("/api/system-info")
+def system_info():
+    """Exposes this machine's detected CPU/memory capacity and the
+    resulting default (auto-detected, zero-bundle) worker-count ceilings
+    (v4.9.1) - lets the frontend's "Parallel scanning workers" dropdown
+    show real, machine-specific numbers (e.g. "Auto (this machine: 8 CPU
+    cores)") instead of guessing, so a choice like 16/32/64/128 can be
+    made with actual context about whether it's within, or well beyond,
+    this machine's real core count."""
+    cpu_count = os.cpu_count() or 1
+    avail_mb = _get_available_memory_mb()
+    return {
+        "cpu_count": cpu_count,
+        "available_memory_mb": round(avail_mb) if avail_mb is not None else None,
+        "default_max_workers": min(cpu_count, _DEFAULT_MAX_WORKERS),
+        "absolute_max_workers": _ABSOLUTE_MAX_WORKERS,
+    }
 
 
 @app.post("/api/shutdown")
