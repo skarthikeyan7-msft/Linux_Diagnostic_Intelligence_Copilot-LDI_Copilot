@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.7.1-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.8.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -191,6 +191,8 @@ Every bundle is **automatically** analyzed across all of the below — there's n
 - **🐧 OS & Config (v4.7.0)** — detects OS family/major/minor version (RHEL/CentOS/Rocky/AlmaLinux, SLES/openSUSE) from whatever release-identification file the bundle has, then shows a short "what's different about this major version" orientation, a curated list of known version-specific gotchas (cgroup v1↔v2 container migration, iptables/nftables coexistence, HA-cluster firewall ports, SELinux config-vs-runtime drift, and more) with links to official vendor docs, and a support-lifecycle hint. Alongside that, a config-file anomaly scanner checks `sysctl`, `limits.conf`, `fstab`, `corosync.conf`, `multipath.conf`, `chrony`/`ntp.conf`, `resolv.conf`, and the SELinux config file for known-risky or known-inconsistent settings. See CHANGELOG.md's [4.7.0] entry for the full list of what's checked.
 
 Every one of the above shows its data on its own dedicated Results tab, or the explicit message **"No relevant data found from the sosreport or supportconfig."** when that category has nothing to show for this particular bundle.
+
+**Compressed rotated logs (v4.8.0):** every file scanned above - not just `/var/log/messages` but audit logs, cluster logs, anything - is decompressed transparently if it's gzip/bz2/xz-compressed (detected by content, not filename - correctly handles even a stacked/double-compressed file like `messages-20260406.xz.gz`). Rotated logs going back years are common in real bundles and are now fully scanned instead of silently skipped as "binary."
 
 **Analysis focus areas** (Step 1 → Advanced options) let you narrow which of the sections above actually render in the digest/AI report — useful once you already know a given axis isn't relevant to this investigation. Every analyzer still *runs* regardless (they're cheap, and the full structured data stays available in `facts.json`/the API either way) — the toggles only control what's emphasized in what you and the AI actually read. All checked by default.
 

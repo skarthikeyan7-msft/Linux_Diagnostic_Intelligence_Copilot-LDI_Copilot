@@ -18,7 +18,12 @@ Nothing is skipped: inventory.json lists every file encountered, and
 findings.json keeps every deduplicated pattern match with exact
 file:line provenance so a human or an LLM reasoning layer can jump to
 the original source and verify/expand any finding. digest.md is the
-condensed, ranked summary meant to be read first.
+condensed, ranked summary meant to be read first. Individually
+compressed files (gzip/bz2/xz - the common rotated-log pattern, e.g.
+"messages-20180803.gz", including stacked compression like
+"messages-20260406.xz.gz") are transparently decompressed and scanned
+exactly like plain text, detected by content (magic bytes), not
+filename - see "Compressed-file support" below.
 
 Usage:
     python analyzer.py <input_path> [--output DIR] [--min-severity SEV]
@@ -47,7 +52,11 @@ Outputs (written to --output, default "<input>_analysis" next to input):
     inventory.json     - every file found, with size + assigned category
 """
 import argparse
+import bz2
+import gzip
+import io
 import json
+import lzma
 import os
 import re
 import sys
@@ -58,7 +67,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.7.1"
+__version__ = "4.8.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -369,12 +378,185 @@ CRM_REPORT_DETECT_MARKERS = {
     "crm_mon.txt", "corosync.conf",
 }
 
+# .gz/.bz2/.xz stay listed here too, as a deliberate fallback: real
+# detection of compressed content below is by MAGIC BYTES, not this
+# extension list, so a corrupted/zero-byte ".gz" (or a file mis-named
+# with a compression extension it doesn't actually have) still correctly
+# lands here and gets skipped as binary, rather than being fed raw
+# compressed bytes through the text-line scanner as garbage. ".zip" is
+# deliberately NOT given the same magic-byte-decompression treatment as
+# gzip/bz2/xz below - it's a multi-member container format (could hold
+# many files, not one compressed stream), which is a materially bigger
+# feature (member listing, path-traversal safety, "which member(s) do we
+# even scan") than this project's actual real-world need: individual
+# rotated-log-style files compressed with gzip/bz2/xz, optionally
+# stacked (e.g. "messages-20260406.xz.gz") - see open_decompressed_text()
+# below. A full sosreport/supportconfig/crm_report bundle that is ITSELF
+# a .zip is already handled separately, at extraction time, before any
+# of this per-file categorization ever runs.
 BINARY_SKIP_EXTS = {
     ".rpm", ".deb", ".gz", ".bz2", ".xz", ".zip", ".png", ".jpg", ".jpeg",
     ".gif", ".ico", ".pdf", ".db", ".sqlite", ".sqlite3", ".journal",
     ".pcap", ".pcapng", ".so", ".ko", ".bin", ".img", ".qcow2", ".vmdk",
     ".tar", ".core",
 }
+
+# --------------------------------------------------------------------------
+# Compressed-file support (v4.8.0)
+# --------------------------------------------------------------------------
+# Real sosreport/supportconfig bundles routinely carry rotated logs that
+# are individually compressed - e.g. "messages-20180803.gz", or (seen on
+# a real customer bundle) double-compressed "messages-20260406.xz.gz"
+# (an xz-compressed log that got gzipped again on top, most likely by a
+# separate backup/transfer step). Before v4.8.0 these were silently
+# skipped as "binary" (.gz/.bz2/.xz are in BINARY_SKIP_EXTS above) and
+# NEVER scanned for failure signatures - a real, silent gap, especially
+# since rotated logs from just before an incident are exactly the kind
+# of evidence a root-cause investigation needs.
+#
+# Detection is by MAGIC BYTES, not filename extension - deliberately, so
+# a mis-named or extra/missing extension (like the ".xz.gz" case above,
+# where it's ambiguous from the name alone whether that's genuinely two
+# compression layers or an extra suffix tacked onto an already-single-
+# compressed file) is still handled correctly: peel_one_compression_layer()
+# below is only ever driven by what the bytes actually are, checked again
+# after each peel, so it naturally stops exactly where genuine compression
+# stops - whether that's after 0, 1, or 2 layers - regardless of what the
+# filename claims.
+_GZIP_MAGIC = b"\x1f\x8b"
+_BZ2_MAGIC = b"BZh"
+_XZ_MAGIC = b"\xfd7zXZ\x00"
+_MAX_COMPRESSION_LAYERS = 3  # generous (real cases need at most 2); bounds worst-case work on a pathological filename
+_MAX_DECOMPRESSED_BYTES = 2 * 1024 ** 3  # 2 GB - a zip-bomb/corruption guard, not a real-world limit (see scan_file)
+
+
+def sniff_compression_kind(head: bytes):
+    """Given the first few bytes already read from a file, returns
+    'gzip'/'bz2'/'xz' if they match a known compression magic number,
+    else None. Split out from any actual file I/O so peel_one_
+    compression_layer() can call this again on already-decompressed
+    in-memory bytes without a redundant read."""
+    if head.startswith(_GZIP_MAGIC):
+        return "gzip"
+    if head.startswith(_BZ2_MAGIC):
+        return "bz2"
+    if head.startswith(_XZ_MAGIC):
+        return "xz"
+    return None
+
+
+def _peel_one_layer(binary_stream, kind):
+    """Wraps binary_stream in the decompressor for `kind`, returning a
+    new binary file-like object that streams the decompressed content
+    (decompression happens lazily as it's read, not all at once)."""
+    if kind == "gzip":
+        return gzip.GzipFile(fileobj=binary_stream)
+    if kind == "bz2":
+        return bz2.BZ2File(binary_stream)
+    return lzma.LZMAFile(binary_stream)
+
+
+def open_decompressed_binary(fpath, max_layers=_MAX_COMPRESSION_LAYERS):
+    """Opens fpath and peels up to max_layers of gzip/bz2/xz compression,
+    one layer at a time, re-checking the magic bytes after each peel -
+    correctly handles both a single layer (the common case) and a
+    genuinely double-compressed file like "messages-20260406.xz.gz"
+    (gzip-of-xz) without needing to know in advance which of those it is.
+    Returns a binary streaming file-like object positioned at the start
+    of the fully-decompressed content, or None if fpath isn't compressed
+    at all (no magic bytes matched on the very first layer - caller
+    should fall back to a plain open()) or if opening/peeling fails for
+    any reason (corrupt/truncated archive) - never raises."""
+    try:
+        stream = open(fpath, "rb")
+        head = stream.read(6)
+        stream.seek(0)
+    except OSError:
+        return None
+    kind = sniff_compression_kind(head)
+    if kind is None:
+        stream.close()
+        return None
+    try:
+        for _ in range(max_layers):
+            stream = _peel_one_layer(stream, kind)
+            head = stream.read(6)
+            stream.seek(0)
+            kind = sniff_compression_kind(head)
+            if kind is None:
+                break
+        return stream
+    except (OSError, EOFError, lzma.LZMAError) as e:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        return None
+
+
+def open_decompressed_text(fpath, max_layers=_MAX_COMPRESSION_LAYERS):
+    """Same as open_decompressed_binary(), wrapped in a text-mode
+    TextIOWrapper (UTF-8, invalid bytes replaced rather than raising) so
+    callers can iterate it exactly like a plain open(fpath, "r", ...) -
+    this is what makes decompressed logs reuse every existing line-by-
+    line scanning helper (classify_line, parse_timestamp,
+    iter_supportconfig_lines, ...) completely unchanged."""
+    stream = open_decompressed_binary(fpath, max_layers=max_layers)
+    if stream is None:
+        return None
+    return io.TextIOWrapper(stream, encoding="utf-8", errors="replace")
+
+
+def is_probably_text_bytes(chunk: bytes) -> bool:
+    """The actual text-vs-binary heuristic, extracted from
+    is_probably_text() so it can also be applied to a peek of
+    DECOMPRESSED content (a compressed file might still wrap genuine
+    binary data - some backup/monitoring tools gzip arbitrary state, not
+    just logs - and that should still be skipped, not fed through the
+    line scanner as garbage)."""
+    if not chunk:
+        return True
+    if b"\x00" in chunk:
+        return False
+    text_chars = sum(1 for b in chunk if 9 <= b <= 13 or 32 <= b <= 126 or b >= 128)
+    return (text_chars / len(chunk)) > 0.85
+
+
+def classify_file_readability(fpath):
+    """Single-open, single-read decision (deliberately: this runs once
+    per file in a bundle that can hold 90,000+ files, so it must not add
+    a second I/O pass over every ordinary, non-compressed file just to
+    support the compressed-log case) on how - or whether - fpath should
+    be line-scanned. Returns (mode, compression_kind):
+      ("text", None)         - open normally
+      ("compressed", "gzip"/"bz2"/"xz") - open via open_decompressed_text()
+                                 (compression_kind is the OUTERMOST layer
+                                 found, informational only)
+      ("skip", None)         - binary, unreadable, or a compressed
+                                 stream whose decompressed content still
+                                 isn't text
+    """
+    try:
+        with open(fpath, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return "skip", None
+    kind = sniff_compression_kind(head)
+    if kind is not None:
+        try:
+            dec = open_decompressed_text(fpath)
+            if dec is None:
+                return "skip", None
+            with dec as fh2:
+                dec_head = fh2.read(4096)
+            if is_probably_text_bytes(dec_head.encode("utf-8", errors="replace")):
+                return "compressed", kind
+        except Exception:
+            pass
+        return "skip", None
+    if fpath.suffix.lower() in BINARY_SKIP_EXTS:
+        return "skip", None
+    return ("text", None) if is_probably_text_bytes(head) else ("skip", None)
 
 SECTION_HEADER_RE = re.compile(r"^#==\[\s*(.+?)\s*\]=+#\s*$")
 SYSLOG_TS_RE = re.compile(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})")
@@ -711,12 +893,7 @@ def is_probably_text(path: Path) -> bool:
             chunk = fh.read(4096)
     except OSError:
         return False
-    if not chunk:
-        return True
-    if b"\x00" in chunk:
-        return False
-    text_chars = sum(1 for b in chunk if 9 <= b <= 13 or 32 <= b <= 126 or b >= 128)
-    return (text_chars / len(chunk)) > 0.85
+    return is_probably_text_bytes(chunk)
 
 
 def build_inventory(root: Path, kind: str):
@@ -754,7 +931,21 @@ def find_by_basename_prefix(inventory, *prefixes):
 
 
 def get_text(root: Path, relpath: str, max_bytes=2_000_000) -> str:
+    """Reads up to max_bytes of text from relpath. Transparently
+    decompresses gzip/bz2/xz (and stacked combinations) content first if
+    the file's magic bytes indicate it's compressed - every analyzer
+    that reads a specific known file via find_inventory()+get_text()
+    (SELinux denial counts, package lists, systemd-analyze output, ...)
+    gets compressed-log support for free this way, with zero changes
+    needed in any of those individual check functions."""
     p = root / relpath
+    dec = open_decompressed_binary(p)
+    if dec is not None:
+        try:
+            with dec as fh:
+                return fh.read(max_bytes).decode("utf-8", errors="replace")
+        except OSError:
+            return ""
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as fh:
             return fh.read(max_bytes)
@@ -925,7 +1116,7 @@ def classify_line(line: str, low: str):
 # --------------------------------------------------------------------------
 # Core scan
 # --------------------------------------------------------------------------
-def scan_file(root, relpath, kind, file_category, ctx):
+def scan_file(root, relpath, kind, file_category, ctx, compression_kind=None):
     fpath = root / relpath
     is_sc_txt = kind == "supportconfig"
     findings = ctx["findings"]
@@ -949,11 +1140,32 @@ def scan_file(root, relpath, kind, file_category, ctx):
     # forward across timestamp-less continuation lines (e.g. multi-line
     # stack traces) so they inherit the enclosing event's time for both
     # window-gating and timeline placement.
+    decompressed_bytes_seen = 0  # only ever incremented/checked when
+    # compression_kind is set (see below) - zero added cost to the
+    # ordinary plain-text path, which has no equivalent cap: an on-disk
+    # plain-text file's scan cost is bounded by its own real size, but a
+    # compressed file's on-disk size can be wildly smaller than what it
+    # decompresses to (accidentally, via corruption, or a deliberate
+    # zip-bomb-style archive) - _MAX_DECOMPRESSED_BYTES is a safety net
+    # for that specific risk, not a real-world limit on legitimate
+    # rotated logs (which compress at best a few dozen:1).
     try:
-        with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+        if compression_kind:
+            fh_cm = open_decompressed_text(fpath)
+            if fh_cm is None:
+                stats["read_errors"] += 1
+                return
+        else:
+            fh_cm = open(fpath, "r", encoding="utf-8", errors="replace")
+        with fh_cm as fh:
             gen = iter_supportconfig_lines(fh) if is_sc_txt else ((i, l.rstrip("\n"), None) for i, l in enumerate(fh, start=1))
             for lineno, line, source in gen:
                 stats["lines_scanned"] += 1
+                if compression_kind:
+                    decompressed_bytes_seen += len(line) + 1
+                    if decompressed_bytes_seen > _MAX_DECOMPRESSED_BYTES:
+                        stats["decompressed_size_capped"] += 1
+                        break
                 ts = None
                 if track_span:
                     ts = parse_timestamp(line, stats["year_hint"])
@@ -1003,7 +1215,7 @@ def scan_file(root, relpath, kind, file_category, ctx):
                             "ts": ts_for_timeline.isoformat(), "severity": sev, "category": category,
                             "file": provenance, "line": lineno, "text": line.strip()[:220],
                         })
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError, EOFError, lzma.LZMAError):
         stats["read_errors"] += 1
 
 
@@ -2137,7 +2349,10 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
     lines.append(f"- **Source:** `{input_path}`")
     lines.append(f"- **Extracted root:** `{root}`")
     lines.append(f"- **Files inventoried:** {len(inventory):,}")
-    lines.append(f"- **Files content-scanned:** {stats['files_scanned']:,} (binary/empty skipped: {stats['files_skipped_binary']:,}, read errors: {stats['read_errors']:,})")
+    compressed_note = f", {stats['compressed_files_scanned']:,} transparently decompressed (gzip/bz2/xz)" if stats.get("compressed_files_scanned") else ""
+    lines.append(f"- **Files content-scanned:** {stats['files_scanned']:,}{compressed_note} (binary/empty skipped: {stats['files_skipped_binary']:,}, read errors: {stats['read_errors']:,})")
+    if stats.get("decompressed_size_capped"):
+        lines.append(f"- ⚠️ **{stats['decompressed_size_capped']} compressed file(s) exceeded the {human_size(_MAX_DECOMPRESSED_BYTES)} decompressed-size safety cap** and were only partially scanned (guards against a corrupted or maliciously-crafted archive expanding without bound - not expected on legitimate rotated logs).")
     if stats.get("window_active"):
         lines.append(f"- **Lines scanned:** {stats['lines_scanned']:,} (~{human_size(stats['bytes_scanned'])}) — **{stats['lines_in_window']:,} in-window / {stats['lines_out_of_window']:,} excluded by time filter**")
     else:
@@ -2662,7 +2877,8 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         "window_start": start_dt, "window_end": end_dt,
         "stats": {"bytes_scanned": 0, "lines_scanned": 0, "read_errors": 0,
                    "files_scanned": 0, "files_skipped_binary": 0, "year_hint": year_hint,
-                   "lines_in_window": 0, "lines_out_of_window": 0, "window_active": window_active},
+                   "lines_in_window": 0, "lines_out_of_window": 0, "window_active": window_active,
+                   "compressed_files_scanned": 0, "decompressed_size_capped": 0},
     }
     if window_active:
         report(f"Time window active: {start_dt or '(open start)'} -> {end_dt or '(open end)'} (chronological logs only; config/snapshot files always fully scanned)")
@@ -2674,7 +2890,13 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         if item["size"] <= 0:
             continue
         fpath = root / relpath
-        if not is_probably_text(fpath):
+        # classify_file_readability() detects gzip/bz2/xz-compressed
+        # files (e.g. rotated logs like "messages-20260406.xz.gz") by
+        # magic bytes and transparently decompresses them for scanning,
+        # rather than skipping them as binary the way a plain extension
+        # check would - see the "Compressed-file support" section above.
+        readability, compression_kind = classify_file_readability(fpath)
+        if readability == "skip":
             ctx["stats"]["files_skipped_binary"] += 1
             continue
         # Reported BEFORE scan_file() runs (not after) so a single very
@@ -2683,13 +2905,16 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         # the progress line going silent for that entire stretch with no
         # indication of which file is responsible.
         if time.time() - last_report > 5:
-            report(f"  ...scanning {relpath}  ({idx}/{len(inventory)} files, {len(ctx['findings'])} distinct findings so far)")
+            suffix = f" (decompressing {compression_kind})" if compression_kind else ""
+            report(f"  ...scanning {relpath}{suffix}  ({idx}/{len(inventory)} files, {len(ctx['findings'])} distinct findings so far)")
             last_report = time.time()
-        scan_file(root, relpath, kind, item["category"], ctx)
+        scan_file(root, relpath, kind, item["category"], ctx, compression_kind=compression_kind)
         ctx["stats"]["files_scanned"] += 1
+        if compression_kind:
+            ctx["stats"]["compressed_files_scanned"] += 1
 
     stats = ctx["stats"]
-    report(f"Scan complete: {stats['files_scanned']} files scanned, {stats['lines_scanned']:,} lines, {len(ctx['findings'])} distinct findings")
+    report(f"Scan complete: {stats['files_scanned']} files scanned ({stats['compressed_files_scanned']} decompressed), {stats['lines_scanned']:,} lines, {len(ctx['findings'])} distinct findings")
     if window_active:
         report(f"  ({stats['lines_in_window']:,} lines in-window, {stats['lines_out_of_window']:,} excluded by time filter)")
 

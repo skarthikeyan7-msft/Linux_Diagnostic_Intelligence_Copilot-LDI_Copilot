@@ -53,7 +53,7 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="4.7.1")
+app = FastAPI(title="LDI Copilot", version="4.8.0")
 
 USERS_PATH = BASE_DIR / "backend" / "data" / "users.json"
 USER_STORE = UserStore(USERS_PATH)
