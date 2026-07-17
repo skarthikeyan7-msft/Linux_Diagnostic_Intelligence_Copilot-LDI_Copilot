@@ -554,6 +554,11 @@ async function startAnalysis() {
   fd.append("focus", focusText);
   fd.append("min_severity", $("optMinSeverity").value);
   fd.append("top_per_category", $("optTopPerCategory").value);
+  // "" (Auto) is deliberately NOT appended at all - the backend's
+  // workers Form field defaults to None (auto-detect) when omitted;
+  // sending an empty string would fail FastAPI's int|None parsing.
+  const workersVal = $("optWorkers").value;
+  if (workersVal) fd.append("workers", workersVal);
 
   const checkedFocusAreas = Array.from(document.querySelectorAll(".focus-area-cb:checked")).map((cb) => cb.value);
   // Always sent explicitly (even "all checked", even "" if the user

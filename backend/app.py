@@ -242,6 +242,7 @@ async def analyze(
     window: float = Form(60.0),
     focus_areas: str | None = Form(None),
     pcap_file: UploadFile | None = File(None),
+    workers: int | None = Form(None),
 ):
     """Start a new analysis job. Accepts EITHER an uploaded archive/file
     (drag-and-drop from the browser) OR a server_path already on disk
@@ -267,7 +268,13 @@ async def analyze(
     so this is a second, independent upload slot. Analyzed as METADATA
     ONLY (packet/byte counts, top talkers, protocol mix, TCP/DNS
     summaries) - raw payload content is never parsed or stored; see
-    SECURITY.md."""
+    SECURITY.md.
+
+    `workers` (v4.9.0) optionally overrides the auto-detected parallel
+    worker-process count for the line-scanning pass - omit/leave blank
+    to auto-detect from CPU count/available memory/bundle size (the
+    default and recommended setting), or pass 1 to force the original
+    single-process sequential scan."""
     if not file and not server_path:
         raise HTTPException(status_code=400, detail="provide either a file upload or a server_path")
 
@@ -308,6 +315,7 @@ async def analyze(
         min_severity=min_severity, top_per_category=top_per_category,
         start=start or None, end=end or None, around=around or None, window=window,
         focus=focus, focus_areas=focus_areas_list, pcap_path=str(pcap_path) if pcap_path else None,
+        workers=workers,
     )
     thread = threading.Thread(target=_run_job, args=(job_id, input_path, kwargs), daemon=True)
     thread.start()

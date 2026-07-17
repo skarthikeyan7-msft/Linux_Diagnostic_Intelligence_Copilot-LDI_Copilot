@@ -90,6 +90,10 @@ If your organization's policy is stricter than "metadata only" for packet captur
 - The "known issues" and "official docs" reference links shown in the UI/digest are **hardcoded strings baked into this file at development time** (each one verified to resolve before being added) — the tool never fetches, pings, or validates them at analysis time, and never sends any bundle content to them. Clicking a link in the UI is the only way one of these URLs is ever actually requested, and that's a normal outbound browser navigation you control, not something LDI Copilot does on your behalf.
 - Both checks read only files already inside the bundle you provided (`/etc/os-release`, `sysctl.conf`, `corosync.conf`, etc.) and produce structured findings that flow into the same digest/redaction pipeline as every other analyzer above — no separate data path, no new destination.
 
+## Parallel scanning (v4.9.0): local worker processes only, no new data flow
+
+For large bundles, the line-by-line scan spreads across multiple local **processes** on the same machine (see CHANGELOG.md for how worker count is chosen). This is a pure performance optimization — every worker process runs the exact same file-scanning code as the single-process path, reading only files already inside the bundle on local disk. No network calls, no data leaves the machine, and no additional destination is introduced — the only thing that changes is how many CPU cores work through the file list at once. Forcing `workers=1` (Advanced options, or `--workers 1` on the CLI) restores the original single-process behavior exactly, if you ever want to rule out a parallelism-related difference.
+
 ## Installing Ollama itself (v4.5.0+): what runs, and only with your say-so
 
 If Ollama isn't installed yet, both the launcher scripts (`run.sh`/`run.bat`/`run.ps1`) and the browser's Ollama **Start** button (`backend/ai/ollama_manager.py`) can install it for you - but only after an explicit confirmation each time (a `[y/N]` prompt in the launcher, a confirm dialog in the browser), never automatically, and this choice is never remembered anywhere - declining once doesn't suppress being asked again later.

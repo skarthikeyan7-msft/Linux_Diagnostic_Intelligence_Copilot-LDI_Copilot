@@ -53,21 +53,24 @@ Outputs (written to --output, default "<input>_analysis" next to input):
 """
 import argparse
 import bz2
+import ctypes
 import gzip
 import io
 import json
 import lzma
 import os
+import platform
 import re
 import sys
 import tarfile
 import time
 import zipfile
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.8.0"
+__version__ = "4.9.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -2755,9 +2758,231 @@ class _DigestArgs:
         self.enabled_sections = enabled_sections
 
 
+# --------------------------------------------------------------------------
+# Parallel scanning (v4.9.0)
+# --------------------------------------------------------------------------
+# The line-by-line scan (scan_file(), above) is CPU-bound - regex matching
+# against every line of every file - not I/O-bound, so Python threads
+# don't help here (the GIL means only one thread executes Python bytecode
+# at a time regardless of thread count; this was directly confirmed on a
+# real customer bundle where a single worker pegged one CPU core at ~100%
+# for the whole multi-minute scan). Real parallelism for CPU-bound work in
+# Python requires separate PROCESSES (each with its own GIL) -
+# concurrent.futures.ProcessPoolExecutor is the stdlib tool for that.
+#
+# Design constraints this section works within:
+#   - No new dependency (no psutil) - memory detection below is
+#     OS-native (ctypes on Windows, /proc/meminfo on Linux), matching
+#     this project's stdlib-only philosophy everywhere else.
+#   - Worker functions must be plain top-level module functions (not
+#     closures/lambdas) so they're picklable across the process
+#     boundary - _scan_batch() below takes only plain, picklable
+#     arguments (strings, a Path, primitives) and returns a
+#     self-contained partial result with no shared mutable state.
+#   - Small bundles must not pay process-pool startup overhead for no
+#     benefit - determine_worker_count() only recommends >1 worker once
+#     the bundle is big enough that parallelizing is actually worth it.
+#   - The sequential (single-process) code path is left completely
+#     untouched as the workers<=1 branch in run_analysis() - the
+#     multi-worker path is strictly additive, not a rewrite of the
+#     proven-correct single-threaded scan.
+_DEFAULT_MAX_WORKERS = 8  # hard ceiling regardless of CPU count - beyond
+# this, per-worker overhead (process startup, result-merging) and disk
+# I/O contention dominate any further gain for this workload; also keeps
+# a huge-core-count shared VM from being monopolized by one analysis job.
+_MIN_FILES_FOR_PARALLEL = 300      # below this, sequential is already fast
+_MIN_BYTES_FOR_PARALLEL = 20 * 1024 * 1024  # 20MB - ditto
+_EST_MB_PER_WORKER = 300  # conservative per-worker memory budget used to
+# cap worker count on a memory-constrained VM - covers the Python
+# interpreter + compiled regex tables + one file's decompression buffers
+# + that worker's share of accumulated findings; deliberately generous
+# rather than tightly tuned, since under-provisioning workers just costs
+# some speed, while over-provisioning them risks the VM's memory pressure.
+
+
+def _get_available_memory_mb():
+    """Best-effort available-memory detection, OS-native only (no psutil
+    dependency). Returns None if it can't be determined on this platform
+    - callers must treat that as "unknown, don't let memory constrain the
+    worker count" rather than as zero."""
+    system = platform.system()
+    if system == "Windows":
+        try:
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return stat.ullAvailPhys / (1024 * 1024)
+        except Exception:
+            pass
+        return None
+    if system == "Linux":
+        try:
+            with open("/proc/meminfo", "r", encoding="ascii", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / 1024  # kB -> MB
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+    return None  # macOS/other: no stdlib-only reliable API - treated as unknown, not zero
+
+
+def determine_worker_count(total_files, total_bytes, requested_workers=None):
+    """Decides how many worker PROCESSES to use for the line-scanning
+    pass. requested_workers overrides auto-detection entirely when given
+    (1 forces the original sequential path; any other positive int is
+    used as-is, capped only by CPU count - an explicit request is
+    trusted over the heuristic). None (the default) auto-detects from:
+      - CPU count (os.cpu_count()) - the hard upper bound, since more
+        worker processes than cores cannot run truly concurrently;
+      - available memory / _EST_MB_PER_WORKER - a soft cap so a
+        memory-constrained VM doesn't get oversubscribed;
+      - bundle size - below _MIN_FILES_FOR_PARALLEL/_MIN_BYTES_FOR_PARALLEL,
+        returns 1 unconditionally, since process-pool startup overhead
+        would outweigh any benefit on a small bundle;
+      - _DEFAULT_MAX_WORKERS - a hard ceiling regardless of how many
+        cores/memory are available (see constant comment above).
+    Always returns at least 1.
+    """
+    if requested_workers is not None:
+        try:
+            requested_workers = int(requested_workers)
+        except (TypeError, ValueError):
+            requested_workers = None
+    if requested_workers is not None and requested_workers >= 1:
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(requested_workers, cpu_count))
+
+    if total_files < _MIN_FILES_FOR_PARALLEL or total_bytes < _MIN_BYTES_FOR_PARALLEL:
+        return 1
+
+    cpu_count = os.cpu_count() or 1
+    workers = min(cpu_count, _DEFAULT_MAX_WORKERS)
+
+    avail_mb = _get_available_memory_mb()
+    if avail_mb is not None:
+        mem_cap = max(1, int(avail_mb // _EST_MB_PER_WORKER))
+        workers = min(workers, mem_cap)
+
+    return max(1, workers)
+
+
+def _partition_items_by_size(items, num_partitions):
+    """Greedy longest-processing-time-first (LPT) partitioning: sorts
+    items by size descending, then repeatedly assigns the next item to
+    whichever partition currently has the smallest accumulated total
+    size. A well-known good approximation for balancing work across N
+    workers when task sizes vary widely - directly relevant here, since
+    real bundles routinely mix thousands of small files with a handful
+    of individually huge ones (a real customer bundle had several
+    100MB+ pacemaker logs among ~96,000 mostly-small files); naive
+    equal-COUNT chunking would leave one worker stuck with all the huge
+    files while the others finish early and sit idle."""
+    partitions = [[] for _ in range(num_partitions)]
+    totals = [0] * num_partitions
+    for item in sorted(items, key=lambda it: it[3], reverse=True):  # it[3] = size
+        idx = totals.index(min(totals))
+        partitions[idx].append(item)
+        totals[idx] += item[3]
+    return [p for p in partitions if p]  # drop any empty partition (more workers than items)
+
+
+def _scan_batch(root, kind, batch, window_start, window_end, max_examples, year_hint):
+    """Worker-process entry point (must stay a plain top-level function -
+    picklability across the process boundary depends on it). Scans every
+    item in `batch` (a list of (relpath, category, compression_kind,
+    size) tuples) into a fresh, self-contained ctx local to this call -
+    no state is shared with the main process or other workers, so this
+    needs zero locking. Reuses scan_file() completely unchanged; the only
+    difference from the sequential path is that each worker gets its OWN
+    ctx instead of all files sharing one - _merge_scan_contexts() below
+    combines them back into a single result afterward."""
+    local_ctx = {
+        "findings": {}, "timeline": [], "log_spans": {},
+        "max_examples": max_examples,
+        "window_start": window_start, "window_end": window_end,
+        "stats": {"bytes_scanned": 0, "lines_scanned": 0, "read_errors": 0,
+                   "files_scanned": 0, "files_skipped_binary": 0, "year_hint": year_hint,
+                   "lines_in_window": 0, "lines_out_of_window": 0,
+                   "compressed_files_scanned": 0, "decompressed_size_capped": 0},
+    }
+    for relpath, category, compression_kind, _size in batch:
+        scan_file(root, relpath, kind, category, local_ctx, compression_kind=compression_kind)
+        local_ctx["stats"]["files_scanned"] += 1
+        if compression_kind:
+            local_ctx["stats"]["compressed_files_scanned"] += 1
+    return local_ctx
+
+
+def _merge_scan_contexts(partial_ctxs, max_examples):
+    """Combines the partial per-worker ctx dicts _scan_batch() returns
+    into a single ctx with the exact same shape run_analysis()'s
+    sequential path builds directly, so every downstream consumer
+    (build_digest(), the API's findings_list sort, etc.) works completely
+    unchanged regardless of whether 1 or many workers did the scanning.
+
+    One deliberate, documented behavioral nuance versus strictly
+    sequential scanning: when a given finding occurs in files handled by
+    different workers, which specific occurrences end up as that
+    finding's first `max_examples` recorded examples can differ from
+    "always the first N encountered in inventory order" - the total
+    COUNT is always exact and complete either way (nothing is ever
+    dropped or double-counted), only the particular handful of sample
+    examples shown for a high-frequency finding might vary. Examples
+    have always been "some representative samples," not an exhaustive
+    or canonically-ordered list, so this is a reasonable, disclosed
+    trade for a meaningful speed win - see CHANGELOG.md's [4.9.0] entry.
+    """
+    merged = {
+        "findings": {}, "timeline": [], "log_spans": {},
+        "stats": {"bytes_scanned": 0, "lines_scanned": 0, "read_errors": 0,
+                   "files_scanned": 0, "files_skipped_binary": 0,
+                   "lines_in_window": 0, "lines_out_of_window": 0,
+                   "compressed_files_scanned": 0, "decompressed_size_capped": 0},
+    }
+    for ctx in partial_ctxs:
+        for key, entry in ctx["findings"].items():
+            existing = merged["findings"].get(key)
+            if existing is None:
+                merged["findings"][key] = dict(entry)  # copy - don't alias a worker's own dict
+            else:
+                existing["count"] += entry["count"]
+                if len(existing["examples"]) < max_examples:
+                    existing["examples"].extend(entry["examples"][: max_examples - len(existing["examples"])])
+        merged["timeline"].extend(ctx["timeline"])
+        for relpath, span in ctx["log_spans"].items():
+            existing_span = merged["log_spans"].get(relpath)
+            if existing_span is None:
+                merged["log_spans"][relpath] = list(span)
+            else:
+                existing_span[0] = min(existing_span[0], span[0])
+                existing_span[1] = max(existing_span[1], span[1])
+        for k, v in ctx["stats"].items():
+            if k in merged["stats"]:
+                merged["stats"][k] += v
+    # Same soft cap as the sequential path's "and len(timeline) < 20000"
+    # guard - preserved post-merge so the guarantee ("never unboundedly
+    # many timeline entries") holds regardless of worker count. Which
+    # specific entries get kept if the true total exceeds 20000 can differ
+    # slightly from sequential order for the same reason as findings
+    # examples above - an accepted trade, and only relevant for an
+    # extreme/degenerate bundle far outside real-world sosreport norms.
+    if len(merged["timeline"]) > 20000:
+        merged["timeline"] = merged["timeline"][:20000]
+    return merged
+
+
 def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_category=25,
                   max_examples=3, start=None, end=None, around=None, window=60.0,
-                  focus=None, progress_cb=None, focus_areas=None, pcap_path=None):
+                  focus=None, progress_cb=None, focus_areas=None, pcap_path=None, workers=None):
     """
     Library entrypoint - run a full analysis and return a result dict:
         {kind, root, input_path, output_dir, inventory, findings, facts,
@@ -2795,6 +3020,17 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
     (.pcap/.pcapng) to analyze alongside the bundle - see
     backend/engine/pcap_analyzer.py. Reserved for the network analyzer;
     None means no capture was provided.
+
+    workers controls parallelism for the line-by-line scanning pass
+    (v4.9.0): None (the default) auto-detects a sensible worker-process
+    count from CPU count, available memory, and bundle size (see
+    determine_worker_count()) - small bundles stay fully sequential
+    automatically, since process-pool startup overhead wouldn't pay off.
+    Pass 1 to force the original single-process sequential path
+    unconditionally (e.g. for debugging, or on a memory-constrained
+    system where you'd rather it just be slower than risk memory
+    pressure), or any other positive int to pin an explicit worker count
+    (still capped at the machine's actual CPU count).
 
     progress_cb(message: str), if given, is called with human-readable
     progress strings instead of printing to stdout - used by the web
@@ -2885,6 +3121,7 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
 
     report("Scanning files for known failure signatures (this can take a while for large archives)...")
     last_report = time.time()
+    scannable = []  # (relpath, category, compression_kind, size)
     for idx, item in enumerate(inventory, start=1):
         relpath = item["path"]
         if item["size"] <= 0:
@@ -2899,19 +3136,74 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         if readability == "skip":
             ctx["stats"]["files_skipped_binary"] += 1
             continue
-        # Reported BEFORE scan_file() runs (not after) so a single very
-        # large/slow file - which can legitimately take minutes on a huge
-        # log - shows up immediately as "currently scanning", instead of
-        # the progress line going silent for that entire stretch with no
-        # indication of which file is responsible.
         if time.time() - last_report > 5:
-            suffix = f" (decompressing {compression_kind})" if compression_kind else ""
-            report(f"  ...scanning {relpath}{suffix}  ({idx}/{len(inventory)} files, {len(ctx['findings'])} distinct findings so far)")
+            report(f"  ...classifying {relpath}  ({idx}/{len(inventory)} files inspected so far)")
             last_report = time.time()
-        scan_file(root, relpath, kind, item["category"], ctx, compression_kind=compression_kind)
-        ctx["stats"]["files_scanned"] += 1
-        if compression_kind:
-            ctx["stats"]["compressed_files_scanned"] += 1
+        scannable.append((relpath, item["category"], compression_kind, item["size"]))
+
+    total_scan_bytes = sum(s[3] for s in scannable)
+    worker_count = determine_worker_count(len(scannable), total_scan_bytes, requested_workers=workers)
+
+    if worker_count <= 1:
+        # Original, proven-correct sequential path - unconditionally used
+        # for small bundles (auto-detection already returns 1 for those)
+        # or when workers=1 is explicitly forced. Zero behavior change
+        # from pre-v4.9.0 for this branch.
+        last_report = time.time()
+        for idx, (relpath, category, compression_kind, _size) in enumerate(scannable, start=1):
+            if time.time() - last_report > 5:
+                suffix = f" (decompressing {compression_kind})" if compression_kind else ""
+                report(f"  ...scanning {relpath}{suffix}  ({idx}/{len(scannable)} files, {len(ctx['findings'])} distinct findings so far)")
+                last_report = time.time()
+            scan_file(root, relpath, kind, category, ctx, compression_kind=compression_kind)
+            ctx["stats"]["files_scanned"] += 1
+            if compression_kind:
+                ctx["stats"]["compressed_files_scanned"] += 1
+    else:
+        why = "auto-detected from CPU/memory" if workers is None else "requested"
+        report(f"  Using {worker_count} parallel worker processes for {len(scannable)} files (~{human_size(total_scan_bytes)}) - {why}")
+        partitions = _partition_items_by_size(scannable, worker_count)
+        try:
+            partial_ctxs = []
+            with ProcessPoolExecutor(max_workers=len(partitions)) as pool:
+                futures = {
+                    pool.submit(_scan_batch, root, kind, part, start_dt, end_dt, max_examples, year_hint): (i, len(part), sum(x[3] for x in part))
+                    for i, part in enumerate(partitions, start=1)
+                }
+                for future in as_completed(futures):
+                    worker_idx, n_files, n_bytes = futures[future]
+                    try:
+                        partial_ctxs.append(future.result())
+                        report(f"  worker {worker_idx}/{len(partitions)} finished: {n_files} files (~{human_size(n_bytes)})")
+                    except Exception as e:
+                        # One worker failing (a genuinely unexpected bug,
+                        # not the routine per-file OSError/UnicodeDecodeError
+                        # scan_file() already handles internally) shouldn't
+                        # take down the whole analysis - report it clearly
+                        # and continue with whatever the OTHER workers did
+                        # produce, rather than losing all of their work too.
+                        report(f"  ⚠️ worker {worker_idx}/{len(partitions)} failed ({n_files} files skipped): {e}")
+            merged = _merge_scan_contexts(partial_ctxs, max_examples)
+            ctx["findings"] = merged["findings"]
+            ctx["timeline"] = merged["timeline"]
+            ctx["log_spans"] = merged["log_spans"]
+            for k, v in merged["stats"].items():
+                ctx["stats"][k] += v
+        except Exception as e:
+            # ProcessPoolExecutor itself failing to even start (a sandboxed
+            # environment forbidding subprocess creation, exotic platform
+            # restriction, etc.) falls back to the sequential path rather
+            # than aborting the whole analysis - slower, but still correct.
+            report(f"  ⚠️ Parallel scanning unavailable ({e}) - falling back to sequential scanning.")
+            last_report = time.time()
+            for idx, (relpath, category, compression_kind, _size) in enumerate(scannable, start=1):
+                if time.time() - last_report > 5:
+                    report(f"  ...scanning {relpath}  ({idx}/{len(scannable)} files, {len(ctx['findings'])} distinct findings so far)")
+                    last_report = time.time()
+                scan_file(root, relpath, kind, category, ctx, compression_kind=compression_kind)
+                ctx["stats"]["files_scanned"] += 1
+                if compression_kind:
+                    ctx["stats"]["compressed_files_scanned"] += 1
 
     stats = ctx["stats"]
     report(f"Scan complete: {stats['files_scanned']} files scanned ({stats['compressed_files_scanned']} decompressed), {stats['lines_scanned']:,} lines, {len(ctx['findings'])} distinct findings")
@@ -3010,6 +3302,7 @@ def main():
     ap.add_argument("--around", help="Convenience: center the window on this time instead of giving --start/--end. Combine with --window.")
     ap.add_argument("--window", type=float, default=60.0, help="Minutes of padding on each side of --around (default 60 = +/-1h total 2h window). Ignored without --around.")
     ap.add_argument("--focus", help="Free text describing what you're actually investigating (e.g. 'find root cause of NC and IP cluster resource restart issue'). Adds a dedicated Focused Findings section to the digest ahead of the full scan.")
+    ap.add_argument("--workers", type=int, default=None, help="Parallel worker processes for the line-scanning pass. Default: auto-detect from CPU count/available memory/bundle size. Pass 1 to force the original single-process sequential scan.")
     args = ap.parse_args()
 
     try:
@@ -3017,7 +3310,7 @@ def main():
             args.input, output_dir=args.output, min_severity=args.min_severity,
             top_per_category=args.top_per_category, max_examples=args.max_examples,
             start=args.start, end=args.end, around=args.around, window=args.window,
-            focus=args.focus,
+            focus=args.focus, workers=args.workers,
         )
     except AnalysisError as e:
         die(str(e))

@@ -134,7 +134,18 @@
             <label for="optTopPerCategory">Max findings shown per category</label>
             <input type="number" id="optTopPerCategory" value="25" min="1" max="500">
           </div>
+          <div class="field-row">
+            <label for="optWorkers">Parallel scanning workers</label>
+            <select id="optWorkers">
+              <option value="" selected>Auto (recommended)</option>
+              <option value="1">1 (force sequential)</option>
+              <option value="2">2</option>
+              <option value="4">4</option>
+              <option value="8">8</option>
+            </select>
+          </div>
         </div>
+        <p class="muted small">"Auto" detects CPU count and available memory and uses multiple processes to scan large bundles' files concurrently — small bundles stay single-process automatically since the speedup wouldn't be worth the overhead. Force "1" only if you need to compare timing or suspect a parallelism-related issue.</p>
         <div class="scope-toggle">
           <label><input type="radio" name="scopeMode" value="full" checked> Analyze whole archive</label>
           <label><input type="radio" name="scopeMode" value="range"> Restrict to a date/time range</label>
