@@ -86,11 +86,25 @@ def collect_known_hostnames(facts):
     occurrences of them. Sourced from:
     - facts.system_info.hostname (sosreport/supportconfig - single host)
     - facts.cluster_health.nodes_detected (crm_report - list of nodes)
-    Deliberately does NOT try to guess arbitrary hostnames out of free
-    text via regex - that's much more error-prone (false positives on
-    ordinary words, false negatives on unusual naming schemes) than
-    matching identifiers this analysis has already confidently
-    identified elsewhere."""
+    - facts.detected_hostnames_from_logs (v4.9.2 - engine-side
+      sniff_syslog_hostnames(): a generic, content-based fallback that
+      finds the hostname field rsyslog embeds in nearly every log line,
+      regardless of bundle 'kind'. This is what closes a real, live gap:
+      a bundle detected as kind="unknown" (e.g. a raw copy of /var/log,
+      with none of the dedicated system-info files the two sources
+      above depend on) previously had NO hostname source at all here,
+      so hostname redaction was a complete no-op for it even though the
+      real hostname appeared in nearly every scanned log line - exactly
+      what let it leak, unredacted, into a real AI-generated report.
+      Also useful for sosreport/supportconfig/crm_report bundles as a
+      way to additionally catch a cluster PEER's hostname mentioned
+      only in this node's own logs.)
+    The first two sources are a closed, already-confident allow-list
+    from dedicated system-info files. The third is a frequency-gated
+    heuristic (see its own docstring for why that keeps it reliable) -
+    deliberately NOT a raw, ungated free-text guess, which would be far
+    more error-prone (false positives on ordinary words, false
+    negatives on unusual naming schemes)."""
     names = set()
     system_info = (facts or {}).get("system_info") or {}
     hostname = system_info.get("hostname")
@@ -102,6 +116,9 @@ def collect_known_hostnames(facts):
             names.add(first_token)
     cluster_health = (facts or {}).get("cluster_health") or {}
     for node in cluster_health.get("nodes_detected") or []:
+        if node:
+            names.add(node)
+    for node in (facts or {}).get("detected_hostnames_from_logs") or []:
         if node:
             names.add(node)
     return sorted(n for n in names if len(n) >= 2)  # skip anything too short to safely match

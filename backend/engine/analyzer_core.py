@@ -72,7 +72,7 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.9.1"
+__version__ = "4.9.2"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -2053,6 +2053,155 @@ def check_system_info(root, kind, inventory):
     return info
 
 
+_HOSTNAME_SNIFF_MAX_FILES = 30          # bounded sample - cheap even on a 90,000+-file bundle
+_HOSTNAME_SNIFF_MAX_BYTES_PER_FILE = 100_000
+_HOSTNAME_SNIFF_MAX_LINES_PER_FILE = 300
+_HOSTNAME_SNIFF_MIN_OCCURRENCES = 3     # a real host's identifier repeats on nearly every
+# line of a real log; requiring several identical repeats before trusting a
+# candidate is what makes this high-precision without needing any allow-list
+# to start from - a one-off coincidental token match doesn't repeat this way.
+_HOSTNAME_SNIFF_MAX_CANDIDATES = 10
+_HOSTNAME_SNIFF_EXCLUDE = {"localhost", "localhost.localdomain"}
+
+# Classic rsyslog "traditional" line format (the near-universal default) is
+# "<Mon> <DD> <HH:MM:SS> <hostname> <program>[<pid>]: <message>" - or the
+# same shape with an RFC3339/ISO8601 timestamp instead, common on
+# journald-exported logs. Requires the THIRD field too (a program token,
+# optionally "name[pid]:") so a 2-field "<timestamp> <program>: <message>"
+# line (hostname omitted from the format - some minimal/local-only syslog
+# configs do this) can't be mistaken for a 3-field line with the program
+# name misread as the hostname.
+_SYSLOG_HOSTNAME_LINE_RE = re.compile(
+    r"^(?:[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}"
+    r"|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
+    r"\s+([A-Za-z0-9][A-Za-z0-9._-]{0,63})\s+\S+?(?:\[\d+\])?:"
+)
+
+# A hostname ending in a run of digits (e.g. "ue2op1dbsp01") has a SIBLING
+# with the identical prefix and a different digit run (e.g. "ue2op1dbsp02")
+# with extremely high likelihood in HA-cluster contexts specifically - this
+# prefix+incrementing-node-number convention is close to universal for
+# cluster peers (web01/web02, nodeA1/nodeA2, ...). Unlike the syslog
+# hostname FIELD (which only ever shows the LOCAL machine writing its own
+# log - never a remote peer), a peer's name legitimately appears only in
+# free-text MESSAGE content (corosync membership notices, pacemaker
+# fencing/STONITH messages, e.g. "Node ue2op1dbsp02 is now member" or
+# "Peer ue2op1dbsp02 is confirmed fenced") - trying to hand-write regexes
+# for every real Pacemaker/corosync message wording risks being both
+# brittle (misses unanticipated exact phrasings) and still imprecise.
+# Instead, once a hostname is ALREADY confirmed via the high-confidence
+# syslog-field frequency gate above, searching the SAME already-sampled
+# text for other tokens sharing its exact prefix is a much more targeted,
+# domain-appropriate heuristic that needs just ONE occurrence to trust,
+# since an accidental unrelated token happening to share a real hostname's
+# exact multi-character prefix immediately followed by digits is very
+# unlikely by chance.
+_HOSTNAME_TRAILING_DIGITS_RE = re.compile(r"^(.*?)(\d+)$")
+
+
+def _find_hostname_siblings(confirmed_hostnames, sampled_text):
+    siblings = set()
+    for host in confirmed_hostnames:
+        m = _HOSTNAME_TRAILING_DIGITS_RE.match(host)
+        if not m:
+            continue
+        prefix, _digits = m.group(1), m.group(2)
+        if not prefix:
+            continue
+        sibling_re = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(prefix) + r"(\d+)(?![A-Za-z0-9_-])")
+        for sm in sibling_re.finditer(sampled_text):
+            candidate = prefix + sm.group(1)
+            if candidate != host:
+                siblings.add(candidate)
+    return siblings
+
+
+def sniff_syslog_hostnames(root, inventory):
+    """Generic, content-based hostname-detection fallback that works
+    regardless of bundle 'kind' - closes a real gap found from a live
+    customer bundle: a raw copy of /var/log has none of the dedicated
+    system-info files (sos_commands/, installed-rpms, basic-
+    environment.txt) that check_system_info()/check_cluster_health()
+    read, so detect_type() correctly classifies it as kind="unknown" -
+    but that ALSO meant collect_known_hostnames()
+    (backend/ai/redaction.py) had ZERO input to work with, so hostname
+    redaction was a complete no-op even though the real hostnames
+    appeared in nearly every line of the bundle's own pacemaker/
+    corosync logs - exactly the identifiers that then leaked,
+    unredacted, into a real AI-generated report.
+
+    Two complementary tiers:
+    1. The classic rsyslog line format embeds the LOCAL machine's own
+       hostname as the field immediately after the timestamp (see
+       _SYSLOG_HOSTNAME_LINE_RE) - this samples a bounded set of
+       candidate log-like files (capped in count/bytes/lines; a fixed,
+       small cost even on a 90,000+-file bundle, since this is a
+       SAMPLE, not a full scan) and tallies how often each candidate
+       token repeats identically in that position. Only a candidate
+       that repeats at least _HOSTNAME_SNIFF_MIN_OCCURRENCES times is
+       trusted - a real host's identifier repeats on nearly every line
+       of a real log, while a coincidental one-off match doesn't, so
+       this stays high-precision without needing to already know what
+       a valid hostname looks like. This tier only ever finds the LOCAL
+       host (the one that wrote this log) - never a remote peer.
+    2. A cluster PEER's hostname (e.g. the other node in a 2-node HA
+       pair) legitimately appears only in free-text message content
+       (corosync membership notices, pacemaker fencing/STONITH
+       messages), never in the syslog hostname field of THIS node's own
+       log. _find_hostname_siblings() catches this common case via the
+       near-universal HA-cluster "shared prefix + incrementing node
+       number" naming convention (e.g. ue2op1dbsp01/ue2op1dbsp02) - once
+       tier 1 confirms one such hostname, any other token sharing its
+       exact prefix elsewhere in the same sampled text is trusted with
+       just one occurrence, since the shared multi-character prefix
+       match already makes an accidental false positive very unlikely.
+
+    Also valuable as a supplementary source even for sosreport/
+    supportconfig/crm_report bundles (where system_info.hostname/
+    cluster_health.nodes_detected usually already cover the LOCAL
+    host) - both tiers here can additionally surface a cluster peer's
+    hostname that neither of those existing sources tracks.
+    Deliberately unconditional (not gated by kind) for exactly this
+    reason - see run_structured_checks()."""
+    candidates = Counter()
+    sampled_text_parts = []
+    files_sampled = 0
+
+    def _priority(item):
+        # Prefer paths that look log-ish, then larger files first (more
+        # lines sampled per file = higher chance of hitting the pattern
+        # at all, and a substantial ongoing log is more likely to be
+        # genuinely representative than a tiny one-off snapshot file).
+        return (0 if "log" in item["path"].lower() else 1, -item["size"])
+
+    for item in sorted(inventory, key=_priority):
+        if files_sampled >= _HOSTNAME_SNIFF_MAX_FILES:
+            break
+        if item["size"] <= 0:
+            continue
+        fpath = root / item["path"]
+        readability, _compression_kind = classify_file_readability(fpath)
+        if readability == "skip":
+            continue
+        text = get_text(root, item["path"], _HOSTNAME_SNIFF_MAX_BYTES_PER_FILE)
+        if not text:
+            continue
+        files_sampled += 1
+        sampled_text_parts.append(text)
+        for line in text.splitlines()[:_HOSTNAME_SNIFF_MAX_LINES_PER_FILE]:
+            m = _SYSLOG_HOSTNAME_LINE_RE.match(line)
+            if m:
+                candidates[m.group(1)] += 1
+
+    trusted = {
+        name for name, count in candidates.most_common(_HOSTNAME_SNIFF_MAX_CANDIDATES)
+        if count >= _HOSTNAME_SNIFF_MIN_OCCURRENCES and name.lower() not in _HOSTNAME_SNIFF_EXCLUDE
+    }
+    if trusted:
+        trusted |= _find_hostname_siblings(trusted, "\n".join(sampled_text_parts))
+    return sorted(trusted)
+
+
 def parse_df_text(text):
     rows = []
     for line in text.splitlines():
@@ -2257,6 +2406,21 @@ def run_structured_checks(root, kind, inventory):
         facts["system_info"] = check_system_info(root, kind, inventory)
     except Exception as e:
         facts["system_info_error"] = str(e)
+    try:
+        # Unconditional (not gated by kind, unlike cluster_health below) -
+        # this is a fallback/supplementary hostname source that matters
+        # MOST precisely for bundles check_system_info() has no dedicated
+        # file-based lookup for (kind="unknown", e.g. a raw /var/log copy
+        # with no sos_commands/basic-environment.txt), but it can also
+        # pick up a cluster PEER's hostname mentioned only in this node's
+        # own logs for any kind - see sniff_syslog_hostnames()'s docstring.
+        # Feeds collect_known_hostnames() (backend/ai/redaction.py), which
+        # is what closes a real gap: hostname redaction was previously a
+        # complete no-op for kind="unknown" bundles, since it had no
+        # allow-list to work from at all.
+        facts["detected_hostnames_from_logs"] = sniff_syslog_hostnames(root, inventory)
+    except Exception as e:
+        facts["detected_hostnames_from_logs_error"] = str(e)
     try:
         facts["disk_usage"] = check_disk_usage(root, kind, inventory)
     except Exception as e:
