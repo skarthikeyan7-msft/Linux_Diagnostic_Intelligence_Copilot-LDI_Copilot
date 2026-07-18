@@ -67,13 +67,14 @@ import stat
 import sys
 import tarfile
 import time
+import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.12.0"
+__version__ = "4.13.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -1807,10 +1808,228 @@ def _parse_sar_text(text, fallback_date, filename_date=None):
     return series, restart_events
 
 
+# --------------------------------------------------------------------------
+# sadf -x XML sar support (v4.13.0)
+# --------------------------------------------------------------------------
+# sosreport's sar plugin captures BOTH the classic pre-rendered text table
+# (sos_commands/sar/sarNN, parsed by _parse_sar_text() above) AND a
+# `sadf -x` XML rendition of the SAME underlying binary sadc data
+# (sos_commands/sar/saNN.xml) - confirmed against a real customer bundle.
+# Before this version the XML file was simply never parsed at all
+# (harmless when the text file has usable data too, but real data left
+# on the table whenever the text render is incomplete/restart-only and
+# the XML happens to cover a different or wider span).
+#
+# Schema confirmed directly against sysstat's own XML-rendering source
+# (xml_stats.c, sadf_misc.c on GitHub) rather than guessed - deliberately,
+# after this same project already found THREE real, independently-
+# undetected bugs in the text-format parser from assuming a fixed schema
+# (see check_sar_performance()'s docstring history). Cross-checked
+# against the one real XML file available (a restart-only capture, no
+# populated <timestamp> blocks) - which itself already showed a real,
+# if minor, version-drift wrinkle: the real file's <boot> used a
+# "utc=\"1\"" attribute, while current upstream source instead writes
+# "tz=\"...\"" - reinforcing the same "don't assume a byte-perfect fixed
+# schema across sysstat versions" stance the text parser already takes,
+# so this parser only ever depends on "date"/"time" attributes (stable
+# across both) plus the metric attribute names below, never on any of
+# the version-drifting extras.
+#
+# Column names are remapped to the IDENTICAL keys _parse_sar_text()
+# already produces (e.g. XML's "idle" attribute -> "%idle", XML's "rkB"
+# -> "rkB/s") so check_sar_performance()'s summary/chart code needs ZERO
+# changes to also accept XML-sourced samples - both feed the exact same
+# {metric_group: [{"ts": iso, <col>: val, ...}]} shape.
+_SAR_XML_CPU_ATTR_MAP = {"idle": "%idle", "user": "%usr", "system": "%sys", "nice": "%nice", "iowait": "%iowait", "steal": "%steal"}
+_SAR_XML_MEMORY_CHILD_MAP = {
+    "memused-percent": "%memused", "memused": "kbmemused", "cached": "kbcached", "buffers": "kbbuffers",
+    "commit": "kbcommit", "commit-percent": "%commit",
+    "swpused-percent": "%swpused", "swpfree": "kbswpfree", "swpused": "kbswpused",
+}
+_SAR_XML_DISK_ATTR_MAP = {"dev": "DEV", "tps": "tps", "rkB": "rkB/s", "wkB": "wkB/s"}
+_SAR_XML_NET_ATTR_MAP = {"iface": "IFACE", "rxkB": "rxkB/s", "txkB": "txkB/s", "rxpck": "rxpck/s", "txpck": "txpck/s"}
+_SAR_XML_QUEUE_ATTR_MAP = {"ldavg-1": "ldavg-1", "ldavg-5": "ldavg-5", "ldavg-15": "ldavg-15", "runq-sz": "runq-sz", "plist-sz": "plist-sz"}
+_SAR_XML_PAGING_ATTR_MAP = {"pgpgin": "pgpgin/s", "pgpgout": "pgpgout/s", "fault": "fault/s", "majflt": "majflt/s"}
+
+_XML_DECL_RE = re.compile(r"^\s*<\?xml[^>]*\?>")
+
+
+def _looks_like_xml(text):
+    """Cheap content-based sniff (not filename-based, consistent with
+    this project's established preference elsewhere) for whether a sar
+    candidate file is the XML rendition rather than the classic text
+    table - checked before attempting either parser, since a sosreport
+    can capture BOTH sarNN (text) and saNN.xml (XML) side by side and
+    each needs a different parser."""
+    head = text.lstrip()[:200]
+    return head.startswith("<?xml") or head.startswith("<sysstat")
+
+
+def _strip_xml_namespaces(root):
+    """sysstat's XML output declares a default namespace
+    (xmlns="http://.../sysstat", confirmed directly against a real
+    file) - which means EVERY element's parsed .tag becomes
+    "{http://.../sysstat}cpu" rather than plain "cpu". Directly
+    confirmed this silently breaks a bare root.iter("cpu")-style search
+    (finds zero matches, no error) before writing the rest of this
+    parser around bare tag names - stripping the namespace once, right
+    after parsing, is simpler and faster than making every subsequent
+    .iter() call namespace-aware individually."""
+    for el in root.iter():
+        if "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+    return root
+
+
+def _parse_sar_xml(text, fallback_date):
+    """Parses sadf -x XML sar output into the same
+    {metric_group: [{"ts": iso, <col>: val, ...}]} shape
+    _parse_sar_text() produces - see the module-level comment block
+    above for the full schema-verification story.
+
+    Each <timestamp date="..." time="..."> block (found anywhere in the
+    tree via .iter(), not assuming one fixed nesting depth - the same
+    robustness reasoning as _looks_like_xml() above) supplies the date/
+    time context for whatever metric sub-elements it directly contains.
+    <boot> restart markers are collected separately, the same way
+    _parse_sar_text() surfaces its "LINUX RESTART" line - confirmed
+    against the real file that <restarts><boot .../></restarts> is a
+    SIBLING of <statistics>, not nested inside any one <timestamp>.
+
+    Best-effort and silent on anything unparseable (not valid XML at
+    all, or valid XML that isn't sysstat's - e.g. some other file that
+    happens to have a .xml extension), consistent with
+    _parse_sar_text()'s philosophy: a sar candidate with no usable data
+    must never raise, only contribute nothing.
+    """
+    series = defaultdict(list)
+    restart_events = []
+    try:
+        root = ET.fromstring(_XML_DECL_RE.sub("", text, count=1))
+    except ET.ParseError:
+        return series, restart_events
+    _strip_xml_namespaces(root)
+
+    for boot in root.iter("boot"):
+        d, t = boot.get("date"), boot.get("time")
+        if d and t:
+            try:
+                restart_events.append(datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M:%S").isoformat())
+            except ValueError:
+                pass
+
+    for ts_elem in root.iter("timestamp"):
+        d, t = ts_elem.get("date"), ts_elem.get("time")
+        the_date = None
+        if d:
+            try:
+                the_date = datetime.strptime(d, "%Y-%m-%d").date()
+            except ValueError:
+                the_date = None
+        the_date = the_date or fallback_date
+        if not (the_date and t):
+            continue
+        try:
+            hh, mm, ss = (int(x) for x in t.split(":")[:3])
+            ts = datetime(the_date.year, the_date.month, the_date.day, hh, mm, ss).isoformat()
+        except (ValueError, TypeError):
+            continue
+
+        for cpu in ts_elem.iter("cpu"):
+            row = {"CPU": cpu.get("number", "all")}
+            for xk, tk in _SAR_XML_CPU_ATTR_MAP.items():
+                v = cpu.get(xk)
+                if v is not None:
+                    try:
+                        row[tk] = float(v)
+                    except ValueError:
+                        pass
+            if len(row) > 1:
+                series["cpu"].append({"ts": ts, **row})
+
+        for mem in ts_elem.iter("memory"):
+            row = {}
+            for child in mem:
+                tk = _SAR_XML_MEMORY_CHILD_MAP.get(child.tag)
+                if tk and child.text:
+                    try:
+                        row[tk] = float(child.text)
+                    except ValueError:
+                        pass
+            if row:
+                series["memory"].append({"ts": ts, **row})
+
+        for disk in ts_elem.iter("disk-device"):
+            row = {}
+            for xk, tk in _SAR_XML_DISK_ATTR_MAP.items():
+                v = disk.get(xk)
+                if v is None:
+                    continue
+                if xk == "dev":
+                    row[tk] = v
+                else:
+                    try:
+                        row[tk] = float(v)
+                    except ValueError:
+                        pass
+            if len(row) > 1:
+                series["disk_io"].append({"ts": ts, **row})
+
+        for net in ts_elem.iter("net-dev"):
+            row = {}
+            for xk, tk in _SAR_XML_NET_ATTR_MAP.items():
+                v = net.get(xk)
+                if v is None:
+                    continue
+                if xk == "iface":
+                    row[tk] = v
+                else:
+                    try:
+                        row[tk] = float(v)
+                    except ValueError:
+                        pass
+            if len(row) > 1:
+                series["network"].append({"ts": ts, **row})
+
+        for q in ts_elem.iter("queue"):
+            row = {}
+            for xk, tk in _SAR_XML_QUEUE_ATTR_MAP.items():
+                v = q.get(xk)
+                if v is not None:
+                    try:
+                        row[tk] = float(v)
+                    except ValueError:
+                        pass
+            if row:
+                series["load"].append({"ts": ts, **row})
+
+        for pg in ts_elem.iter("paging"):
+            row = {}
+            for xk, tk in _SAR_XML_PAGING_ATTR_MAP.items():
+                v = pg.get(xk)
+                if v is not None:
+                    try:
+                        row[tk] = float(v)
+                    except ValueError:
+                        pass
+            if row:
+                series["paging"].append({"ts": ts, **row})
+
+    return series, restart_events
+
+
 def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
-    """Parses pre-rendered `sar` text captures - sysstat's own plain-text
-    table output - into per-metric time series plus a condensed summary.
-    Looks in every location a bundle realistically stores this:
+    """Parses pre-rendered `sar` captures - both sysstat's classic
+    plain-text table output AND (v4.13.0) its `sadf -x` XML rendition,
+    via _parse_sar_text()/_parse_sar_xml() respectively (content-sniffed
+    per candidate file, see _looks_like_xml()) - into per-metric time
+    series plus a condensed summary. A real sosreport captures BOTH
+    side by side for the same underlying binary sadc data (e.g.
+    sos_commands/sar/sar18 AND sos_commands/sar/sa18.xml) - both are
+    always tried, and their results merged into the same series, so a
+    text render that's incomplete or restart-only doesn't hide real
+    data the XML sibling happens to cover (or vice versa). Looks in
+    every location a bundle realistically stores this:
       - sosreport: the dedicated sar-plugin capture (sos_commands/sar/*),
         AND the raw sysstat spool directory it also copies in wholesale
         (var/log/sa/* - mostly binary saDD files this tool can't decode
@@ -1964,13 +2183,23 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
         text = get_text(root, relp, 40_000_000)
         if not text.strip():
             continue
-        basename = relp.rsplit("/", 1)[-1]
-        for ext in (".xz", ".gz", ".bz2"):  # strip a compression suffix so the date pattern still matches the underlying spool filename
-            if basename.lower().endswith(ext):
-                basename = basename[:-len(ext)]
-                break
-        filename_date = _extract_date_from_sar_filename(basename, reference_date=fallback_date)
-        parsed, restart_events = _parse_sar_text(text, fallback_date, filename_date=filename_date)
+        if _looks_like_xml(text):
+            # sadf -x XML rendition (v4.13.0) - a real sosreport
+            # captures this alongside the classic text table (see
+            # _parse_sar_xml()'s module-level comment). No filename-
+            # date fallback needed here: unlike the text format, the
+            # XML schema's own <timestamp date="..."> is present on
+            # every single interval, not just a header line once per
+            # file, so there's nothing to fall back FROM in practice.
+            parsed, restart_events = _parse_sar_xml(text, fallback_date)
+        else:
+            basename = relp.rsplit("/", 1)[-1]
+            for ext in (".xz", ".gz", ".bz2"):  # strip a compression suffix so the date pattern still matches the underlying spool filename
+                if basename.lower().endswith(ext):
+                    basename = basename[:-len(ext)]
+                    break
+            filename_date = _extract_date_from_sar_filename(basename, reference_date=fallback_date)
+            parsed, restart_events = _parse_sar_text(text, fallback_date, filename_date=filename_date)
         all_restart_events.update(restart_events)
         if any(parsed.values()):
             files_parsed.append(relp)
@@ -2023,14 +2252,31 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
         # "all" is sar's own aggregate-across-cores row, always present
         # even when a per-core breakdown (-P ALL) was also captured -
         # using it avoids conflating one busy core with overall load.
-        idle_vals = [r["%idle"] for r in cpu_rows if isinstance(r.get("%idle"), float) and r.get("CPU", "all") == "all"]
-        if not idle_vals:
-            idle_vals = [r["%idle"] for r in cpu_rows if isinstance(r.get("%idle"), float)]
-        if idle_vals:
-            used_vals = [round(100.0 - v, 2) for v in idle_vals]
+        all_rows = [r for r in cpu_rows if isinstance(r.get("%idle"), float) and r.get("CPU", "all") == "all"]
+        if not all_rows:
+            all_rows = [r for r in cpu_rows if isinstance(r.get("%idle"), float)]
+        if all_rows:
+            # Real bug found and fixed here (v4.13.0): keeping each row
+            # paired with its own "% used" value throughout - rather
+            # than computing a separately-filtered idle/used-values list
+            # and then indexing back into the ORIGINAL, UNFILTERED
+            # cpu_rows with that filtered list's own position - is what
+            # this fix is about. The previous code's
+            # "cpu_rows[used_vals.index(...)]" silently returned the
+            # WRONG row's timestamp (off by however many per-core rows
+            # sorted earlier in the same interval) whenever a real
+            # -P ALL capture mixed "all" rows together with per-core
+            # ones in the same series, exactly the scenario this
+            # function's own comment above already anticipated as a
+            # normal, expected case - caught by testing against a
+            # synthetic multi-row capture while adding XML sar support,
+            # not previously covered by any existing regression check.
+            used_pairs = [(round(100.0 - r["%idle"], 2), r["ts"]) for r in all_rows]
+            used_vals = [u for u, _ in used_pairs]
             summary["cpu_pct_used_avg"] = round(sum(used_vals) / len(used_vals), 2)
-            summary["cpu_pct_used_peak"] = round(max(used_vals), 2)
-            summary["cpu_pct_used_peak_ts"] = cpu_rows[used_vals.index(max(used_vals))]["ts"]
+            peak_used, peak_ts = max(used_pairs, key=lambda p: p[0])
+            summary["cpu_pct_used_peak"] = round(peak_used, 2)
+            summary["cpu_pct_used_peak_ts"] = peak_ts
         iowait_vals = [r["%iowait"] for r in cpu_rows if isinstance(r.get("%iowait"), float)]
         if iowait_vals:
             summary["iowait_pct_avg"] = round(sum(iowait_vals) / len(iowait_vals), 2)

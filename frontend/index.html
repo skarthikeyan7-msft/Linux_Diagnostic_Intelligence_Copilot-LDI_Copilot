@@ -19,6 +19,7 @@
       <span class="privacy-pill" title="This app runs entirely on your machine. Bundle data never leaves localhost unless you choose a cloud AI provider for synthesis.">🔒 Local-only</span>
       <span id="whoamiPill" class="whoami-pill hidden"></span>
       <button id="btnRecent" class="btn btn-ghost">Recent analyses</button>
+      <button id="btnFeedback" class="btn btn-ghost" title="Send feedback or report an issue">💬 Feedback</button>
       <button id="btnStopProject" class="btn btn-ghost btn-danger" title="Stops the LDI Copilot server itself (and any Ollama instance it's managing) - in-app equivalent of stop.sh/stop.bat/stop.ps1">⏹ Stop project</button>
     </div>
   </header>
@@ -364,6 +365,34 @@
         <div class="chart-tooltip hidden" id="chartModalTooltip"></div>
       </div>
       <div class="chart-legend" id="chartModalLegend"></div>
+    </div>
+  </div>
+
+  <!-- Send feedback / report an issue - opens the user's own mail
+       client via a mailto: link (see initFeedbackModal() in app.js for
+       why: this is a purely local tool with no outbound SMTP of its
+       own, so a mailto: link needs zero new credentials/dependencies/
+       network surface). -->
+  <div id="feedbackModalOverlay" class="modal-overlay hidden">
+    <div class="modal-card">
+      <h3>💬 Send feedback / report an issue</h3>
+      <p class="muted small">This opens your default mail app with a message pre-filled to <strong>skarthikeyan@microsoft.com</strong> - nothing is sent automatically, and no bundle data is attached. Review the message in your mail client before sending.</p>
+      <div class="field-row">
+        <label for="feedbackType">Type</label>
+        <select id="feedbackType">
+          <option value="feedback">General feedback / suggestion</option>
+          <option value="bug">Report an issue / bug</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label for="feedbackText">Your message</label>
+        <textarea id="feedbackText" rows="6" placeholder="What's on your mind? For a bug report, include what you expected vs. what happened."></textarea>
+      </div>
+      <p class="muted small" id="feedbackContextNote"></p>
+      <div class="modal-actions">
+        <button id="feedbackModalCancel" class="btn btn-ghost">Cancel</button>
+        <button id="feedbackModalSend" class="btn btn-primary">Open in mail app</button>
+      </div>
     </div>
   </div>
 </div>

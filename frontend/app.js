@@ -1451,6 +1451,78 @@ function initChartModal() {
   });
 }
 
+// --------------------------------------------------------------------------
+// Feedback / report-issue button (topbar). Implemented as a mailto: link
+// rather than real server-side sending, deliberately: this is a purely
+// local, personal tool with no outbound SMTP configured (and no plan to
+// add one) - a mailto: link opens the user's OWN already-configured mail
+// client with the message pre-filled, needing zero new credentials, zero
+// new dependencies, and zero new outbound network surface from the
+// server itself. The user always reviews and sends it themselves - this
+// tool never transmits anything on their behalf.
+// --------------------------------------------------------------------------
+const FEEDBACK_RECIPIENT = "skarthikeyan@microsoft.com";
+let _cachedAppVersion = null;
+
+async function getAppVersion() {
+  if (_cachedAppVersion) return _cachedAppVersion;
+  try {
+    const data = await fetch("/api/health").then((r) => r.json());
+    _cachedAppVersion = data.version || "unknown";
+  } catch {
+    _cachedAppVersion = "unknown";
+  }
+  return _cachedAppVersion;
+}
+
+async function openFeedbackModal() {
+  $("feedbackType").value = "feedback";
+  $("feedbackText").value = "";
+  const version = await getAppVersion();
+  const jobBit = state.jobId ? `, job ${state.jobId}` : "";
+  $("feedbackContextNote").textContent = `Included automatically: LDI Copilot v${version}${jobBit}. No bundle data, findings, or AI-generated content is included.`;
+  $("feedbackModalOverlay").classList.remove("hidden");
+  $("feedbackText").focus();
+}
+
+function closeFeedbackModal() {
+  $("feedbackModalOverlay").classList.add("hidden");
+}
+
+async function sendFeedback() {
+  const text = $("feedbackText").value.trim();
+  if (!text) {
+    $("feedbackText").focus();
+    return;
+  }
+  const isBug = $("feedbackType").value === "bug";
+  const subject = isBug ? "LDI Copilot - Bug report" : "LDI Copilot - Feedback";
+  const version = await getAppVersion();
+  const contextLines = [`LDI Copilot version: ${version}`];
+  if (state.jobId) contextLines.push(`Job ID: ${state.jobId}`);
+  const body = `${text}\n\n---\n${contextLines.join("\n")}`;
+  const mailto = `mailto:${FEEDBACK_RECIPIENT}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  // Plain navigation (not window.open()) - a mailto: link never actually
+  // navigates the page away in any browser, but window.open() would
+  // additionally pop up (and then need to auto-close) a blank tab first
+  // in several browsers, which plain assignment avoids entirely.
+  window.location.href = mailto;
+  closeFeedbackModal();
+}
+
+function initFeedbackModal() {
+  const overlay = $("feedbackModalOverlay");
+  $("btnFeedback").addEventListener("click", openFeedbackModal);
+  $("feedbackModalCancel").addEventListener("click", closeFeedbackModal);
+  $("feedbackModalSend").addEventListener("click", sendFeedback);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeFeedbackModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !overlay.classList.contains("hidden")) closeFeedbackModal();
+  });
+}
+
 function buildChartCard(title, statsText, namedSeries) {
   const card = document.createElement("div");
   card.className = "chart-card";
@@ -2483,6 +2555,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initSystemInfo();
   initPerfToolbar();
   initChartModal();
+  initFeedbackModal();
   loadRecentJobs();
   updatePlaceholders();
 

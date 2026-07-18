@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.13.0] - 2026-07-18
+
+### Added
+- **`sadf -x` XML sar support.** A real sosreport captures BOTH the classic pre-rendered text sar table (`sos_commands/sar/sarNN`) AND a `sadf -x` XML rendition of the identical underlying binary sadc data (`sos_commands/sar/saNN.xml`) side by side - the XML sibling was previously never parsed at all. Now both are tried for every sar candidate file (content-sniffed, not filename-based, consistent with this project's established preference), and their results merged into the same time series, so a text render that's incomplete or restart-only no longer hides real data its XML sibling happens to cover (the exact real-world shape this closes: a real customer's `sar18` held nothing but a reboot marker, while `sa18.xml` from the very same capture window could hold real interval data).
+  - Schema confirmed directly against sysstat's own XML-rendering C source (`xml_stats.c`/`sadf_misc.c`) rather than guessed, after this project already found three independent real bugs in the text-format parser from assuming a fixed schema. This paid off immediately: the real XML file available for testing showed a genuine version-drift wrinkle even against current upstream source (`utc="1"` vs. the latest source's `tz="..."` attribute) - confirming the same "don't assume a byte-perfect fixed schema across sysstat versions" stance the text parser already takes was the right one here too.
+  - A second, more serious gotcha caught directly by testing (not assumed): sysstat's XML output declares a default XML namespace, which silently makes a naive tag search (e.g. `root.iter("cpu")`) match **zero** elements against the real file's actual structure - the exact same "looks like it works, returns nothing, no error" failure pattern behind every other bug found in this codebase's sar handling. Fixed by stripping namespaces from the parsed tree in one pass before any tag-name search runs.
+  - XML attribute/element names are remapped to the identical keys the text parser already produces (e.g. XML's `idle` → `%idle`, `rkB` → `rkB/s`) so `check_sar_performance()`'s existing summary and chart-rendering code needed zero changes to also accept XML-sourced samples.
+
+### Fixed
+- **A real, pre-existing bug in `cpu_pct_used_peak_ts`** (the "peak CPU used, and when" figure shown in the digest and Performance tab), found while testing the XML feature above against data mixing an "all" row with per-core rows in the same interval (a real, anticipated `-P ALL` capture shape this function's own comment already called out as normal) - not something a user reported. The peak-percentage computation filtered `cpu_rows` down to "all"-only rows before finding the maximum, but then used that filtered list's own position to index back into the **original, unfiltered** row list to find the matching timestamp - silently returning the wrong interval's timestamp whenever any per-core rows were interleaved with "all" rows anywhere before the peak. Fixed by keeping each row paired with its own "% used" value throughout, rather than re-deriving an index into a differently-filtered list. Verified this was genuinely latent (not previously exercised) - zero regressions across all 93 pre-existing local checks.
+
+### Added (UI)
+- **"💬 Feedback" button** in the topbar, opening a small modal to write general feedback or report an issue, with a type selector (feedback vs. bug). Sends via a `mailto:` link to `skarthikeyan@microsoft.com` pre-filled with the message plus automatically-included context (app version, current job ID if one is loaded) - deliberately **not** real server-side email sending, since this is a purely local, personal tool with no outbound SMTP of its own; a `mailto:` link needs zero new credentials, dependencies, or network surface, and the user always reviews and sends it themselves from their own already-configured mail client. No bundle data, findings, or AI-generated content is ever included.
+
+Verified with 31 new synthetic regression checks (SAR XML: real restart-only file's exact bytes, a schema-accurate synthetic populated capture covering all six metric groups, the namespace-stripping gotcha, and an end-to-end text+XML-sibling scenario; the peak-timestamp fix: both an isolated repro and via the real `check_sar_performance()` path) plus zero regressions against the pre-existing 93 (32+29+32) local checks - 124 total, all passing.
+
 ## [4.12.0] - 2026-07-18
 
 ### Added
@@ -383,6 +399,7 @@ Verified via 23 automated checks (installer/pull generators for each OS branch a
 - `samples/`: synthetic `fake_sosreport`, `fake_supportconfig`, and `fake_crm_report` fixtures.
 - `run.ps1`: one-command local launcher (venv + deps + server + browser).
 
+[4.13.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.13.0
 [4.12.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.12.0
 [4.11.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.11.0
 [4.6.0]: https://github.com/skarthikeyan7-msft/Linux_Diagnostic_Intelligence_Copilot-LDI_Copilot/releases/tag/v4.6.0

@@ -563,6 +563,11 @@ select option:disabled { color: #4a5163; font-style: italic; }
 .modal-chart-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .modal-chart-head h3 { margin: 0; font-size: 15px; }
 
+/* Feedback / report-issue modal */
+#feedbackModalOverlay .modal-card { width: min(90vw, 560px); }
+#feedbackText { resize: vertical; }
+#feedbackContextNote { margin: -4px 0 4px; }
+
 /* Interactive AI follow-up chat, below the generated report */
 .chat-section {
   margin-top: 22px;
