@@ -452,12 +452,14 @@ function initOllamaControls() {
 }
 
 // --------------------------------------------------------------------------
-// Per-user accounts ("accounts" auth mode - backend/auth.py,
-// backend/users.py) - shows "signed in as <username>" + a logout link in
-// the topbar when this instance has that mode active. A 401 from
-// /api/auth/me is expected and silently ignored whenever accounts mode
-// isn't in use (--auth-token/--no-auth/loopback), so this never shows
-// anything misleading in those cases.
+// Session-based auth (local accounts and/or Microsoft Entra ID SSO -
+// backend/auth.py, backend/users.py, backend/entra_auth.py) - shows
+// "signed in as <username>" (with a badge for HOW they signed in) + a
+// logout link + an Audit Log link in the topbar when this instance has
+// session-based auth active. A 401 from /api/auth/me is expected and
+// silently ignored whenever session auth isn't in use (--auth-token/
+// --no-auth/loopback), so this never shows anything misleading in those
+// cases.
 // --------------------------------------------------------------------------
 async function initWhoami() {
   try {
@@ -465,14 +467,15 @@ async function initWhoami() {
     if (!resp.ok) return;
     const data = await resp.json();
     const pill = $("whoamiPill");
-    pill.innerHTML = `👤 ${escapeHtml(data.username)} <a id="btnLogout">Sign out</a>`;
+    const methodLabel = data.auth_method === "entra" ? "Microsoft Entra ID" : "local account";
+    pill.innerHTML = `👤 ${escapeHtml(data.username)} <span class="muted small" title="Signed in via ${escapeHtml(methodLabel)}">(${escapeHtml(methodLabel)})</span> <a id="btnAuditLog" href="/audit.html">Audit log</a> · <a id="btnLogout">Sign out</a>`;
     pill.classList.remove("hidden");
     document.getElementById("btnLogout").addEventListener("click", async () => {
       await fetch("/api/auth/logout", { method: "POST" });
       window.location.href = "/login.html";
     });
   } catch {
-    // Network error or accounts mode not in use - nothing to show.
+    // Network error or session auth not in use - nothing to show.
   }
 }
 

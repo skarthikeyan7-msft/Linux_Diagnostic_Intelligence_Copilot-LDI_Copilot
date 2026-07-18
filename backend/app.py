@@ -30,12 +30,13 @@ import socket
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request, UploadFile, Form, File, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # allow `import engine`, `import ai` when run directly
@@ -47,17 +48,20 @@ from ai import (
 )
 from auth import SESSION_COOKIE_NAME, SessionStore
 from users import UserStore
+from audit import AuditLog
+import entra_auth
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 DATA_DIR = BASE_DIR / "backend" / "data" / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDI Copilot", version="4.8.0")
+app = FastAPI(title="LDI Copilot", version="4.10.0")
 
 USERS_PATH = BASE_DIR / "backend" / "data" / "users.json"
 USER_STORE = UserStore(USERS_PATH)
 SESSIONS = SessionStore()
+AUDIT_LOG = AuditLog(BASE_DIR / "backend" / "data" / "audit.log")
 
 # Auth gate (backend/auth.py), wired here at module level rather than
 # inside main(). uvicorn.run("app:app", ...) resolves that string by
@@ -73,14 +77,28 @@ SESSIONS = SessionStore()
 # picks them up - during uvicorn's fresh re-import.
 #
 # Exactly one of the two gates below is ever active - main() decides
-# which (or neither, for --no-auth/loopback) and sets ONE of these two
-# env vars accordingly, never both. "Accounts" (per-user, backend/users.py)
-# takes priority over "token" (single shared secret) whenever at least
-# one account is configured; see main()'s auth_mode selection for the
-# exact precedence rules and why.
+# which (or neither, for --no-auth/loopback) and sets the env vars
+# accordingly. "Session" mode (SessionCookieMiddleware - local accounts
+# and/or Entra ID SSO, see backend/auth.py/backend/entra_auth.py) takes
+# priority over "token" (single shared secret) whenever local accounts
+# exist OR Entra ID is configured; see main()'s auth_mode selection for
+# the exact precedence rules and why.
 _LDI_AUTH_TOKEN_ENV = "LDI_COPILOT_AUTH_TOKEN"
-_LDI_ACCOUNTS_AUTH_ENV = "LDI_COPILOT_ACCOUNTS_AUTH"
+_LDI_SESSION_AUTH_ENV = "LDI_COPILOT_SESSION_AUTH"
 _LDI_COOKIE_SECURE_ENV = "LDI_COPILOT_COOKIE_SECURE"
+
+# Entra ID SSO configuration (v4.10.0) - these double as BOTH the same
+# main()-to-reimported-module handoff mechanism as the vars above, AND a
+# direct, user-facing way to supply this config without it ever
+# appearing in a CLI argument list (visible in shell history / `ps`/Task
+# Manager's process list otherwise) - main() reads any of these that are
+# already set in the real environment as its default, letting the
+# matching --entra-* CLI flag override on a given run. All four must be
+# present together for Entra ID SSO to activate; see main().
+LDI_ENTRA_TENANT_ID_ENV = "LDI_COPILOT_ENTRA_TENANT_ID"
+LDI_ENTRA_CLIENT_ID_ENV = "LDI_COPILOT_ENTRA_CLIENT_ID"
+LDI_ENTRA_CLIENT_SECRET_ENV = "LDI_COPILOT_ENTRA_CLIENT_SECRET"
+LDI_ENTRA_REDIRECT_URI_ENV = "LDI_COPILOT_ENTRA_REDIRECT_URI"
 
 # Whether the login endpoint marks the session cookie Secure (HTTPS-only)
 # - mirrors whatever --https resolved to at startup, read the same
@@ -88,9 +106,15 @@ _LDI_COOKIE_SECURE_ENV = "LDI_COPILOT_COOKIE_SECURE"
 COOKIE_SECURE = os.environ.get(_LDI_COOKIE_SECURE_ENV) == "1"
 
 _auth_token = os.environ.get(_LDI_AUTH_TOKEN_ENV)
-_accounts_auth_enabled = os.environ.get(_LDI_ACCOUNTS_AUTH_ENV) == "1"
+_session_auth_enabled = os.environ.get(_LDI_SESSION_AUTH_ENV) == "1"
 
-if _accounts_auth_enabled:
+ENTRA_TENANT_ID = os.environ.get(LDI_ENTRA_TENANT_ID_ENV) or None
+ENTRA_CLIENT_ID = os.environ.get(LDI_ENTRA_CLIENT_ID_ENV) or None
+ENTRA_CLIENT_SECRET = os.environ.get(LDI_ENTRA_CLIENT_SECRET_ENV) or None
+ENTRA_REDIRECT_URI = os.environ.get(LDI_ENTRA_REDIRECT_URI_ENV) or None
+ENTRA_ENABLED = bool(ENTRA_TENANT_ID and ENTRA_CLIENT_ID and ENTRA_CLIENT_SECRET and ENTRA_REDIRECT_URI)
+
+if _session_auth_enabled:
     from auth import SessionCookieMiddleware
     app.add_middleware(SessionCookieMiddleware, session_store=SESSIONS)
 elif _auth_token:
@@ -179,21 +203,41 @@ def _get_job_or_404(job_id):
 
 
 # --------------------------------------------------------------------------
-# API: per-user account authentication ("accounts" auth mode - see
-# backend/auth.py, backend/users.py, backend/manage_users.py). These
-# routes always exist regardless of which auth mode main() actually
-# enforces for this run (harmless if unused - a session cookie that
-# nothing ever checks doesn't grant anything), which keeps the login
-# flow testable/usable even without a non-loopback --host.
+# API: authentication - two ways to establish the same kind of session
+# (backend/auth.py's SessionStore/SessionCookieMiddleware): local
+# accounts (backend/users.py, backend/manage_users.py) and Microsoft
+# Entra ID SSO (v4.10.0, backend/entra_auth.py). These routes always
+# exist regardless of which auth mode main() actually enforces for this
+# run (harmless if unused - a session cookie that nothing ever checks
+# doesn't grant anything), which keeps the login flow testable/usable
+# even without a non-loopback --host. Every login attempt (either path)
+# and logout is recorded to AUDIT_LOG (backend/audit.py) - see also
+# GET /api/audit below.
 # --------------------------------------------------------------------------
+def _client_ip(request: Request) -> str | None:
+    """request.client.host only - deliberately does NOT trust an
+    X-Forwarded-For header. This project's documented deployment model
+    is a direct bind (optionally --https with its own cert), not behind
+    a trusted reverse proxy - trusting a client-suppliable header for
+    an audit trail's IP field would let anyone log in and have their
+    real IP silently replaced with whatever they put in that header. If
+    you do put a trusted proxy in front of this server yourself, that
+    proxy's own access log is the right place to capture the true
+    client IP; this field will show the proxy's address in that setup."""
+    return request.client.host if request.client else None
+
+
 @app.post("/api/auth/login")
-async def login(payload: dict, response: Response):
+async def login(payload: dict, request: Request, response: Response):
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
     ok, message = USER_STORE.verify(username, password)
+    ip, ua = _client_ip(request), request.headers.get("user-agent")
     if not ok:
+        AUDIT_LOG.record("login_failure", username=username or None, auth_method="local", ip=ip, user_agent=ua, detail=message)
         raise HTTPException(status_code=401, detail=message)
-    token = SESSIONS.create(username)
+    AUDIT_LOG.record("login_success", username=username, auth_method="local", ip=ip, user_agent=ua)
+    token = SESSIONS.create(username, auth_method="local")
     resp = JSONResponse({"username": username})
     resp.set_cookie(
         SESSION_COOKIE_NAME, token, httponly=True, samesite="lax",
@@ -206,6 +250,9 @@ async def login(payload: dict, response: Response):
 async def logout(request: Request):
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if token:
+        session = SESSIONS.get_session(token)
+        if session:
+            AUDIT_LOG.record("logout", username=session["username"], auth_method=session["auth_method"], ip=_client_ip(request), user_agent=request.headers.get("user-agent"))
         SESSIONS.destroy(token)
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
@@ -215,15 +262,100 @@ async def logout(request: Request):
 @app.get("/api/auth/me")
 async def whoami(request: Request):
     """Lets the frontend show "logged in as <username>" plus a logout
-    button when accounts mode is active - 401 (silently ignored by the
-    frontend) whenever there's no session, whether that's because the
-    user isn't logged in yet or because this instance isn't using
-    accounts mode at all (e.g. --auth-token/--no-auth/loopback)."""
+    button when session-based auth is active - 401 (silently ignored by
+    the frontend) whenever there's no session, whether that's because
+    the user isn't logged in yet or because this instance isn't using
+    session-based auth at all (e.g. --auth-token/--no-auth/loopback)."""
     token = request.cookies.get(SESSION_COOKIE_NAME)
-    username = SESSIONS.get_username(token)
-    if not username:
+    session = SESSIONS.get_session(token)
+    if not session:
         raise HTTPException(status_code=401, detail="not authenticated")
-    return {"username": username}
+    return session
+
+
+@app.get("/api/auth/entra/enabled")
+async def entra_enabled():
+    """Lets the login page decide whether to show a "Sign in with
+    Microsoft" button, and whether to show the local username/password
+    form at all (hidden when zero local accounts are configured AND
+    Entra ID is - no point offering a form that can never succeed)."""
+    return {"entra_enabled": ENTRA_ENABLED, "accounts_configured": USER_STORE.count() > 0}
+
+
+@app.get("/api/auth/entra/login")
+async def entra_login():
+    """Redirects the browser to the Microsoft identity platform's
+    authorize endpoint to begin an interactive sign-in - see
+    backend/entra_auth.py's module docstring for the full OAuth2/PKCE
+    flow this kicks off. A plain browser navigation (not a fetch()
+    call), so this returns an HTTP redirect rather than JSON."""
+    if not ENTRA_ENABLED:
+        raise HTTPException(status_code=404, detail="Microsoft Entra ID sign-in is not configured on this server")
+    url = entra_auth.build_authorize_url(ENTRA_TENANT_ID, ENTRA_CLIENT_ID, ENTRA_REDIRECT_URI)
+    return RedirectResponse(url=url, status_code=307)
+
+
+@app.get("/api/auth/entra/callback")
+async def entra_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None, error_description: str | None = None):
+    """Completes the interactive sign-in Microsoft redirected the
+    browser back to after the user authenticated (and consented, on
+    first use) - exchanges the authorization code for tokens,
+    cryptographically validates the ID token against Entra ID's own
+    published signing keys, then creates a session identical in every
+    way to a local-account login (same SESSIONS.create(), same cookie).
+    Always ends in a browser REDIRECT (never a raw error status/JSON) -
+    unlike the local-login POST, this is a plain browser navigation the
+    frontend's own JS never sees the response of, so a failure has to
+    be communicated via a redirect the user actually lands on, not a
+    response body nothing reads."""
+    ip, ua = _client_ip(request), request.headers.get("user-agent")
+    if not ENTRA_ENABLED:
+        raise HTTPException(status_code=404, detail="Microsoft Entra ID sign-in is not configured on this server")
+
+    if error:
+        # The user declined consent, or Entra ID itself rejected the
+        # request (e.g. a misconfigured redirect URI) - Microsoft
+        # reports this as query params rather than ever reaching our
+        # code+state handling below.
+        detail = error_description or error
+        AUDIT_LOG.record("login_failure", auth_method="entra", ip=ip, user_agent=ua, detail=detail)
+        return RedirectResponse(url=f"/login.html?error={urllib.parse.quote(detail[:300])}", status_code=303)
+
+    code_verifier = entra_auth.STATE_STORE.pop(state) if state else None
+    if not code or not code_verifier:
+        AUDIT_LOG.record("login_failure", auth_method="entra", ip=ip, user_agent=ua, detail="missing or expired/invalid state (possible CSRF attempt, or sign-in took too long)")
+        return RedirectResponse(url="/login.html?error=" + urllib.parse.quote("Sign-in session expired or is invalid - please try again."), status_code=303)
+
+    try:
+        tokens = entra_auth.exchange_code_for_tokens(ENTRA_TENANT_ID, ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET, ENTRA_REDIRECT_URI, code, code_verifier)
+        id_token = tokens.get("id_token")
+        if not id_token:
+            raise entra_auth.EntraAuthError("token response did not contain an id_token")
+        claims = entra_auth.validate_id_token(id_token, ENTRA_TENANT_ID, ENTRA_CLIENT_ID)
+        username = entra_auth.extract_username_from_claims(claims)
+    except entra_auth.EntraAuthError as e:
+        AUDIT_LOG.record("login_failure", auth_method="entra", ip=ip, user_agent=ua, detail=str(e))
+        return RedirectResponse(url=f"/login.html?error={urllib.parse.quote(str(e)[:300])}", status_code=303)
+
+    AUDIT_LOG.record("login_success", username=username, auth_method="entra", ip=ip, user_agent=ua)
+    token = SESSIONS.create(username, auth_method="entra")
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.set_cookie(
+        SESSION_COOKIE_NAME, token, httponly=True, samesite="lax",
+        secure=COOKIE_SECURE, max_age=SESSIONS.ttl_seconds, path="/",
+    )
+    return resp
+
+
+@app.get("/api/audit")
+async def get_audit(limit: int = 200, username: str | None = None, event: str | None = None):
+    """Recent sign-in activity (local accounts AND Entra ID alike) for
+    an in-app "who has been using this" view - see backend/audit.py.
+    Gated by whatever auth mode is already active (this route is behind
+    the same middleware as every other /api/* route; no separate
+    permission check exists, consistent with this project's documented
+    no-RBAC design - see SECURITY.md's "What this doesn't provide")."""
+    return {"entries": AUDIT_LOG.tail(limit=limit, username=username, event=event)}
 
 
 # --------------------------------------------------------------------------
@@ -910,9 +1042,13 @@ def main():
     ap.add_argument("--https", action="store_true", help="Serve over HTTPS/TLS instead of plain HTTP. Without --ssl-certfile/--ssl-keyfile, auto-generates and reuses a self-signed certificate under ../certs (browsers show a one-time trust warning for it - see README.md's HTTPS section).")
     ap.add_argument("--ssl-certfile", default=None, help="Path to a PEM certificate file - supply your own trusted cert instead of the auto-generated self-signed one (use together with --ssl-keyfile)")
     ap.add_argument("--ssl-keyfile", default=None, help="Path to the PEM private key matching --ssl-certfile")
-    ap.add_argument("--auth-token", default=None, help="Shared secret required (as an HTTP Basic Auth password, any username) to reach this server. Takes priority over per-user accounts if both are present - use this for quick/simple sharing without provisioning individual accounts. If --host is non-loopback and neither this nor any account (see backend/manage_users.py) exists, a random token is generated and printed once at startup. Use --no-auth to disable all auth gates instead.")
-    ap.add_argument("--no-auth", action="store_true", help="Disable all auth gates (accounts and shared-token alike) even when --host is non-loopback. Only safe when something else already restricts who can reach this address (VPN, firewall rule scoped to known IPs).")
+    ap.add_argument("--auth-token", default=None, help="Shared secret required (as an HTTP Basic Auth password, any username) to reach this server. Takes priority over per-user accounts/Entra ID SSO if any are present - use this for quick/simple sharing without provisioning individual accounts. If --host is non-loopback and none of --auth-token/accounts/Entra ID is configured, a random token is generated and printed once at startup. Use --no-auth to disable all auth gates instead.")
+    ap.add_argument("--no-auth", action="store_true", help="Disable all auth gates (accounts, Entra ID SSO, and shared-token alike) even when --host is non-loopback. Only safe when something else already restricts who can reach this address (VPN, firewall rule scoped to known IPs).")
     ap.add_argument("--require-auth", action="store_true", help="Force whichever auth gate would apply on a non-loopback host to also apply here, even though --host is loopback. Useful for testing the login flow locally before deploying.")
+    ap.add_argument("--entra-tenant-id", default=None, help="Microsoft Entra ID SSO (v4.10.0): your Azure AD Directory (tenant) ID - enables a 'Sign in with Microsoft' option on the login page, in addition to (not instead of) any local accounts. All four --entra-* values are required together (or set the matching LDI_COPILOT_ENTRA_* environment variable instead of a CLI flag, to avoid the client secret appearing in shell history / `ps`/Task Manager's process list). See README.md's 'Sharing with a team' section for the Azure Portal app-registration steps.")
+    ap.add_argument("--entra-client-id", default=None, help="Microsoft Entra ID SSO: the app registration's Application (client) ID.")
+    ap.add_argument("--entra-client-secret", default=None, help="Microsoft Entra ID SSO: the app registration's client secret VALUE (not the secret ID). Prefer the LDI_COPILOT_ENTRA_CLIENT_SECRET environment variable over this flag to keep it out of shell history/process list.")
+    ap.add_argument("--entra-redirect-uri", default=None, help="Microsoft Entra ID SSO: the exact redirect URI registered on the app registration, e.g. https://your-server-address:8756/api/auth/entra/callback - must match EXACTLY (scheme/host/port/path) what's configured in Azure Portal, since Entra ID rejects any mismatch.")
     args = ap.parse_args()
     scheme = "https" if args.https else "http"
     _preflight_check_host(args.host, scheme=scheme)
@@ -921,47 +1057,73 @@ def main():
         print("ERROR: --auth-token and --no-auth are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
 
+    # Entra ID config: an explicit --entra-* flag overrides whatever the
+    # matching LDI_COPILOT_ENTRA_* environment variable already holds;
+    # otherwise the environment variable (if any) is used as-is - this
+    # lets a user avoid ever putting the client secret on the command
+    # line at all, by exporting it once in their shell/service-unit
+    # environment instead.
+    entra_tenant_id = args.entra_tenant_id or os.environ.get(LDI_ENTRA_TENANT_ID_ENV) or None
+    entra_client_id = args.entra_client_id or os.environ.get(LDI_ENTRA_CLIENT_ID_ENV) or None
+    entra_client_secret = args.entra_client_secret or os.environ.get(LDI_ENTRA_CLIENT_SECRET_ENV) or None
+    entra_redirect_uri = args.entra_redirect_uri or os.environ.get(LDI_ENTRA_REDIRECT_URI_ENV) or None
+    entra_values = {"--entra-tenant-id": entra_tenant_id, "--entra-client-id": entra_client_id, "--entra-client-secret": entra_client_secret, "--entra-redirect-uri": entra_redirect_uri}
+    entra_present = [k for k, v in entra_values.items() if v]
+    entra_configured = len(entra_present) == 4
+    if 0 < len(entra_present) < 4:
+        missing = [k for k, v in entra_values.items() if not v]
+        print(f"ERROR: Microsoft Entra ID SSO requires all four --entra-* values (or their LDI_COPILOT_ENTRA_* environment variable equivalents) together. Missing: {', '.join(missing)}.", file=sys.stderr)
+        sys.exit(1)
+
     is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
     enforce = args.require_auth or not is_loopback
     n_users = USER_STORE.count()
+    session_auth_available = n_users > 0 or entra_configured
 
     # Precedence: --no-auth always wins (gate off). An explicit
-    # --auth-token always wins next, regardless of accounts, so a quick
-    # shared-password setup is still available even if accounts happen
-    # to be configured too. Otherwise: no enforcement needed (loopback,
-    # no --require-auth) -> gate off; enforcement needed and at least one
-    # account exists -> the stronger per-user "accounts" gate; otherwise
-    # (enforcement needed, zero accounts, no explicit token) -> the same
-    # auto-generated shared-token fallback introduced in v4.3.0.
+    # --auth-token always wins next, regardless of accounts/Entra ID, so
+    # a quick shared-password setup is still available even if either is
+    # configured too. Otherwise: no enforcement needed (loopback, no
+    # --require-auth) -> gate off; enforcement needed and EITHER local
+    # accounts OR Entra ID is configured (or both - the login page offers
+    # whichever is actually available) -> the stronger session-based
+    # gate; otherwise (enforcement needed, nothing configured) -> the
+    # same auto-generated shared-token fallback introduced in v4.3.0.
     if args.no_auth:
         auth_mode, auth_token = "none", None
     elif args.auth_token:
         auth_mode, auth_token = "token", args.auth_token
     elif not enforce:
         auth_mode, auth_token = "none", None
-    elif n_users > 0:
-        auth_mode, auth_token = "accounts", None
+    elif session_auth_available:
+        auth_mode, auth_token = "session", None
     else:
         from auth import generate_token
         auth_mode, auth_token = "token", generate_token()
 
-    if auth_mode == "accounts":
-        os.environ[_LDI_ACCOUNTS_AUTH_ENV] = "1"
+    if auth_mode == "session":
+        os.environ[_LDI_SESSION_AUTH_ENV] = "1"
         os.environ.pop(_LDI_AUTH_TOKEN_ENV, None)
-        usernames = ", ".join(USER_STORE.list_usernames())
-        print(
-            f"Auth gate ENABLED (per-user accounts, {n_users} configured: {usernames}).\n"
-            "Each teammate signs in at the login page with their own username and\n"
-            "password - nothing to share over chat/email. Manage accounts with:\n"
-            "    python backend/manage_users.py add <username>\n"
-            "    python backend/manage_users.py remove <username>\n"
-            "    python backend/manage_users.py list\n"
-            "To fall back to a single shared password instead, pass --auth-token.\n"
-            "See SECURITY.md before exposing this beyond localhost.\n"
-        )
+        lines = ["Auth gate ENABLED (session-based sign-in)."]
+        if n_users > 0:
+            usernames = ", ".join(USER_STORE.list_usernames())
+            lines.append(f"  Local accounts ({n_users} configured: {usernames}) - manage with:")
+            lines.append("    python backend/manage_users.py add <username>")
+            lines.append("    python backend/manage_users.py remove <username>")
+            lines.append("    python backend/manage_users.py list")
+        if entra_configured:
+            lines.append(f"  Microsoft Entra ID SSO ENABLED (tenant {entra_tenant_id}) - teammates can sign in with")
+            lines.append("    their existing organizational Microsoft account, no separate password to manage.")
+            lines.append("    Restrict who can sign in via Entra ID's own app registration ('Assignment")
+            lines.append("    required?' under Enterprise applications), not a setting in this app.")
+        lines.append("Every sign-in (either method) and logout is recorded to backend/data/audit.log -")
+        lines.append("view recent activity at GET /api/audit, or read the file directly.")
+        lines.append("To fall back to a single shared password instead, pass --auth-token.")
+        lines.append("See SECURITY.md before exposing this beyond localhost.")
+        print("\n".join(lines) + "\n")
     elif auth_mode == "token":
         os.environ[_LDI_AUTH_TOKEN_ENV] = auth_token
-        os.environ.pop(_LDI_ACCOUNTS_AUTH_ENV, None)
+        os.environ.pop(_LDI_SESSION_AUTH_ENV, None)
         print(
             "Auth gate ENABLED - every request needs an HTTP Basic Auth credential.\n"
             "  Username: (anything, e.g. \"ldi\")\n"
@@ -971,14 +1133,15 @@ def main():
             "it for the session. To pin a stable password instead of a random one each\n"
             "restart, pass --auth-token yourself. For stronger, per-user access\n"
             "instead of one shared password, provision accounts with\n"
-            "backend/manage_users.py and restart without --auth-token. To disable\n"
-            "all auth gates (only if something else already restricts access, e.g.\n"
-            "VPN), pass --no-auth. See SECURITY.md before exposing this beyond\n"
-            "localhost.\n"
+            "backend/manage_users.py and/or configure Microsoft Entra ID SSO\n"
+            "(--entra-tenant-id/--entra-client-id/--entra-client-secret/--entra-redirect-uri)\n"
+            "and restart without --auth-token. To disable all auth gates (only if\n"
+            "something else already restricts access, e.g. VPN), pass --no-auth.\n"
+            "See SECURITY.md before exposing this beyond localhost.\n"
         )
     else:
         os.environ.pop(_LDI_AUTH_TOKEN_ENV, None)
-        os.environ.pop(_LDI_ACCOUNTS_AUTH_ENV, None)
+        os.environ.pop(_LDI_SESSION_AUTH_ENV, None)
         if enforce:
             print(
                 "WARNING: auth gate DISABLED (--no-auth) while bound to a non-loopback\n"
@@ -986,6 +1149,22 @@ def main():
                 "tool and any customer data uploaded to it. Make sure network-level\n"
                 "access (VPN/firewall) is already locked down. See SECURITY.md.\n"
             )
+
+    # Entra ID config is handed off to the re-imported app:app module the
+    # same environment-variable way as the auth mode/token above (see
+    # that block's comment for why) - set regardless of auth_mode, since
+    # a user could otherwise still reach the Entra endpoints directly
+    # even under --auth-token/--no-auth; ENTRA_ENABLED (computed from
+    # these at import time) is what actually gates whether the login
+    # page offers the button, independent of which OTHER gate is active.
+    if entra_configured:
+        os.environ[LDI_ENTRA_TENANT_ID_ENV] = entra_tenant_id
+        os.environ[LDI_ENTRA_CLIENT_ID_ENV] = entra_client_id
+        os.environ[LDI_ENTRA_CLIENT_SECRET_ENV] = entra_client_secret
+        os.environ[LDI_ENTRA_REDIRECT_URI_ENV] = entra_redirect_uri
+    else:
+        for var in (LDI_ENTRA_TENANT_ID_ENV, LDI_ENTRA_CLIENT_ID_ENV, LDI_ENTRA_CLIENT_SECRET_ENV, LDI_ENTRA_REDIRECT_URI_ENV):
+            os.environ.pop(var, None)
 
     os.environ[_LDI_COOKIE_SECURE_ENV] = "1" if args.https else "0"
 

@@ -19,30 +19,58 @@ This remains the recommended default. If your situation genuinely calls for one 
 
 ## Running one shared instance instead (if you can't avoid it)
 
-As of v4.4.0, if you do run a single instance reachable by more than one person, layered controls are available and (except accounts, which need one-time setup) turn on **automatically** the moment `--host` is anything other than a loopback address:
+As of v4.4.0, if you do run a single instance reachable by more than one person, layered controls are available and (except accounts/Entra ID, which need one-time setup) turn on **automatically** the moment `--host` is anything other than a loopback address:
 
-- **Per-user accounts** (`backend/users.py`, `backend/auth.py`'s `SessionCookieMiddleware`) - **the recommended control**. Provision each teammate with `python backend/manage_users.py add <username>` (prompts for a password, hashed with `hashlib.scrypt` - a memory-hard KDF, never stored or logged in plaintext). The moment at least one account exists, everyone signs in individually at a login page instead of sharing one secret; access for one person can be revoked (`manage_users.py remove <username>`) without affecting anyone else, and failed logins lock an account out after 5 attempts within 15 minutes. This does **not** create per-user data isolation - see below.
-- **A shared-secret auth gate** (`backend/auth.py`'s `BasicAuthMiddleware`, the original v4.3.0 control) - every request requires a single shared HTTP Basic Auth credential. Used automatically as a zero-setup fallback whenever no accounts are configured yet, or explicitly via `--auth-token` (which always takes priority over accounts, for cases where individual provisioning is overkill). `--no-auth` disables every gate entirely - only if network-level access is already restricted, e.g. VPN-only.
-- **`--https`** — TLS via a self-signed certificate (auto-generated and reused under `certs/`, gitignored) or your own certificate via `--ssl-certfile`/`--ssl-keyfile`. Without this, a shared instance sends account/token credentials and every bundle/report over plain HTTP, readable by anyone positioned on the network path between a user and the server.
+- **Per-user accounts** (`backend/users.py`, `backend/auth.py`'s `SessionCookieMiddleware`) - real individual sign-in. Provision each teammate with `python backend/manage_users.py add <username>` (prompts for a password, hashed with `hashlib.scrypt` - a memory-hard KDF, never stored or logged in plaintext). The moment at least one account exists, everyone signs in individually at a login page instead of sharing one secret; access for one person can be revoked (`manage_users.py remove <username>`) without affecting anyone else, and failed logins lock an account out after 5 attempts within 15 minutes. This does **not** create per-user data isolation - see below.
+- **Microsoft Entra ID SSO** (v4.10.0, `backend/entra_auth.py`, `backend/app.py`'s `/api/auth/entra/*` endpoints) - **the recommended control for teams already in Microsoft 365/Azure AD**. Teammates sign in with their existing organizational Microsoft account via a standard OAuth2 Authorization Code + PKCE flow (RFC 7636) - see "Microsoft Entra ID SSO: security properties" below for the full technical detail. Configured via `--entra-tenant-id`/`--entra-client-id`/`--entra-client-secret`/`--entra-redirect-uri` (or the matching `LDI_COPILOT_ENTRA_*` environment variables, to avoid the client secret appearing in shell history/process list) - all four required together. Can be enabled **alongside** local accounts; the login page offers whichever is actually configured. Restricting *who* can sign in is delegated entirely to Entra ID's own "Assignment required?" app setting (Enterprise applications → your app → Properties) rather than a second, separately-maintained allow-list in this project - one source of truth for who's allowed in, not two that can drift apart.
+- Establishing a session via **either** local accounts or Entra ID produces the exact same kind of session cookie - everything downstream (the auth gate itself, `/api/auth/me`, the audit log) treats a session uniformly regardless of which door the user came in through.
+- **A shared-secret auth gate** (`backend/auth.py`'s `BasicAuthMiddleware`, the original v4.3.0 control) - every request requires a single shared HTTP Basic Auth credential. Used automatically as a zero-setup fallback whenever neither accounts nor Entra ID is configured yet, or explicitly via `--auth-token` (which always takes priority over accounts/Entra ID, for cases where individual provisioning is overkill). `--no-auth` disables every gate entirely - only if network-level access is already restricted, e.g. VPN-only.
+- **`--https`** — TLS via a self-signed certificate (auto-generated and reused under `certs/`, gitignored) or your own certificate via `--ssl-certfile`/`--ssl-keyfile`. Without this, a shared instance sends account/token credentials, Entra ID tokens, and every bundle/report over plain HTTP, readable by anyone positioned on the network path between a user and the server. Entra ID SSO in particular effectively requires this, since Microsoft's own redirect-URI validation strongly prefers `https://` for anything beyond `localhost`.
 - **`--require-auth`** — forces whichever gate would apply on a non-loopback host to also apply on `127.0.0.1`, for testing the login flow locally.
+- **Sign-in audit log** (v4.10.0, `backend/audit.py`) - every login attempt (success or failure, local account or Entra ID) and every logout is recorded to `backend/data/audit.log` (gitignored, rotates at 5MB keeping 5 backups) - see "Sign-in audit log" below for exactly what is and isn't covered.
 
 **What this combination does and does not give you:**
 - ✅ Blocks a stranger who finds the address/port from reaching the tool or any data on it at all.
-- ✅ With accounts specifically: individual identity and revocability - you know *who* signed in (not just that *someone* did), and can cut off one person without resetting a secret everyone else also has to update.
-- ✅ Encrypts traffic between each user and the server (with `--https`), so credentials and bundle data aren't sent in the clear.
-- ❌ Does **not** give per-user *data* isolation, even with accounts. Every authenticated user - regardless of mode - sees the exact same job list (`GET /api/jobs`) and can open, chat about, or delete any job on the instance, including bundles a different teammate uploaded. If your team analyzes different customers' data on the same shared instance, every team member with access can see every customer's bundle.
-- ❌ Does **not** give audit logging (who analyzed what, when - accounts mode knows who's *logged in*, but nothing correlates that identity to specific job actions), RBAC, or per-user rate limiting/quotas against a shared AI provider budget.
+- ✅ With accounts or Entra ID specifically: individual identity and revocability - you know *who* signed in (not just that *someone* did), and can cut off one person (removing their local account, or removing their Entra ID app assignment) without resetting a secret everyone else also has to update.
+- ✅ With Entra ID SSO specifically: no separate password for this tool at all - teammates use the same organizational account/MFA/Conditional Access policies your org already enforces everywhere else, and leaving the org (Entra ID account disabled) automatically revokes access here too, with no separate step in this tool.
+- ✅ Encrypts traffic between each user and the server (with `--https`), so credentials/tokens and bundle data aren't sent in the clear.
+- ✅ A durable, reviewable **sign-in** history (v4.10.0) - who signed in, how, when, from what IP, and whether it succeeded; see "Sign-in audit log" below for exactly what this covers.
+- ❌ Does **not** give per-user *data* isolation, even with accounts/Entra ID. Every authenticated user - regardless of mode - sees the exact same job list (`GET /api/jobs`) and can open, chat about, or delete any job on the instance, including bundles a different teammate uploaded. If your team analyzes different customers' data on the same shared instance, every team member with access can see every customer's bundle.
+- ❌ The audit log covers **sign-in/sign-out only** - it does **not** correlate a signed-in identity to specific *job-level* actions (who analyzed which specific bundle, downloaded which report, etc.). See "Sign-in audit log" below for the precise boundary.
+- ❌ Does **not** give RBAC (every authenticated user has identical capability - see above) or per-user rate limiting/quotas against a shared AI provider budget.
 - ❌ Is not a substitute for real network-layer controls. Combine it with a cloud firewall rule scoped to your team's known IP ranges/VPN CIDR (not `0.0.0.0/0`) whenever possible - every auth gate here is a safety net behind that, not instead of it.
 
 If any of the ❌ items above are unacceptable for the customer engagements you support, go back to one-instance-per-engineer instead.
 
-Example for a globally-distributed team on one Azure VM, with individual accounts plus a firewall rule:
+Example for a globally-distributed team on one Azure VM, with Entra ID SSO plus a firewall rule:
 ```bash
-python backend/manage_users.py add alice
-python backend/manage_users.py add bob
-./run.sh --host 0.0.0.0 --https
+export LDI_COPILOT_ENTRA_CLIENT_SECRET="the-secret-value"
+./run.sh --host 0.0.0.0 --https \
+  --entra-tenant-id <directory-tenant-id> --entra-client-id <application-client-id> \
+  --entra-redirect-uri https://<vm-address>:8756/api/auth/entra/callback
 ```
-Then scope the cloud NSG/security group rule for that port to your team's IP ranges, and share the URL with your team - each person signs in with their own account, nothing else to distribute or leak.
+Then scope the cloud NSG/security group rule for that port to your team's IP ranges, and share the URL with your team - each person signs in with their existing Microsoft account, nothing else to distribute or leak. See README.md's "Sharing with a team over the internet" section for the full Azure Portal app-registration walkthrough.
+
+## Microsoft Entra ID SSO: security properties
+
+v4.10.0's "Sign in with Microsoft" option implements the OAuth2 Authorization Code flow with PKCE (RFC 7636) - the standard, Microsoft-recommended pattern for a confidential web client authenticating a real person through a browser (a different flow from the machine-to-machine client-credentials grant `backend/ai/providers.py` uses to *call* Azure OpenAI on the analysis side - see that module's docstring):
+
+- **PKCE** is used even though this is a confidential client (it holds a client secret) - defense-in-depth against authorization-code interception, per current Microsoft/IETF best-practice guidance for all app types, not just public/mobile clients.
+- **`state` parameter**: single-use (consumed on first use, a replay of the same callback URL fails), time-limited (10 minutes), cryptographically random - this is the CSRF protection, preventing an attacker from tricking a victim's browser into completing an OAuth flow the attacker initiated for their own account.
+- **ID token signature verification**: the returned ID token's RS256 signature is verified against Microsoft's own published signing keys (JWKS), fetched from Entra ID's own discovery endpoint - via `PyJWT` (the one new dependency this feature adds; every other module in this project remains stdlib-only where a stdlib facility already suffices). A token that isn't genuinely signed by Microsoft for your tenant/app is rejected outright, regardless of what claims it contains.
+- **`iss` (issuer) and `aud` (audience) claim checks**: a validly-*signed* token for a different tenant or a different app registration is still rejected - these are exact string matches, not fuzzy ones.
+- **Session identical to local accounts**: on success, the exact same kind of session cookie local-account login produces is created - no separate, parallel auth path exists downstream of a successful sign-in.
+- **No new outbound network destination beyond Microsoft's own identity platform** (`login.microsoftonline.com`) - the same host Entra ID API-key/token flows in `backend/ai/providers.py` already talk to for Azure OpenAI, not a new third party.
+- **Restricting *who* can sign in** is intentionally left to Entra ID's own "Assignment required?" app setting (see the setup steps in README.md), not a second allow-list maintained inside this project - avoids two access-control lists that could silently drift out of sync with each other.
+
+## Sign-in audit log
+
+v4.10.0 adds `backend/audit.py`: every login attempt (success or failure, local account **or** Entra ID) and every logout is recorded as one JSON line to `backend/data/audit.log` (gitignored, same as `users.json`) - `{time, event, username, auth_method, ip, user_agent, detail}`. Rotates at 5MB, keeping 5 backups, via stdlib `logging.handlers.RotatingFileHandler` (no hand-rolled rotation logic, no new dependency).
+
+- View it in-app at `/audit.html` (linked next to your username in the topbar once signed in) or read the file directly - it's plain JSON-lines, `grep`/log-shipping-tool friendly without needing this project's own viewer.
+- `GET /api/audit` (the API the in-app viewer calls) is gated by whichever auth mode is already active, same as every other route - there is **no separate "admin-only" restriction** on top of that, consistent with this project's no-RBAC design (see "What this combination does and does not give you" above). Anyone who can reach the app at all can view its sign-in history.
+- **Scope, precisely**: this is a **sign-in/sign-out** audit trail, not a job-action audit trail. It answers "who has been signing in to this instance, and did anyone fail to get in" - it does **not** answer "who analyzed customer X's bundle" or "who downloaded this report." Correlating identity to specific job actions would require instrumenting every job-related endpoint individually, which this version does not do.
+- IP address is read directly from the TCP connection (`request.client.host`) - deliberately does **not** trust an `X-Forwarded-For` header, since this project's documented deployment model is a direct bind (see "Recommended deployment model" above), not behind a trusted reverse proxy that could be relied on to set that header correctly. If you do put a trusted proxy in front of this server yourself, that proxy's own access log is the right place to capture the true client IP for that setup.
 
 Do **not** run a shared instance with `--no-auth` unless network-level access is independently locked down (VPN-only, or a firewall rule scoped to known IPs) — without either an auth gate or a network restriction, this would be an unauthenticated multi-tenant service holding multiple customers' diagnostic data on the open internet.
 
@@ -151,9 +179,9 @@ The GitHub repository itself is private. To share it with your CSS team:
 
 Be clear-eyed about the gaps before treating this as a complete solution for handling regulated or highly sensitive customer data:
 - No encryption at rest for uploaded bundles or analysis output on disk.
-- No audit logging of who analyzed what, when - per-user accounts (v4.4.0+) know who's *logged in*, but nothing correlates that identity to specific job actions.
-- No per-user data isolation - the optional auth gates (shared-secret or per-user accounts, see "Running one shared instance instead") block unauthenticated outsiders, but every authenticated user of a shared instance has identical access to every job on it, regardless of which auth mode is active.
-- No data-loss-prevention (DLP) scanning beyond the hostname/IP redaction described above.
+- No **job-level** audit logging - v4.10.0 adds a **sign-in** audit log (who signed in, how, when, from what IP, success/failure - see "Sign-in audit log" above), but nothing correlates a signed-in identity to specific job actions (who analyzed which specific bundle, downloaded which report, etc.).
+- No per-user data isolation - the optional auth gates (shared-secret, per-user accounts, or Microsoft Entra ID SSO - see "Running one shared instance instead") block unauthenticated outsiders, but every authenticated user of a shared instance has identical access to every job on it, regardless of which auth mode is active.
+- No data-loss-prevention (DLP) scanning beyond the hostname/IP/email redaction described above.
 - No formal compliance certification of any kind.
 
 If your team's work requires any of the above, treat this tool as a productivity aid layered on top of your organization's existing data-handling controls and policies — not a replacement for them.

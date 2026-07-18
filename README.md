@@ -1,6 +1,6 @@
 # Linux Diagnostic Intelligence Copilot - LDI Copilot
 
-[![Version](https://img.shields.io/badge/version-4.9.2-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-4.10.0-blue)](CHANGELOG.md) [![status](https://img.shields.io/badge/status-personal%20tool-informational)]() [![privacy](https://img.shields.io/badge/data-stays%20local-brightgreen)]()
 
 AI-powered analysis of **sosreport** (Red Hat), **supportconfig** (SUSE), and **crm_report/hb_report** (Pacemaker/Corosync HA cluster) diagnostic bundles — running locally in your browser — to deliver automated issue detection, root cause analysis, and remediation guidance.
 
@@ -20,7 +20,7 @@ The CLI (`sosreport-rca`) is great for scripting/automation. This project wraps 
 - **Move freely between Provide Bundle / Analyzing / Results** at any time via a persistent top tab bar, instead of being forced through a linear wizard
 - **Watch background progress from a full-height activity terminal docked along the entire right edge** — bundle selection, scan progress, AI synthesis, Ollama start/stop, downloads — without needing to be on a specific tab
 - **Reduce exposure automatically when using a public AI model** — known hostnames, IPv4/IPv6 addresses, and email addresses are redacted from the evidence digest before it's sent to any non-local provider, with an explicit confirmation required before any external send, and the exact redaction mapping shown right on the Results page (see [SECURITY.md](SECURITY.md))
-- **Optionally serve over HTTPS and behind an auth gate** — if you need to reach this from more than just `localhost` (e.g. a team sharing one instance on a cloud VM), `--https` adds TLS and a non-loopback `--host` automatically requires signing in (per-user accounts if you provision any, else a shared password) - see "Sharing with a team" below
+- **Optionally serve over HTTPS and behind an auth gate** — if you need to reach this from more than just `localhost` (e.g. a team sharing one instance on a cloud VM), `--https` adds TLS and a non-loopback `--host` automatically requires signing in (local accounts and/or Microsoft Entra ID SSO if you configure either, else a shared password) - every sign-in is recorded to an audit log - see "Sharing with a team" below
 - Get a live, readable dashboard (summary cards, cluster status, findings by category, chronological timeline) instead of a markdown file
 - Analyze `crm_report`/`hb_report` bundles too, with per-node attribution across a multi-node cluster
 - Keep everything on your machine — the server binds to `127.0.0.1` only by default, and bundle data is only ever sent off-box if you explicitly choose a cloud AI provider for the synthesis step
@@ -104,24 +104,50 @@ Options:
 
 **Read this before pointing `--host` at anything other than `127.0.0.1`.** [SECURITY.md](SECURITY.md)'s primary recommendation is still **one instance per engineer** — running a single shared instance means every user of that instance sees the same job list and uploaded bundles (there's no per-user *data* isolation, even with accounts below; see "What this doesn't provide"). If you need a single shared instance anyway (e.g. a global support team without per-engineer VMs), this project gives you independent safety nets, layered together:
 
-- **Per-user accounts (recommended)** — real individual sign-in instead of one password everyone shares. Provision each teammate with:
+- **Per-user accounts** — real individual sign-in instead of one password everyone shares. Provision each teammate with:
   ```bash
   python backend/manage_users.py add alice
   python backend/manage_users.py add bob
   ```
   (prompts for a password, hashed with `scrypt` — never stored or logged in plaintext). The moment one account exists and `--host` is non-loopback, every request requires signing in at a login page with that person's own username/password — nothing to share over chat/email at all, no single secret to leak or rotate, and you can revoke one person's access (`python backend/manage_users.py remove alice`) without affecting anyone else. Accounts lock out after 5 failed attempts (15 minutes) to resist brute-forcing. Manage the list any time with `add` / `remove` / `list` — changes apply immediately, no restart needed (except the very first account, which needs one restart to switch the server into accounts mode).
-- **`--auth-token "a-shared-secret"`** — the original single-shared-password gate (HTTP Basic Auth), still available for quick/simple sharing when individual accounts are overkill. Takes priority over accounts if both are present, so you can always fall back to it. Omit it entirely on a non-loopback host with zero accounts configured and a random password is generated and printed once at startup instead.
-- **`--https`** — serves over TLS instead of plain HTTP, so credentials (account passwords or the shared token alike) and bundle data aren't sent in the clear. Without `--ssl-certfile`/`--ssl-keyfile`, a self-signed certificate is generated once and reused on every restart (`certs/`, gitignored). Browsers will show a one-time "connection isn't private" warning for it — expected for any self-signed cert. Run `.\trust-cert.ps1` / `./trust-cert.sh` / `.\trust-cert.bat` once to import it into your OS's trusted store and make that warning go away entirely on that machine (only helps the machine you run it on — a different machine/browser connecting to the same server still sees the warning, or pass your own CA-issued certificate instead to avoid it everywhere).
+- **Microsoft Entra ID SSO (v4.10.0, recommended for teams already in Microsoft 365/Azure AD)** — teammates sign in with their existing organizational Microsoft account instead of a separate password you provision and they have to remember. Can be enabled **together with** local accounts (the login page offers whichever option(s) are actually configured) or entirely on its own.
+
+  **Set up an app registration once** (Azure Portal, one person with appropriate permissions does this):
+  1. **Microsoft Entra ID → App registrations → New registration**. Name it something recognizable (e.g. "LDI Copilot"). Note the **Application (client) ID** and **Directory (tenant) ID** from its Overview page.
+  2. **Authentication → Add a platform → Web**. Add a **Redirect URI** that exactly matches where this server will actually be reached, with `/api/auth/entra/callback` appended — e.g. `https://<your-vm-address>:8756/api/auth/entra/callback`. This must match byte-for-byte (scheme, host, port, path) what you pass to `--entra-redirect-uri` below, or Entra ID rejects the sign-in.
+  3. **Certificates & secrets → New client secret**. Copy the secret **value** immediately (shown only once).
+  4. **API permissions**: the default `openid`/`profile`/`email` delegated permissions (added automatically) are sufficient — no admin consent needed for basic sign-in.
+  5. *(Optional, recommended for restricting who can sign in)* Under **Enterprise applications** → find this same app → **Properties** → set **Assignment required?** to Yes, then assign specific users/groups under **Users and groups**. This is Entra ID's own access-control mechanism — this project intentionally doesn't maintain a separate allow-list on top of it, to avoid two access lists drifting out of sync.
+
+  Then start the server with:
+  ```bash
+  ./run.sh --host 0.0.0.0 --https \
+    --entra-tenant-id <directory-tenant-id> \
+    --entra-client-id <application-client-id> \
+    --entra-client-secret <client-secret-value> \
+    --entra-redirect-uri https://<your-vm-address>:8756/api/auth/entra/callback
+  ```
+  **Avoid putting the client secret on the command line** (visible in shell history and to anything that can list process arguments) by exporting it as an environment variable instead and omitting `--entra-client-secret` — the server reads `LDI_COPILOT_ENTRA_CLIENT_SECRET` (and the matching `LDI_COPILOT_ENTRA_TENANT_ID`/`_CLIENT_ID`/`_REDIRECT_URI`) automatically if the corresponding flag isn't passed:
+  ```bash
+  export LDI_COPILOT_ENTRA_CLIENT_SECRET="the-secret-value"
+  ./run.sh --host 0.0.0.0 --https --entra-tenant-id ... --entra-client-id ... --entra-redirect-uri ...
+  ```
+  All four values are required together for Entra ID SSO to activate; the server refuses to start if only some are given (a clear config-error message, not a silent partial state).
+- **`--auth-token "a-shared-secret"`** — the original single-shared-password gate (HTTP Basic Auth), still available for quick/simple sharing when individual accounts/Entra ID are overkill. Takes priority over accounts/Entra ID if any are present, so you can always fall back to it. Omit it entirely on a non-loopback host with nothing else configured and a random password is generated and printed once at startup instead.
+- **`--https`** — serves over TLS instead of plain HTTP, so credentials (account passwords, Entra ID tokens, or the shared token alike) and bundle data aren't sent in the clear. Without `--ssl-certfile`/`--ssl-keyfile`, a self-signed certificate is generated once and reused on every restart (`certs/`, gitignored). Browsers will show a one-time "connection isn't private" warning for it — expected for any self-signed cert. Run `.\trust-cert.ps1` / `./trust-cert.sh` / `.\trust-cert.bat` once to import it into your OS's trusted store and make that warning go away entirely on that machine (only helps the machine you run it on — a different machine/browser connecting to the same server still sees the warning, or pass your own CA-issued certificate instead to avoid it everywhere). **Entra ID SSO effectively requires `--https`** in practice — Microsoft's own redirect URI validation strongly prefers `https://` for anything other than `localhost`.
 - **`--no-auth`** disables every auth gate even on a non-loopback host — only do this if network-level access is *already* restricted (VPN-only, or a firewall rule scoped to specific known IPs), since these gates are a safety net against a stray internet scanner finding the address, not a substitute for real network controls.
 - **`--require-auth`** forces whichever gate would apply on a non-loopback host to also apply on `127.0.0.1` — handy for testing the login flow locally before deploying for real.
 
-Realistic setup for a globally-distributed support team on one Azure VM, with individual accounts:
+**Audit log (v4.10.0)** — every sign-in attempt (success or failure, local account or Entra ID) and every logout is recorded to `backend/data/audit.log` (gitignored, rotates at 5MB keeping 5 backups). View recent activity in-app at `/audit.html` (linked from the "Audit log" entry next to your username in the topbar once signed in) or read the file directly — it's one JSON object per line, `grep`/log-tool friendly. Gated by whichever auth mode is already active, same as every other page — consistent with this project's no-RBAC design (see "What this doesn't provide" below), there's no separate "admin-only" restriction on top of that.
+
+Realistic setup for a globally-distributed support team on one Azure VM, with Entra ID SSO:
 ```bash
-python backend/manage_users.py add alice
-python backend/manage_users.py add bob
-./run.sh --host 0.0.0.0 --https
+export LDI_COPILOT_ENTRA_CLIENT_SECRET="the-secret-value"
+./run.sh --host 0.0.0.0 --https \
+  --entra-tenant-id <directory-tenant-id> --entra-client-id <application-client-id> \
+  --entra-redirect-uri https://<vm-public-ip>:8756/api/auth/entra/callback
 ```
-Then open the VM's NSG for the chosen port (scoped to your team's known IP ranges/VPN CIDR if at all possible, not `0.0.0.0/0`), and share `https://<vm-public-ip>:<port>` with your team — each person signs in with their own account, nothing else to distribute.
+Then open the VM's NSG for the chosen port (scoped to your team's known IP ranges/VPN CIDR if at all possible, not `0.0.0.0/0`), and share `https://<vm-public-ip>:<port>` with your team — each person signs in with their existing Microsoft account via the "Sign in with Microsoft" button, nothing else to distribute or provision per-person.
 
 ### Manual setup (alternative to the run scripts)
 
@@ -242,10 +268,10 @@ If authentication succeeds but the chat call still fails, double-check step 3 �
 
 ## Privacy & data handling
 
-**See [SECURITY.md](SECURITY.md) for the full picture** — recommended team deployment model (one instance per engineer, not a shared server), exactly what data leaves the machine and when, the redaction feature and its limitations, a provider risk ordering, retention guidance, and an explicit list of what this tool does *not* provide (encryption at rest, audit logging, RBAC, DLP, formal compliance certification).
+**See [SECURITY.md](SECURITY.md) for the full picture** — recommended team deployment model (one instance per engineer, not a shared server), exactly what data leaves the machine and when, the redaction feature and its limitations, a provider risk ordering, retention guidance, and an explicit list of what this tool does *not* provide (encryption at rest, RBAC, DLP, formal compliance certification).
 
 Summary:
-- The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0` (or another real address), which automatically requires signing in (per-user accounts if any are configured, else a shared password) and offers `--https` for TLS - see "Sharing with a team" above.
+- The server binds to `127.0.0.1` (localhost) by default — nothing on your network can reach it unless you explicitly pass `-HostAddress 0.0.0.0` (or another real address), which automatically requires signing in (local accounts and/or Microsoft Entra ID SSO if either is configured, else a shared password) and offers `--https` for TLS - see "Sharing with a team" above. Every sign-in (either method) and logout is recorded to an audit log (`backend/data/audit.log`, viewable in-app at `/audit.html`).
 - Uploaded archives and their extracted contents/analysis output are kept under `backend/data/jobs/<job_id>/` for the lifetime of the server process. Delete a job's data any time via the API (`DELETE /api/jobs/{id}`) or just delete the folder; nothing is auto-uploaded anywhere.
 - The AI synthesis step sends the **evidence digest** (system/cluster names, log excerpts, IPs, timestamps, etc. — not the raw uploaded archive) to whichever provider you pick, with known hostnames/IPs redacted by default for non-local providers — and now shown directly on the Results page, not just the activity terminal. Use **Ollama** (the default) if the bundle must never leave the machine.
 - The frontend has zero external/CDN dependencies (including its own small Markdown renderer) so the UI itself works with no internet access — only the AI synthesis step (for non-Ollama providers) and the optional "Check available models" call need connectivity.
@@ -262,8 +288,16 @@ ldi-copilot/
 ├── backend/
 │   ├── app.py                 # FastAPI server: job management, REST API, static file serving,
 │   │                          # /api/models live-availability endpoint, /api/ollama/* lifecycle,
-│   │                          # /api/jobs/{id}/chat (interactive follow-up), /api/jobs/{id}/sar_series
-│   ├── requirements.txt        # fastapi, uvicorn, python-multipart, dpkt (pcap parsing)
+│   │                          # /api/jobs/{id}/chat (interactive follow-up), /api/jobs/{id}/sar_series,
+│   │                          # /api/auth/* (local login + Entra ID SSO), /api/audit
+│   ├── auth.py                 # SessionStore/SessionCookieMiddleware (shared by local accounts AND
+│   │                          # Entra ID SSO) + BasicAuthMiddleware (shared-secret fallback)
+│   ├── users.py                # per-user local account store (scrypt-hashed, backend/data/users.json)
+│   ├── manage_users.py         # CLI to add/remove/list local accounts
+│   ├── entra_auth.py           # Microsoft Entra ID SSO (v4.10.0) - OAuth2 Authorization Code + PKCE,
+│   │                          # ID token signature verification via PyJWT against Entra ID's JWKS
+│   ├── audit.py                # sign-in/logout audit log (v4.10.0) - backend/data/audit.log
+│   ├── requirements.txt        # fastapi, uvicorn, python-multipart, dpkt (pcap parsing), PyJWT[crypto]
 │   ├── engine/
 │   │   ├── analyzer_core.py   # mechanical scanning engine (extraction, detection, pattern
 │   │   │                      # matching, fact-checks, timeline, digest, focus-keyword
@@ -290,6 +324,8 @@ ldi-copilot/
 │   │                          # pcap upload slot + analysis focus-area toggles, full-height
 │   │                          # right-edge activity terminal with Ollama toolbar, Performance
 │   │                          # sub-tab, interactive chat thread
+│   ├── login.html              # sign-in page (local accounts and/or "Sign in with Microsoft")
+│   ├── audit.html               # in-app sign-in audit log viewer (v4.10.0)
 │   ├── app.js                 # upload, polling, rendering, SSE streaming, tiny MD renderer,
 │   │                          # top-level tab switching, auth-type-aware AI config, model
 │   │                          # dropdown + availability checks, activity-terminal logging,

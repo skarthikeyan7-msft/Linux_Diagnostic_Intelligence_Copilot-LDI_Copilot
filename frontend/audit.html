@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audit Log - LDI Copilot</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+  .audit-wrap { max-width: 1100px; margin: 24px auto; padding: 0 24px 48px; }
+  .audit-filters { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 16px; flex-wrap: wrap; }
+  .audit-filters .field-row { margin-bottom: 0; min-width: 160px; }
+  .audit-table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  table.audit-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.audit-table th, table.audit-table td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  table.audit-table th { color: var(--text-muted); font-weight: 500; background: var(--bg-panel-2); position: sticky; top: 0; }
+  table.audit-table td { font-family: Consolas, monospace; font-size: 12.5px; }
+  .event-badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-family: inherit; }
+  .event-login_success { background: rgba(111, 207, 151, 0.15); color: var(--info); }
+  .event-login_failure { background: rgba(255, 84, 112, 0.15); color: var(--critical); }
+  .event-logout { background: rgba(139, 148, 167, 0.15); color: var(--text-muted); }
+  .method-badge { font-size: 11px; color: var(--text-muted); }
+  .audit-empty { padding: 32px; text-align: center; color: var(--text-muted); }
+  .audit-detail { color: var(--text-muted); font-size: 11.5px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">LDI</span>
+      <span class="brand-name">LDI Copilot</span>
+      <span class="brand-sub">Audit Log - sign-in activity (local accounts &amp; Microsoft Entra ID)</span>
+    </div>
+    <div class="topbar-right">
+      <a href="/" class="btn btn-ghost">← Back to app</a>
+    </div>
+  </header>
+
+  <div class="audit-wrap">
+    <p class="muted small" id="audit-intro">Recent sign-in activity for this LDI Copilot instance - every login attempt (success or failure, local account or Microsoft Entra ID) and every logout. Read directly from <code>backend/data/audit.log</code>, rotated at 5MB (keeps 5 backups). Gated by whatever auth mode this instance already has active - anyone who can reach this page can already reach every other page too.</p>
+
+    <div class="audit-filters">
+      <div class="field-row">
+        <label for="fUsername">Filter by username</label>
+        <input type="text" id="fUsername" placeholder="e.g. alice">
+      </div>
+      <div class="field-row">
+        <label for="fEvent">Filter by event</label>
+        <select id="fEvent">
+          <option value="">All events</option>
+          <option value="login_success">login_success</option>
+          <option value="login_failure">login_failure</option>
+          <option value="logout">logout</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label for="fLimit">Show up to</label>
+        <select id="fLimit">
+          <option value="50">50</option>
+          <option value="200" selected>200</option>
+          <option value="500">500</option>
+          <option value="1000">1000</option>
+        </select>
+      </div>
+      <button id="btnRefresh" class="btn btn-primary">🔄 Refresh</button>
+    </div>
+
+    <div class="audit-table-wrap">
+      <table class="audit-table">
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Event</th>
+            <th>Username</th>
+            <th>Method</th>
+            <th>IP</th>
+            <th>User agent</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody id="auditBody"></tbody>
+      </table>
+      <div class="audit-empty hidden" id="auditEmpty">No audit entries match these filters.</div>
+    </div>
+  </div>
+</div>
+<script>
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  const methodLabels = { local: "Local account", entra: "Microsoft Entra ID" };
+
+  async function loadAudit() {
+    const username = document.getElementById("fUsername").value.trim();
+    const event = document.getElementById("fEvent").value;
+    const limit = document.getElementById("fLimit").value;
+    const params = new URLSearchParams({ limit });
+    if (username) params.set("username", username);
+    if (event) params.set("event", event);
+
+    const body = document.getElementById("auditBody");
+    const empty = document.getElementById("auditEmpty");
+    try {
+      const resp = await fetch(`/api/audit?${params.toString()}`);
+      if (!resp.ok) {
+        body.innerHTML = "";
+        empty.textContent = resp.status === 401
+          ? "Sign in to view the audit log."
+          : `Could not load audit log (HTTP ${resp.status}).`;
+        empty.classList.remove("hidden");
+        return;
+      }
+      const data = await resp.json();
+      const entries = data.entries || [];
+      if (!entries.length) {
+        body.innerHTML = "";
+        empty.textContent = "No audit entries match these filters.";
+        empty.classList.remove("hidden");
+        return;
+      }
+      empty.classList.add("hidden");
+      body.innerHTML = entries.map((e) => `
+        <tr>
+          <td>${escapeHtml(e.time)}</td>
+          <td><span class="event-badge event-${escapeHtml(e.event)}">${escapeHtml(e.event)}</span></td>
+          <td>${escapeHtml(e.username || "—")}</td>
+          <td><span class="method-badge">${escapeHtml(methodLabels[e.auth_method] || e.auth_method || "—")}</span></td>
+          <td>${escapeHtml(e.ip || "—")}</td>
+          <td class="audit-detail" title="${escapeHtml(e.user_agent || "")}">${escapeHtml(e.user_agent || "—")}</td>
+          <td class="audit-detail" title="${escapeHtml(e.detail || "")}">${escapeHtml(e.detail || "—")}</td>
+        </tr>
+      `).join("");
+    } catch (err) {
+      body.innerHTML = "";
+      empty.textContent = `Network error loading audit log: ${err.message}`;
+      empty.classList.remove("hidden");
+    }
+  }
+
+  document.getElementById("btnRefresh").addEventListener("click", loadAudit);
+  document.getElementById("fUsername").addEventListener("keydown", (e) => { if (e.key === "Enter") loadAudit(); });
+  document.getElementById("fEvent").addEventListener("change", loadAudit);
+  document.getElementById("fLimit").addEventListener("change", loadAudit);
+  loadAudit();
+</script>
+</body>
+</html>

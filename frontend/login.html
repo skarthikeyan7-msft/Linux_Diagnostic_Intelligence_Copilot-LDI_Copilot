@@ -59,22 +59,98 @@
   }
   button:disabled { opacity: .6; cursor: default; }
   .error { color: var(--error); font-size: 13px; margin: 0 0 14px; min-height: 16px; }
+  .btn-ms {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px;
+    background: #2f2f2f;
+    border: 1px solid #555;
+    border-radius: 6px;
+    color: #fff;
+    font-weight: 500;
+    font-size: 14px;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .btn-ms:hover { background: #3a3a3a; }
+  .ms-logo { width: 18px; height: 18px; flex: none; }
+  .divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 18px 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+  #localForm.hidden, #entraBtnWrap.hidden, .divider.hidden { display: none; }
 </style>
 </head>
 <body>
-  <form class="card" id="loginForm" autocomplete="on">
+  <div class="card">
     <h1>🔒 LDI Copilot</h1>
-    <p class="sub">Sign in with your team account.</p>
+    <p class="sub">Sign in to continue.</p>
     <div class="error" id="err"></div>
-    <label for="u">Username</label>
-    <input id="u" name="username" autocomplete="username" required autofocus>
-    <label for="p">Password</label>
-    <input id="p" name="password" type="password" autocomplete="current-password" required>
-    <button id="btn" type="submit">Sign in</button>
-  </form>
+
+    <div id="entraBtnWrap" class="hidden">
+      <a id="btnEntra" class="btn-ms" href="/api/auth/entra/login">
+        <svg class="ms-logo" viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg">
+          <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+          <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+          <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+          <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+        </svg>
+        Sign in with Microsoft
+      </a>
+    </div>
+    <div class="divider" id="divider">or</div>
+
+    <form id="loginForm" autocomplete="on">
+      <label for="u">Username</label>
+      <input id="u" name="username" autocomplete="username" required autofocus>
+      <label for="p">Password</label>
+      <input id="p" name="password" type="password" autocomplete="current-password" required>
+      <button id="btn" type="submit">Sign in</button>
+    </form>
+  </div>
   <script>
-    const form = document.getElementById("loginForm");
     const err = document.getElementById("err");
+
+    // Surface a Microsoft Entra ID sign-in FAILURE, if we just landed
+    // back here via a redirect from /api/auth/entra/callback (see
+    // backend/app.py's entra_callback() - a browser navigation can't
+    // return JSON a script would read the way the local-login POST
+    // below can, so the error comes back as a query param instead).
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("error")) {
+      err.textContent = params.get("error");
+      // Clean the URL so refreshing/bookmarking doesn't keep re-showing
+      // a stale error message.
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+
+    // Decide which sign-in option(s) this instance actually offers -
+    // Entra ID SSO, local accounts, or both (see backend/app.py's
+    // GET /api/auth/entra/enabled). Hides whichever option isn't
+    // actually usable rather than showing a form/button that could
+    // never succeed.
+    fetch("/api/auth/entra/enabled").then((r) => r.json()).then((data) => {
+      if (data.entra_enabled) {
+        document.getElementById("entraBtnWrap").classList.remove("hidden");
+      }
+      if (data.entra_enabled && !data.accounts_configured) {
+        document.getElementById("loginForm").classList.add("hidden");
+        document.getElementById("divider").classList.add("hidden");
+      }
+    }).catch(() => {
+      // Network error - leave the default (local form visible, Entra
+      // button hidden) rather than guessing.
+    });
+
+    const form = document.getElementById("loginForm");
     const btn = document.getElementById("btn");
     form.addEventListener("submit", async (e) => {
       e.preventDefault();

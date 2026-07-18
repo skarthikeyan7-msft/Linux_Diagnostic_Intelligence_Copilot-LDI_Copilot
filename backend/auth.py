@@ -10,25 +10,37 @@ team" section), anyone who can route to that address can reach every
 endpoint: upload a customer's sosreport, read back the analysis, spend
 the configured AI provider's API budget, etc. This module provides two
 gates, chosen automatically by backend/app.py's main() based on whether
-any per-user accounts are configured (see backend/users.py):
+session-based auth (local accounts and/or Entra ID SSO) is configured:
 
-1. **SessionCookieMiddleware + SessionStore** (recommended - "accounts"
-   mode): per-user login via backend/users.py's UserStore, backed by a
-   signed-nothing random session token in an HttpOnly cookie. Gives real
-   per-user identity (so access for one teammate can be revoked without
-   affecting anyone else) at the cost of needing an admin to provision
-   accounts first (backend/manage_users.py).
+1. **SessionCookieMiddleware + SessionStore** (recommended - "session"
+   mode): per-user login, backed by a random session token in an
+   HttpOnly cookie. Gives real per-user identity (so access for one
+   teammate can be revoked without affecting anyone else). A session can
+   be established two ways, both producing the identical kind of cookie:
+   - **Local accounts** (backend/users.py's UserStore) - an admin
+     provisions each teammate a username/password first
+     (backend/manage_users.py).
+   - **Microsoft Entra ID SSO** (v4.10.0, backend/entra_auth.py) -
+     teammates sign in with their existing organizational Microsoft
+     account instead, no separate password to provision/manage/rotate.
+     Both can be enabled at once - the login page offers whichever
+     option(s) are actually configured for this instance.
 2. **BasicAuthMiddleware** ("token" mode - the original v4.3.0 gate,
    still available): a single shared secret, no accounts to manage,
-   automatically used as a zero-setup fallback when no accounts exist
-   yet. HTTP Basic Auth means the browser prompts once and auto-attaches
-   the credential to every subsequent request (including the frontend's
-   own fetch() calls) with zero frontend code.
+   automatically used as a zero-setup fallback when neither local
+   accounts nor Entra ID are configured. HTTP Basic Auth means the
+   browser prompts once and auto-attaches the credential to every
+   subsequent request (including the frontend's own fetch() calls) with
+   zero frontend code.
 
 Both are enforced by a Starlette middleware wrapping every request (API
 routes and the static frontend alike) except /api/health, which stays
 reachable without credentials for uptime monitoring / load balancer
 probes and reveals nothing sensitive (just {"status": "ok", ...}).
+
+Every login attempt (either path) and logout is recorded to
+backend/audit.py's append-only audit log - see that module and
+GET /api/audit.
 
 Neither is a substitute for real network-layer controls (VPN-only
 access, a firewall rule scoped to known source IPs) when the bundles
@@ -90,40 +102,59 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
 
 
 # --------------------------------------------------------------------------
-# Per-user accounts ("accounts" mode) - session store + cookie middleware.
+# Session-cookie-based auth ("session" mode) - session store + cookie
+# middleware, shared by BOTH ways of establishing a session: local
+# accounts (backend/users.py) and Microsoft Entra ID SSO
+# (backend/entra_auth.py). Either path calls SessionStore.create() below
+# and gets back the exact same kind of cookie - everything downstream of
+# login (this middleware, /api/auth/me, audit logging) treats a session
+# uniformly regardless of which door the user came in through.
 # --------------------------------------------------------------------------
 SESSION_COOKIE_NAME = "ldi_session"
 LOGIN_PAGE_PATH = "/login.html"
 _DEFAULT_SESSION_TTL_SECONDS = 12 * 3600  # 12 hours - a support engineer's typical shift-length upper bound
 
 # Paths reachable without a session, on top of _UNAUTHENTICATED_PATHS
-# above: the login page itself and the login API call that establishes
-# a session in the first place (nothing else about /api/auth/* - "me"
-# and "logout" both require an existing session, which they check
-# themselves rather than being globally exempted here).
-_ACCOUNTS_UNAUTHENTICATED_PATHS = {LOGIN_PAGE_PATH, "/api/auth/login"}
+# above: the login page itself, the local-account login API call, and
+# (v4.10.0) the two Entra ID SSO endpoints that necessarily run BEFORE
+# any session exists - a user can't have a session cookie yet when
+# they're still in the middle of establishing one. Nothing else about
+# /api/auth/* is exempted here ("me" and "logout" both require an
+# existing session, which they check themselves).
+_ACCOUNTS_UNAUTHENTICATED_PATHS = {
+    LOGIN_PAGE_PATH, "/api/auth/login",
+    "/api/auth/entra/login", "/api/auth/entra/callback", "/api/auth/entra/enabled",
+}
 
 
 class SessionStore:
-    """In-memory session store (token -> {username, expires_at}) - mirrors
-    this codebase's existing JOBS/JOBS_LOCK pattern in backend/app.py:
-    simple, process-lifetime-only, appropriate for a small internal tool
-    with no requirement for sessions to survive a server restart (a
-    restart just signs everyone out, which is an acceptable trade-off
-    here)."""
+    """In-memory session store (token -> {username, auth_method,
+    expires_at}) - mirrors this codebase's existing JOBS/JOBS_LOCK
+    pattern in backend/app.py: simple, process-lifetime-only,
+    appropriate for a small internal tool with no requirement for
+    sessions to survive a server restart (a restart just signs everyone
+    out, which is an acceptable trade-off here)."""
 
     def __init__(self, ttl_seconds: int = _DEFAULT_SESSION_TTL_SECONDS):
         self.ttl_seconds = ttl_seconds
         self._sessions = {}
         self._lock = threading.Lock()
 
-    def create(self, username: str) -> str:
+    def create(self, username: str, auth_method: str = "local") -> str:
+        """auth_method is purely descriptive ("local" or "entra") - it
+        grants nothing on its own and isn't checked by the auth gate
+        itself; it exists so /api/auth/me and the audit log can show/
+        record HOW a given session was established, not just who."""
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._sessions[token] = {"username": username, "expires_at": time.time() + self.ttl_seconds}
+            self._sessions[token] = {"username": username, "auth_method": auth_method, "expires_at": time.time() + self.ttl_seconds}
         return token
 
-    def get_username(self, token: str):
+    def get_session(self, token: str):
+        """Returns the full {username, auth_method} record, or None if
+        the token is missing/unknown/expired. Prefer this over
+        get_username() when the caller also needs auth_method (e.g. the
+        audit log on logout, or /api/auth/me's response)."""
         if not token:
             return None
         with self._lock:
@@ -133,7 +164,16 @@ class SessionStore:
             if record["expires_at"] < time.time():
                 del self._sessions[token]
                 return None
-            return record["username"]
+            return {"username": record["username"], "auth_method": record.get("auth_method", "local")}
+
+    def get_username(self, token: str):
+        """Thin convenience wrapper over get_session() for the many
+        existing callers (SessionCookieMiddleware, in particular) that
+        only ever needed the username - kept so this remains a
+        non-breaking addition rather than requiring every call site to
+        be rewritten for the new auth_method field."""
+        session = self.get_session(token)
+        return session["username"] if session else None
 
     def destroy(self, token: str):
         with self._lock:
