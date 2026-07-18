@@ -61,7 +61,6 @@ import lzma
 import multiprocessing
 import os
 import platform
-import posixpath
 import queue as queue_mod
 import re
 import stat
@@ -74,7 +73,7 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.11.0"
+__version__ = "4.12.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -406,6 +405,19 @@ BINARY_SKIP_EXTS = {
     ".gif", ".ico", ".pdf", ".db", ".sqlite", ".sqlite3", ".journal",
     ".pcap", ".pcapng", ".so", ".ko", ".bin", ".img", ".qcow2", ".vmdk",
     ".tar", ".core",
+    # .obj/.pkl (v4.12.0) - a pure fast-path optimization, NOT a
+    # correctness fix: is_probably_text_bytes()'s content-sniffing
+    # already correctly classifies these as binary without needing an
+    # extension-list entry at all (confirmed directly against real
+    # files below) - this just skips the 4KB-read-and-heuristic probe
+    # entirely for a file already known, from real evidence, to always
+    # be one. Found in two real bundles this project was tested
+    # against: supportconfig's public_cloud/regcache/*.obj (SUSE's
+    # cloudregister.smt SMT-registration cache) and a sosreport's own
+    # *.pkl file - both genuine Python `pickle`-serialized binary
+    # objects (opcode-based serialization, never meaningfully readable
+    # as text either way).
+    ".obj", ".pkl",
 }
 
 # --------------------------------------------------------------------------
@@ -867,15 +879,51 @@ def _windows_safe_member_name(name):
 
 
 def safe_extract_tar(tar_path, dest_dir):
+    """Extracts every member, same as before, but as of v4.12.0 ALSO
+    returns per-link metadata (`links`) for every symlink/hardlink
+    member encountered - not just their eventual byte content.
+
+    Why this matters: on Windows (the one runtime this tool actually
+    ships on), `tarfile.extract()` cannot create a real symlink/hardlink
+    (no `SeCreateSymbolicLinkPrivilege` by default) - but rather than
+    failing, `TarFile.makelink()` silently falls back to copying the
+    LINK TARGET's own real byte content in as an ordinary file instead
+    (confirmed directly against a real sosreport's 1,064 real symlinks -
+    e.g. `etc/localtime` lands as a 127-byte regular file with genuine
+    zoneinfo content, not a 0-byte stub or a missing file). That fallback
+    means file CONTENT was already correctly readable before this
+    change - but every symlink/hardlink was completely indistinguishable
+    from an ordinary file afterward, with zero record that it was ever a
+    link at all. That's a real, if subtle, RCA gap: it silently hides
+    *why* two unrelated-looking paths hold identical content, and a
+    genuinely broken/dangling link on the source system (extraction
+    itself raising, since there's no target content to fall back to)
+    was previously indistinguishable from any other unrelated extraction
+    failure buried in the generic `skipped` list.
+
+    Each entry in `links` is `{"name", "type": "symlink"|"hardlink",
+    "target": <raw linkname exactly as archived>, "extracted": bool,
+    "error": str|None}` - `target` is intentionally left UNRESOLVED here
+    (a tar symlink's target is relative to the link's own directory,
+    while a tar hardlink's target is relative to the ARCHIVE ROOT - two
+    different resolution rules) so it can be interpreted correctly once
+    build_inventory() has the full path set to resolve against; see
+    _resolve_link_target().
+    """
     skipped = []
+    links = []
     dest_abs = os.path.abspath(str(dest_dir))
     with tarfile.open(tar_path, "r:*") as tf:
         for m in tf:
+            link_type = "symlink" if m.issym() else ("hardlink" if m.islnk() else None)
+            safe_name = m.name  # fallback if _windows_safe_member_name() itself never runs below
             try:
                 safe_name = _windows_safe_member_name(m.name)
                 target = os.path.abspath(os.path.join(dest_abs, safe_name))
                 if not (target == dest_abs or target.startswith(dest_abs + os.sep)):
                     skipped.append((m.name, "path traversal"))
+                    if link_type:
+                        links.append({"name": safe_name, "type": link_type, "target": m.linkname, "extracted": False, "error": "path traversal"})
                     continue
                 if m.isdev() or m.ischr() or m.isblk() or m.isfifo():
                     skipped.append((m.name, "device/special file"))
@@ -883,28 +931,68 @@ def safe_extract_tar(tar_path, dest_dir):
                 if safe_name != m.name:
                     m.name = safe_name
                 tf.extract(m, dest_dir)
+                if link_type:
+                    links.append({"name": safe_name, "type": link_type, "target": m.linkname, "extracted": True, "error": None})
             except Exception as e:
                 skipped.append((m.name, str(e)))
-    return skipped
+                if link_type:
+                    links.append({"name": safe_name, "type": link_type, "target": m.linkname, "extracted": False, "error": str(e)})
+    return skipped, links
 
 
 def safe_extract_zip(zip_path, dest_dir):
+    """Same extraction behavior as before, plus symlink metadata
+    tracking (as of v4.12.0) - see safe_extract_tar()'s docstring for
+    the full rationale.
+
+    The ZIP format has no first-class symlink concept the way tar does
+    (no dedicated member "type" byte) - a symlink is instead a plain
+    file entry whose Unix permission bits (packed into the upper 16
+    bits of `external_attr` by tools that wrote it on a Unix system,
+    e.g. Info-Zip - the de facto convention every real Unix zip
+    implementation follows) have the S_IFLNK bit set, and whose CONTENT
+    is the link's target path text rather than real file data. Detected
+    here by checking those permission bits; the target is read directly
+    from the zip entry's own content (available immediately, no
+    dependency on how/whether the extraction itself succeeds).
+
+    ZIP also has no hardlink concept at all - "type" will only ever be
+    "symlink" for a zip-sourced bundle, which is fine since sosreport/
+    supportconfig/crm_report are practically always tar-based anyway;
+    zip support here is a defensive fallback for whatever a user might
+    hand this tool, not the primary real-world path.
+    """
     skipped = []
+    links = []
     dest_abs = os.path.abspath(str(dest_dir))
     with zipfile.ZipFile(zip_path) as zf:
         for info in zf.infolist():
+            is_symlink = bool(info.external_attr) and stat.S_ISLNK((info.external_attr >> 16) & 0xFFFF)
+            link_target = None
+            if is_symlink:
+                try:
+                    link_target = zf.read(info).decode("utf-8", errors="replace").strip()
+                except Exception:
+                    link_target = None
+            safe_name = info.filename  # fallback if _windows_safe_member_name() itself never runs below
             try:
                 safe_name = _windows_safe_member_name(info.filename)
                 target = os.path.abspath(os.path.join(dest_abs, safe_name))
                 if not (target == dest_abs or target.startswith(dest_abs + os.sep)):
                     skipped.append((info.filename, "path traversal"))
+                    if is_symlink:
+                        links.append({"name": safe_name, "type": "symlink", "target": link_target, "extracted": False, "error": "path traversal"})
                     continue
                 if safe_name != info.filename:
                     info.filename = safe_name
                 zf.extract(info, dest_dir)
+                if is_symlink:
+                    links.append({"name": safe_name, "type": "symlink", "target": link_target, "extracted": True, "error": None})
             except Exception as e:
                 skipped.append((info.filename, str(e)))
-    return skipped
+                if is_symlink:
+                    links.append({"name": safe_name, "type": "symlink", "target": link_target, "extracted": False, "error": str(e)})
+    return skipped, links
 
 
 def resolve_root(dest_dir: Path) -> Path:
@@ -981,7 +1069,37 @@ def is_probably_text(path: Path) -> bool:
     return is_probably_text_bytes(chunk)
 
 
-def build_inventory(root: Path, kind: str):
+def build_inventory(root: Path, kind: str, links=None):
+    """Walks the extraction root into the flat {path, size, category}
+    list every downstream check works from. As of v4.12.0, also accepts
+    `links` (the list safe_extract_tar()/safe_extract_zip() return) so
+    every symlink/hardlink that resolves to a FILE gets annotated with
+    its type/target instead of looking identical to an ordinary file -
+    see those functions' docstrings for why this matters. Purely
+    additive: a caller that still passes no `links` (or an archive
+    extractor that found none) gets exactly the pre-v4.12.0 inventory
+    shape back, just without the new keys ever being set.
+
+    Deliberately does NOT try to also resolve/annotate a link's TARGET
+    against the inventory here (an earlier version of this function did
+    - removed after testing directly against a real sosreport's 1,064
+    real symlinks surfaced two real complications a simple string-based
+    resolution can't handle well: many real symlinks point at
+    DIRECTORIES, not files - e.g. "sys/block/sdb" -> a device subtree
+    - which this file-only inventory never lists at all regardless; and
+    a symlink's *documented* target can differ from what tarfile's own
+    content-copy fallback actually resolved on THIS specific extraction
+    run. check_link_summary() answers "did this link end up as usable
+    content" far more reliably by directly checking the filesystem
+    after extraction, rather than re-deriving it from path strings).
+    """
+    links_by_name = {}
+    for link in links or []:
+        # Tar/zip member names always use "/" - matches os.walk()+
+        # as_posix() below, so this lookup is a direct, case-sensitive
+        # dict hit with no further normalization needed.
+        links_by_name[link["name"]] = link
+
     inventory = []
     for dirpath, dirnames, filenames in os.walk(root):
         for fn in filenames:
@@ -995,7 +1113,16 @@ def build_inventory(root: Path, kind: str):
             except OSError:
                 size = -1
             cat = categorize(rel.lower(), kind)
-            inventory.append({"path": rel, "size": size, "category": cat})
+            entry = {"path": rel, "size": size, "category": cat}
+            link = links_by_name.get(rel)
+            if link:
+                entry["is_link"] = True
+                entry["link_type"] = link["type"]
+                entry["link_target"] = link["target"]
+                entry["link_extracted"] = link["extracted"]
+                if not link["extracted"]:
+                    entry["link_error"] = link["error"]
+            inventory.append(entry)
     return inventory
 
 
@@ -2490,6 +2617,95 @@ def check_system_info(root, kind, inventory):
     return info
 
 
+_LINK_SUMMARY_MAX_EXAMPLES = 50  # bounded so a pathological bundle (e.g. thousands of broken links) can't blow up facts.json
+
+
+def check_link_summary(root, links):
+    """Summarizes the raw symlink/hardlink metadata safe_extract_tar()/
+    safe_extract_zip() tracked during extraction (as of v4.12.0) - see
+    those functions' docstrings for why this exists at all: on this
+    tool's own Windows runtime, a link's CONTENT was already correctly
+    readable via tarfile's built-in target-copy fallback even before
+    this version, but there was previously zero record that a given
+    path was ever a link rather than an ordinary file.
+
+    Classifies each link's real, ON-DISK extraction outcome directly
+    (by checking `root / link["name"]` after extraction has already
+    happened) rather than trying to re-derive it from the archive's own
+    recorded target-path string - a real, two-part gap found by testing
+    directly against a real sosreport's 1,064 real symlinks:
+      - Many real symlinks point at DIRECTORIES, not files (e.g.
+        "sys/block/sdb" -> a `/sys` device subtree, "etc/yum/vars" ->
+        "../dnf/vars") - tarfile's fallback correctly creates a real
+        directory for these, which a naive file-content check would
+        never account for.
+      - A symlink whose target isn't captured by sosreport/supportconfig
+        AT ALL (e.g. "etc/mtab" -> "../proc/self/mounts", or a service
+        override pointing at "/dev/null") extracts with NO error raised
+        at all, yet nothing lands on disk - tarfile silently no-ops
+        rather than raising, so this can't be told apart from a genuine
+        extraction failure by exception-catching alone; a direct
+        filesystem check afterward is what actually reveals it.
+    None of this is framed as "broken" - a symlink whose target isn't
+    part of THIS bundle (whether because it resolved to a directory
+    build_inventory() correctly never lists, or a path this collector
+    simply never captures, like most of `/proc`/`/dev`) is the ordinary,
+    expected case, not a sign of a problem on the source system, which
+    this tool has no visibility into either way.
+
+    Returns {} (not an error) when `links` is empty - the common case
+    for supportconfig (SUSE's collector produced zero symlinks in the
+    real bundle this was verified against) and not unusual for
+    sosreport either when the archive extractor found none.
+
+    Two DIFFERENT "content unavailable" cases are deliberately kept
+    separate, not merged into one count, since they have very different
+    severity:
+      - `extraction_errors` - the copy-fallback itself raised an
+        exception (rare - e.g. a still-uncooperative Windows path even
+        after `_windows_safe_member_name()` sanitization). Genuinely
+        actionable: this path's content is truly unavailable to this
+        analysis, unlike every other link.
+      - `target_not_captured` - extraction reported success (no
+        exception - tarfile silently no-ops rather than raising when a
+        link's target isn't found among the archive's own members) but
+        nothing landed on disk. This is the ORDINARY, EXPECTED case for
+        a large fraction of real symlinks (most collectors don't grab
+        `/proc`/`/dev` contents, or arbitrary system libraries a
+        symlink might point at) - informational only, not a sign of a
+        problem on the source system.
+    """
+    if not links:
+        return {}
+    result = {
+        "symlink_count": sum(1 for l in links if l["type"] == "symlink"),
+        "hardlink_count": sum(1 for l in links if l["type"] == "hardlink"),
+    }
+    resolved_as_file = resolved_as_dir = 0
+    extraction_errors = []
+    target_not_captured = []
+    for l in links:
+        p = root / l["name"]
+        if p.is_file():
+            resolved_as_file += 1
+        elif p.is_dir():
+            resolved_as_dir += 1
+        elif not l["extracted"]:
+            extraction_errors.append({"path": l["name"], "type": l["type"], "target": l.get("target"), "error": l["error"]})
+        else:
+            target_not_captured.append({"path": l["name"], "type": l["type"], "target": l.get("target")})
+    result["resolved_as_file"] = resolved_as_file
+    result["resolved_as_directory"] = resolved_as_dir
+    if extraction_errors:
+        result["extraction_errors"] = extraction_errors[:_LINK_SUMMARY_MAX_EXAMPLES]
+        if len(extraction_errors) > _LINK_SUMMARY_MAX_EXAMPLES:
+            result["extraction_errors_truncated"] = True
+    if target_not_captured:
+        result["target_not_captured_count"] = len(target_not_captured)
+        result["target_not_captured_examples"] = target_not_captured[:_LINK_SUMMARY_MAX_EXAMPLES]
+    return result
+
+
 _HOSTNAME_SNIFF_MAX_FILES = 30          # bounded sample - cheap even on a 90,000+-file bundle
 _HOSTNAME_SNIFF_MAX_BYTES_PER_FILE = 100_000
 _HOSTNAME_SNIFF_MAX_LINES_PER_FILE = 300
@@ -2829,7 +3045,7 @@ def check_cluster_health(root, kind, inventory):
     return result
 
 
-def run_structured_checks(root, kind, inventory):
+def run_structured_checks(root, kind, inventory, links=None):
     facts = {}
     full_dt = None
     try:
@@ -2843,6 +3059,15 @@ def run_structured_checks(root, kind, inventory):
         facts["system_info"] = check_system_info(root, kind, inventory)
     except Exception as e:
         facts["system_info_error"] = str(e)
+    try:
+        # Only ever non-empty when the archive extractor tracked link
+        # metadata (see safe_extract_tar()/safe_extract_zip()'s `links`
+        # return value) - a directory input (user already had it
+        # extracted) has no equivalent tracking, so this is correctly
+        # {} in that case too.
+        facts["link_summary"] = check_link_summary(root, links or [])
+    except Exception as e:
+        facts["link_summary_error"] = str(e)
     try:
         # Unconditional (not gated by kind, unlike cluster_health below) -
         # this is a fallback/supplementary hostname source that matters
@@ -2973,6 +3198,17 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
     lines.append(f"- **Source:** `{input_path}`")
     lines.append(f"- **Extracted root:** `{root}`")
     lines.append(f"- **Files inventoried:** {len(inventory):,}")
+    link_summary_hdr = facts.get("link_summary") or {}
+    if link_summary_hdr.get("symlink_count") or link_summary_hdr.get("hardlink_count"):
+        link_bits = []
+        if link_summary_hdr.get("symlink_count"):
+            link_bits.append(f"{link_summary_hdr['symlink_count']:,} symlink(s)")
+        if link_summary_hdr.get("hardlink_count"):
+            link_bits.append(f"{link_summary_hdr['hardlink_count']:,} hardlink(s)")
+        fail_note = ""
+        if link_summary_hdr.get("extraction_errors"):
+            fail_note = f" — ⚠️ {len(link_summary_hdr['extraction_errors'])} failed to extract, see facts.json → link_summary.extraction_errors"
+        lines.append(f"- **Symlinks/hardlinks in bundle:** {', '.join(link_bits)}{fail_note}")
     compressed_note = f", {stats['compressed_files_scanned']:,} transparently decompressed (gzip/bz2/xz)" if stats.get("compressed_files_scanned") else ""
     lines.append(f"- **Files content-scanned:** {stats['files_scanned']:,}{compressed_note} (binary/empty skipped: {stats['files_skipped_binary']:,}, read errors: {stats['read_errors']:,})")
     if stats.get("decompressed_size_capped"):
@@ -3107,6 +3343,11 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
     if facts.get("core_dumps_present"):
         any_fact = True
         lines.append("- **Core dumps / crash artifacts present:** yes — inspect `core_dumps` category")
+    link_summary = facts.get("link_summary") or {}
+    if link_summary.get("extraction_errors"):
+        any_fact = True
+        n = len(link_summary["extraction_errors"])
+        lines.append(f"- ⚠️ **{n} symlink(s)/hardlink(s) failed to extract** — their content is genuinely unavailable to this analysis (unlike every other link in this bundle, whose content was still captured correctly); see `facts.json` → `link_summary.extraction_errors` for the exact paths/reasons.")
     sar = facts.get("sar_performance", {}) or {}
     if _section_on("sar") and sar.get("summary", {}).get("cpu_pct_used_peak") is not None:
         any_fact = True
@@ -3804,6 +4045,7 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
 
     report(f"LDI Copilot analysis engine v{__version__}")
     t0 = time.time()
+    links = []
     if input_path.is_dir():
         root = resolve_root(input_path)  # auto-descend if user pointed at a wrapper folder with one subdir
     else:
@@ -3814,24 +4056,58 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
         extract_dir.mkdir(parents=True, exist_ok=True)
         report(f"Extracting {input_path.name} -> {extract_dir}")
         try:
-            skipped = safe_extract_zip(input_path, extract_dir) if kind_archive == "zip" else safe_extract_tar(input_path, extract_dir)
+            skipped, links = safe_extract_zip(input_path, extract_dir) if kind_archive == "zip" else safe_extract_tar(input_path, extract_dir)
         except Exception as e:
             raise AnalysisError(f"failed to extract archive: {e}") from e
         if skipped:
-            report(f"  ({len(skipped)} archive members skipped - symlinks/specials/errors; see extraction_skipped.json)")
+            report(f"  ({len(skipped)} archive members skipped - specials/errors; see extraction_skipped.json)")
             (output_dir / "extraction_skipped.json").write_text(json.dumps(skipped[:2000], indent=2), encoding="utf-8")
         root = resolve_root(extract_dir)
+        # Archive member names (in `links`, exactly as tarfile/zipfile
+        # gave them) are relative to the ARCHIVE'S OWN top-level entry
+        # (e.g. "sosreport-RHEL-8-.../sos_commands/..."), but `root` may
+        # have just auto-descended past that same wrapper directory
+        # (resolve_root() above) - every OTHER path in this tool
+        # (inventory.json, findings.json, ...) is relative to `root`,
+        # not to `extract_dir`. Without stripping this common prefix
+        # here, every link's `name` would silently never match any real
+        # inventory path, and build_inventory() below would never
+        # annotate a single entry despite `links` being correctly
+        # populated - exactly this mismatch was caught by testing
+        # directly against a real sosreport before release, not assumed.
+        try:
+            wrapper_prefix = root.relative_to(extract_dir).as_posix()
+        except ValueError:
+            wrapper_prefix = ""
+        if wrapper_prefix and wrapper_prefix != ".":
+            prefix = wrapper_prefix + "/"
+            for link in links:
+                if link["name"].startswith(prefix):
+                    link["name"] = link["name"][len(prefix):]
+        if links:
+            # As of v4.12.0: symlinks/hardlinks are no longer lumped into
+            # `skipped` just because Windows can't create a REAL link -
+            # tarfile's own fallback already copies the target's real
+            # content in for the overwhelming majority of them (see
+            # safe_extract_tar()'s docstring), so reporting them as
+            # "skipped" would be actively misleading. This sidecar (and
+            # the `link_summary` fact derived from it) is where their
+            # type/target metadata lives instead.
+            n_failed = sum(1 for l in links if not l["extracted"])
+            failed_note = f", {n_failed} failed to extract" if n_failed else ""
+            report(f"  ({len(links)} symlink(s)/hardlink(s) found{failed_note}; see extraction_links.json)")
+            (output_dir / "extraction_links.json").write_text(json.dumps(links[:5000], indent=2), encoding="utf-8")
 
     kind = detect_type(root)
     report(f"Detected archive type: {kind}")
     report(f"Root directory: {root}")
 
     report("Building file inventory...")
-    inventory = build_inventory(root, kind)
+    inventory = build_inventory(root, kind, links=links)
     report(f"  {len(inventory)} files found")
 
     report("Running structured fact-checks...")
-    facts = run_structured_checks(root, kind, inventory)
+    facts = run_structured_checks(root, kind, inventory, links=links)
 
     year_hint = facts.get("capture_year") or datetime.utcnow().year
     window_active = start_dt is not None or end_dt is not None
