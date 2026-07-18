@@ -72,7 +72,7 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.10.0"
+__version__ = "4.10.1"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -600,10 +600,47 @@ _TZ_ABBR_OFFSETS = {
 }
 
 _SAR_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})(?:\s*([AaPp][Mm]))?\s+(.*)$")
-_SAR_HEADER_DATE_RE = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
+# sar's "Linux <kernel> (<host>) <date> ..." header line prints its date
+# using the CAPTURING system's own locale (glibc strftime "%x") - a real
+# customer bundle (SLES15, modern sysstat) was found to use ISO
+# "YYYY-MM-DD", which the original MM/DD/YYYY-only regex below never
+# matched, silently leaving current_date unset for every block in the
+# file. Both patterns are tried (mutually exclusive by separator, so
+# trying both in sequence is unambiguous) - deliberately NOT attempting
+# to also guess a DD/MM/YYYY slash-ordering, since that's genuinely
+# ambiguous with MM/DD/YYYY from the digits alone and guessing wrong
+# would silently corrupt dates rather than just leaving them unset; see
+# _extract_date_from_sar_filename() below for the locale-independent
+# safety net that covers exactly this gap instead.
+_SAR_HEADER_DATE_RE_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+_SAR_HEADER_DATE_RE_SLASH = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
+# The standard sysstat sa1/sa2 spool-rotation naming convention
+# ("saYYYYMMDD"/"sarYYYYMMDD", e.g. the real "sar20260621"/"sa20260615"
+# seen in a real customer bundle) encodes the exact calendar day
+# unambiguously and locale-independently right in the filename - a far
+# more reliable date source than parsing locale-dependent header text,
+# and used as a fallback whenever the header line's own date can't be
+# confidently parsed (see _parse_sar_text()).
+_SAR_FILENAME_DATE_RE = re.compile(r"^sar?(\d{4})(\d{2})(\d{2})")
 _SAR_HEADER_HINTS = [
     # (header columns that must ALL appear on a header line, metric group)
-    (("%user", "%idle"), "cpu"),
+    # CPU is keyed on "%idle" ALONE (not paired with "%user"/"%usr") -
+    # deliberately, after finding a REAL bug against a real customer
+    # bundle: sysstat renamed several CPU columns between major versions
+    # (%user/%system -> %usr/%sys as of sysstat v10, used by every
+    # currently-supported RHEL/SLES release) while "%idle" itself has
+    # remained the one stable, version-independent column name across
+    # every sysstat release this project has ever seen - and it never
+    # appears in any OTHER sar table type (memory/disk/network/load/
+    # swap/paging tables have no "%idle" column), so it's still a safe,
+    # unambiguous match on its own. Requiring an exact secondary column
+    # name (like the old "%user") meant this hint silently stopped
+    # matching ANY modern sysstat CPU table - a real, previously
+    # undetected gap that made cpu_pct_used_avg/peak and iowait_pct_avg/
+    # peak silently absent from every affected bundle's SAR summary,
+    # without ever surfacing as an error (the other metric groups still
+    # parsed fine, since none of their hints had this fragility).
+    (("%idle",), "cpu"),
     (("kbmemfree",), "memory"),
     (("%memused",), "memory"),
     (("tps", "bread/s"), "disk_io"),
@@ -1400,21 +1437,70 @@ def _parse_sar_time(hh, mm, ss, ampm):
     return h, mi, s
 
 
-def _parse_sar_text(text, fallback_date):
+def _extract_sar_header_date(line):
+    """Tries ISO (YYYY-MM-DD) first, then slash MM/DD/YYYY - see the
+    module-level regex comments above for why DD/MM/YYYY is
+    deliberately not guessed at here. Returns a date or None."""
+    m = _SAR_HEADER_DATE_RE_ISO.search(line)
+    if m:
+        yyyy, mm, dd = m.groups()
+        try:
+            return datetime(int(yyyy), int(mm), int(dd)).date()
+        except ValueError:
+            pass
+    m = _SAR_HEADER_DATE_RE_SLASH.search(line)
+    if m:
+        mm, dd, yyyy = m.groups()
+        try:
+            return datetime(int(yyyy), int(mm), int(dd)).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_date_from_sar_filename(filename):
+    """Recognizes the sysstat sa1/sa2 spool-rotation naming convention
+    ("saYYYYMMDD"/"sarYYYYMMDD") - see the module-level regex comment
+    above. `filename` should already have any compression extension
+    stripped (the caller does this). Returns a date or None (e.g. for
+    the older 2-digit-day-only "saDD"/"sarDD" naming convention, which
+    doesn't encode year/month at all, or any other filename shape)."""
+    m = _SAR_FILENAME_DATE_RE.match(filename.lower())
+    if not m:
+        return None
+    yyyy, mm, dd = m.groups()
+    try:
+        return datetime(int(yyyy), int(mm), int(dd)).date()
+    except ValueError:
+        return None
+
+
+def _parse_sar_text(text, fallback_date, filename_date=None):
     """Parses one sar-plugin text capture (sysstat's own pre-rendered
     tables - CPU/memory/disk/network/load, possibly several back-to-back
     in the same file) into {metric_group: [{"ts": iso, <col>: val, ...}]}.
     Header vs. data rows are told apart generically: a header row's
     columns (after the leading timestamp) are never all-numeric ("CPU",
-    "%user", "kbmemfree", "IFACE", ...); a data row's are (aside from a
-    possible leading label like "all"/"eth0", which is excluded from the
-    all-numeric check by design). This one heuristic handles every sar
-    table shape uniformly without hardcoding per-table column layouts.
-    Unrecognized table shapes are silently skipped - a sar capture always
-    includes several table types most callers don't need, and failing to
-    parse one must never invalidate the others. "Average:" summary rows
-    are intentionally skipped (the caller computes its own averages from
-    the parsed series instead).
+    "%usr"/"%user", "kbmemfree", "IFACE", ...); a data row's are (aside
+    from a possible leading label like "all"/"eth0", which is excluded
+    from the all-numeric check by design). This one heuristic handles
+    every sar table shape uniformly without hardcoding per-table column
+    layouts. Unrecognized table shapes are silently skipped - a sar
+    capture always includes several table types most callers don't
+    need, and failing to parse one must never invalidate the others.
+    "Average:" summary rows are intentionally skipped (the caller
+    computes its own averages from the parsed series instead).
+
+    filename_date (this specific file's own date, derived from its
+    filename by the caller via _extract_date_from_sar_filename() - see
+    that function) is used whenever the "Linux ..." header line's own
+    embedded date can't be parsed (a real gap found against a real
+    customer bundle: modern sysstat's header date format is
+    locale-dependent, and this fallback is what makes that non-fatal)
+    and otherwise falls back further to the caller's generic
+    fallback_date (e.g. the bundle's overall capture date) as a last
+    resort - see check_sar_performance()'s docstring for the full
+    precedence chain and rationale.
     """
     series = defaultdict(list)
     current_date = None
@@ -1428,13 +1514,7 @@ def _parse_sar_text(text, fallback_date):
             continue
         low = stripped.lower()
         if low.startswith("linux"):
-            dm = _SAR_HEADER_DATE_RE.search(stripped)
-            if dm:
-                mm, dd, yyyy = dm.groups()
-                try:
-                    current_date = datetime(int(yyyy), int(mm), int(dd)).date()
-                except ValueError:
-                    pass
+            current_date = _extract_sar_header_date(stripped)
             header_cols = None
             block_kind = None
             continue
@@ -1457,7 +1537,7 @@ def _parse_sar_text(text, fallback_date):
         if t is None:
             continue
         h, mi, se = t
-        the_date = current_date or fallback_date
+        the_date = current_date or filename_date or fallback_date
         if the_date is None:
             continue
         ts = datetime(the_date.year, the_date.month, the_date.day, h, mi, se)
@@ -1489,33 +1569,103 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
         anything containing the literal word "sar" - so matching must be
         by directory membership (an exact path SEGMENT equal to "sar"),
         never by filename substring, or every file in that directory is
-        silently missed.
+        silently missed. Checked UNCONDITIONALLY (regardless of detected
+        `kind`), not just when kind=="supportconfig" - a real customer
+        bundle was reported where this exact directory shape existed but
+        the bundle was classified kind="unknown" (missing the usual
+        supportconfig marker files, e.g. a partial/redacted send), which
+        previously meant zero SAR candidates were ever even considered
+        for it, matching neither the sosreport nor supportconfig branch.
       - crm_report: sysstats.txt.
-    Binary candidates are filtered out via is_probably_text() before
-    attempting to parse them as text - the parser itself is also safe
-    against binary noise (no real sar table header will ever match
-    random bytes), but skipping early avoids a wasted read on what can
-    be a multi-MB raw sa file.
+      - **A bundle that IS JUST the sar/ directory itself, with nothing
+        else around it** (root's own name is "sar"/"sa") - a real,
+        reported case: a support engineer shared only the sar/ subfolder
+        on its own, not the whole bundle. None of the path-based checks
+        above can ever match this, because the relative paths in
+        `inventory` no longer contain a "sar" segment at all once it WAS
+        promoted to be the root itself. In exactly this situation, every
+        file directly under the bundle is treated as a sar candidate -
+        safe even if occasionally wrong, since the parser below already
+        silently discards anything that doesn't actually look like a sar
+        table (see _parse_sar_text()'s docstring).
+    Candidates are filtered through classify_file_readability() (not the
+    plain, non-decompression-aware is_probably_text()) before attempting
+    to parse them as text, so an individually-compressed rotated sar
+    capture is included rather than silently excluded at this filtering
+    step even though get_text() below is fully able to decompress it -
+    this filter is the earlier gatekeeper and must agree with what
+    get_text() can actually read, or compressed candidates never even
+    reach it. Skipping non-text/undecompressable candidates early still
+    avoids a wasted read on what can be a multi-MB raw binary sa file.
     Best-effort and intentionally silent when a bundle has no sar data at
     all (common - sysstat isn't always installed on the customer's box).
+
+    Per-file date resolution (see _parse_sar_text()): each candidate's
+    own filename is checked for the standard sysstat "saYYYYMMDD"/
+    "sarYYYYMMDD" spool-rotation convention FIRST (locale-independent,
+    unambiguous) - a real gap found against a real customer bundle:
+    modern sysstat's "Linux ... <date> ..." header line prints its date
+    in the CAPTURING system's own locale format (this bundle used ISO
+    YYYY-MM-DD; other systems may use MM/DD/YYYY or other orderings),
+    and relying on that alone meant every row in an otherwise perfectly
+    valid, fully-parseable sar file was silently dropped whenever that
+    locale format wasn't one of the (previously only one) recognized
+    patterns - with NO error surfaced, since "zero SAR data" and "sar
+    wasn't captured at all" look identical to a caller. The header
+    line's own embedded date is still tried FIRST inside
+    _parse_sar_text() (more precise for the rare multi-block-per-file
+    case); the filename-derived date is the fallback that makes an
+    unrecognized locale format non-fatal instead of silently zeroing
+    out that entire file's data.
     """
     if kind == "sosreport":
         candidates = find_inventory(inventory, "sos_commands/sar/", "var/log/sa/")
-    elif kind == "supportconfig":
-        candidates = [p for p in find_inventory(inventory, "sar")
-                      if "sar" in p.lower().split("/")[:-1] or "sar" in p.rsplit("/", 1)[-1].lower()]
-    else:
+    elif kind == "crm_report":
         candidates = find_inventory(inventory, "sysstats.txt")
-    candidates = [p for p in candidates if is_probably_text(root / p)]
+    else:
+        candidates = []
+
+    # supportconfig-style "sar/" directory membership - checked for every
+    # kind (see docstring above), unioned with whatever kind-specific
+    # candidates were already found.
+    sar_dir_candidates = [p for p in find_inventory(inventory, "sar")
+                           if "sar" in p.lower().split("/")[:-1] or "sar" in p.rsplit("/", 1)[-1].lower()]
+    candidates = list(dict.fromkeys(candidates + sar_dir_candidates))  # union, de-duplicated, order-preserving
+
+    # Bundle-root-IS-the-sar-directory fallback (see docstring) - only
+    # engages when nothing else matched, so it never overrides a correct,
+    # more specific detection above.
+    if not candidates and root.name.lower() in ("sar", "sa"):
+        candidates = [it["path"] for it in inventory if "/" not in it["path"]]
+
+    candidates = [p for p in candidates if classify_file_readability(root / p)[0] != "skip"]
 
     fallback_date = capture_dt.date() if capture_dt else None
     all_series = defaultdict(list)
     files_parsed = []
+    # 40MB read cap (not the 3MB most other get_text() calls in this file
+    # use for a snippet/summary read) - a real gap found against a real
+    # customer bundle: `sar -A` on a many-CPU system (64 cores here)
+    # prints its per-core CPU breakdown for EVERY interval before any
+    # other table type (memory/network/load/swap/paging) even appears,
+    # and on this real system that CPU section alone ran past 10MB for a
+    # single day - far beyond the old 3MB cap, meaning every OTHER
+    # metric group was silently never even read, let alone parsed, for
+    # any sufficiently CPU-dense system. 40MB comfortably covers even a
+    # heavily-loaded, many-core, many-device system's full day of
+    # `sar -A` text output while still being a bounded, sane ceiling
+    # (not an unbounded read) for the rare pathological case.
     for relp in candidates:
-        text = get_text(root, relp, 3_000_000)
+        text = get_text(root, relp, 40_000_000)
         if not text.strip():
             continue
-        parsed = _parse_sar_text(text, fallback_date)
+        basename = relp.rsplit("/", 1)[-1]
+        for ext in (".xz", ".gz", ".bz2"):  # strip a compression suffix so the date pattern still matches the underlying spool filename
+            if basename.lower().endswith(ext):
+                basename = basename[:-len(ext)]
+                break
+        filename_date = _extract_date_from_sar_filename(basename)
+        parsed = _parse_sar_text(text, fallback_date, filename_date=filename_date)
         if any(parsed.values()):
             files_parsed.append(relp)
             for group, rows in parsed.items():
