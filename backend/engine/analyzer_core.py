@@ -61,8 +61,10 @@ import lzma
 import multiprocessing
 import os
 import platform
+import posixpath
 import queue as queue_mod
 import re
+import stat
 import sys
 import tarfile
 import time
@@ -72,7 +74,7 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.10.1"
+__version__ = "4.11.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -614,6 +616,19 @@ _SAR_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})(?:\s*([AaPp][Mm]))?\s+(.*
 # safety net that covers exactly this gap instead.
 _SAR_HEADER_DATE_RE_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 _SAR_HEADER_DATE_RE_SLASH = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
+# A SECOND real customer bundle (stock RHEL 8, default POSIX/"C" locale -
+# almost certainly the single most common case in practice, since it's
+# what a box gets whenever nobody has explicitly configured a locale)
+# was found to print "%x" as "MM/DD/YY" - a 2-DIGIT year, e.g. "07/18/26"
+# for 2026-07-18. This is tried only after the 4-digit form above fails
+# (mutually exclusive: a 4-digit year would also satisfy \d{2} for its
+# first two digits, so the 4-digit pattern MUST be tried first or every
+# MM/DD/YYYY date would get mis-parsed as MM/DD/<first-2-digits-of-year>
+# with the trailing 2 digits ignored). The century pivot (00-68 -> 2000s,
+# 69-99 -> 1900s) is delegated to strptime's own "%y" directive rather
+# than hand-rolled, for the same POSIX-standard behavior every other tool
+# uses.
+_SAR_HEADER_DATE_RE_SLASH_2DIGIT = re.compile(r"(?<!\d)(\d{2})/(\d{2})/(\d{2})(?!\d)")
 # The standard sysstat sa1/sa2 spool-rotation naming convention
 # ("saYYYYMMDD"/"sarYYYYMMDD", e.g. the real "sar20260621"/"sa20260615"
 # seen in a real customer bundle) encodes the exact calendar day
@@ -622,6 +637,18 @@ _SAR_HEADER_DATE_RE_SLASH = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
 # and used as a fallback whenever the header line's own date can't be
 # confidently parsed (see _parse_sar_text()).
 _SAR_FILENAME_DATE_RE = re.compile(r"^sar?(\d{4})(\d{2})(\d{2})")
+# The STANDARD, out-of-the-box sysstat sa1/sa2 cron naming convention is
+# actually just "saDD"/"sarDD" - a bare 2-digit day-of-month, recycled
+# monthly (e.g. "sa01".."sa31") - confirmed against a real, freshly
+# captured RHEL 8 sosreport ("sa18"/"sar18" for the 18th). The
+# "saYYYYMMDD" form above is a less common customization; this bare-day
+# form is the one every default install actually produces, so treating
+# ONLY the long form as "the" filename fallback (as v4.10.1 did) left
+# the far more common case with no filename-derived date at all. Since a
+# bare day number carries no month/year of its own, resolving it needs
+# an external reference point - see _extract_date_from_sar_filename()'s
+# use of the bundle's overall capture date for that.
+_SAR_FILENAME_BARE_DAY_RE = re.compile(r"^sar?(\d{2})$")
 _SAR_HEADER_HINTS = [
     # (header columns that must ALL appear on a header line, metric group)
     # CPU is keyed on "%idle" ALONE (not paired with "%user"/"%usr") -
@@ -653,6 +680,22 @@ _SAR_HEADER_HINTS = [
     (("kbswpfree",), "swap"),
     (("pgpgin/s",), "paging"),
 ]
+
+# sadc/sar writes a special marker record whenever the monitored system
+# reboots mid-collection-period, rendered by `sar` as e.g.
+# "09:29:14 AM       LINUX RESTART      (64 CPU)" - confirmed against a
+# real customer sosreport. This line matches _SAR_TIME_RE (it starts
+# with a time) but its trailing columns are non-numeric, so without
+# special-casing it, _parse_sar_text() below would misidentify it as an
+# ordinary (if unrecognized) table header, clobbering block_kind to None
+# and silently discarding every subsequent data row in that same table
+# until the next real header line happens to reprint - a real risk
+# exactly in the aftermath of a reboot, precisely the kind of moment a
+# root-cause investigation cares about most. Recognized explicitly
+# instead so it's (a) never mistaken for a header/data row and (b)
+# surfaced as its own useful fact - an independent, sar-corroborated
+# reboot timestamp.
+_SAR_RESTART_RE = re.compile(r"^linux\s+restart\b", re.IGNORECASE)
 
 _AVC_FIELD_RE = re.compile(r'(\w+)=("[^"]*"|\S+)')
 
@@ -1438,9 +1481,11 @@ def _parse_sar_time(hh, mm, ss, ampm):
 
 
 def _extract_sar_header_date(line):
-    """Tries ISO (YYYY-MM-DD) first, then slash MM/DD/YYYY - see the
-    module-level regex comments above for why DD/MM/YYYY is
-    deliberately not guessed at here. Returns a date or None."""
+    """Tries ISO (YYYY-MM-DD) first, then slash MM/DD/YYYY, then slash
+    MM/DD/YY (2-digit year) - see the module-level regex comments above
+    for why DD/MM/YYYY is deliberately not guessed at here, and why the
+    4-digit-year slash form must be tried before the 2-digit one.
+    Returns a date or None."""
     m = _SAR_HEADER_DATE_RE_ISO.search(line)
     if m:
         yyyy, mm, dd = m.groups()
@@ -1455,24 +1500,80 @@ def _extract_sar_header_date(line):
             return datetime(int(yyyy), int(mm), int(dd)).date()
         except ValueError:
             pass
+    m = _SAR_HEADER_DATE_RE_SLASH_2DIGIT.search(line)
+    if m:
+        mm, dd, yy = m.groups()
+        try:
+            return datetime.strptime(f"{mm}/{dd}/{yy}", "%m/%d/%y").date()
+        except ValueError:
+            pass
     return None
 
 
-def _extract_date_from_sar_filename(filename):
-    """Recognizes the sysstat sa1/sa2 spool-rotation naming convention
-    ("saYYYYMMDD"/"sarYYYYMMDD") - see the module-level regex comment
-    above. `filename` should already have any compression extension
-    stripped (the caller does this). Returns a date or None (e.g. for
-    the older 2-digit-day-only "saDD"/"sarDD" naming convention, which
-    doesn't encode year/month at all, or any other filename shape)."""
+def _extract_date_from_sar_filename(filename, reference_date=None):
+    """Recognizes two real sysstat spool-rotation naming conventions:
+    the long "saYYYYMMDD"/"sarYYYYMMDD" form (a less common customization
+    - see the module-level regex comment above), and the bare 2-digit
+    "saDD"/"sarDD" day-of-month form that is what the STOCK, out-of-the-
+    box sa1/sa2 cron actually produces (confirmed against a real,
+    freshly captured RHEL 8 sosreport - "sa18"/"sar18" for the 18th, with
+    no month or year encoded at all). `filename` should already have any
+    compression extension stripped (the caller does this).
+
+    The bare-day form needs an external month/year reference to resolve
+    - `reference_date` (the bundle's overall capture date, passed by the
+    caller) fills that role: if the filename's day is <= the reference
+    date's own day-of-month, it's assumed to be THIS month (e.g.
+    captured on the 20th, "sa18" = 2 days ago); if it's greater, it must
+    be from the PREVIOUS month instead (e.g. captured on the 5th, "sa18"
+    can only be last month's 18th, since this month's 18th hasn't
+    happened yet) - sysstat's default monthly recycling means a bare-day
+    file is never more than about one rotation old, so a single
+    month-back step covers the realistic range without guessing
+    arbitrarily far into the past. Returns a date or None (e.g. no
+    reference_date available, or neither convention matches)."""
     m = _SAR_FILENAME_DATE_RE.match(filename.lower())
-    if not m:
-        return None
-    yyyy, mm, dd = m.groups()
-    try:
-        return datetime(int(yyyy), int(mm), int(dd)).date()
-    except ValueError:
-        return None
+    if m:
+        yyyy, mm, dd = m.groups()
+        try:
+            return datetime(int(yyyy), int(mm), int(dd)).date()
+        except ValueError:
+            return None
+    m = _SAR_FILENAME_BARE_DAY_RE.match(filename.lower())
+    if m and reference_date is not None:
+        dd = int(m.group(1))
+        year, month = reference_date.year, reference_date.month
+        if dd > reference_date.day:
+            month -= 1
+            if month == 0:
+                month, year = 12, year - 1
+        try:
+            return datetime(year, month, dd).date()
+        except ValueError:
+            return None
+    return None
+
+
+def _looks_like_sar_spool_filename(basename):
+    """True for a filename matching sysstat's own sa1/sa2 spool-rotation
+    naming convention (see _SAR_FILENAME_DATE_RE/_SAR_FILENAME_BARE_DAY_RE
+    above) - used to recognize a RAW BINARY sadc spool file specifically,
+    as opposed to any other unrelated unreadable file that happened to be
+    swept in by the generic "sar" directory-membership heuristic in
+    check_sar_performance(). This lets the resulting guidance confidently
+    name the real, well-understood cause (an un-rendered binary spool)
+    instead of a generic "this file could not be read" non-answer.
+    Confirmed against a real customer file: a genuine sysstat binary
+    sadc spool ("var/log/sa/sa18", 63KB, real header strings "Linux"/
+    kernel release/"x86_64" readable amid otherwise-binary bytes) that
+    is NOT text and cannot be decoded without the matching sar/sadf
+    binary version - see check_sar_performance()'s docstring."""
+    low = basename.lower()
+    for ext in (".xz", ".gz", ".bz2"):
+        if low.endswith(ext):
+            low = low[: -len(ext)]
+            break
+    return bool(_SAR_FILENAME_DATE_RE.match(low) or _SAR_FILENAME_BARE_DAY_RE.match(low))
 
 
 def _parse_sar_text(text, fallback_date, filename_date=None):
@@ -1501,8 +1602,19 @@ def _parse_sar_text(text, fallback_date, filename_date=None):
     fallback_date (e.g. the bundle's overall capture date) as a last
     resort - see check_sar_performance()'s docstring for the full
     precedence chain and rationale.
+
+    Returns (series, restart_events) - restart_events is a list of ISO
+    timestamp strings for every "LINUX RESTART" marker found (see
+    _SAR_RESTART_RE) - a reboot noted directly by sar/sadc itself,
+    independent of (and a useful corroboration for) any other reboot
+    evidence elsewhere in the bundle (last -F, journal, dmesg). The
+    caller de-duplicates across files/tables, since the SAME restart
+    typically gets echoed once per metric-type table within a `sar -A`
+    capture (CPU, memory, disk, ... each replaying the same underlying
+    binary records).
     """
     series = defaultdict(list)
+    restart_events = []
     current_date = None
     header_cols = None
     block_kind = None
@@ -1524,6 +1636,20 @@ def _parse_sar_text(text, fallback_date, filename_date=None):
         if not m:
             continue
         hh, mm_, ss, ampm, rest = m.groups()
+        if _SAR_RESTART_RE.match(rest.strip()):
+            # Deliberately does NOT reset header_cols/block_kind (unlike
+            # every other line shape below) - see _SAR_RESTART_RE's own
+            # comment: whatever table was already in progress before the
+            # reboot stays in progress after it, so data rows resuming
+            # right after this marker (before any real header happens to
+            # reprint) are still correctly attributed instead of being
+            # silently dropped.
+            t = _parse_sar_time(hh, mm_, ss, ampm)
+            the_date = current_date or filename_date or fallback_date
+            if t is not None and the_date is not None:
+                h, mi, se = t
+                restart_events.append(datetime(the_date.year, the_date.month, the_date.day, h, mi, se).isoformat())
+            continue
         cols = rest.split()
         if not cols:
             continue
@@ -1551,7 +1677,7 @@ def _parse_sar_text(text, fallback_date, filename_date=None):
             except ValueError:
                 row[colname] = val
         series[block_kind].append({"ts": ts.isoformat(), **row})
-    return series
+    return series, restart_events
 
 
 def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
@@ -1601,22 +1727,61 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
     all (common - sysstat isn't always installed on the customer's box).
 
     Per-file date resolution (see _parse_sar_text()): each candidate's
-    own filename is checked for the standard sysstat "saYYYYMMDD"/
-    "sarYYYYMMDD" spool-rotation convention FIRST (locale-independent,
-    unambiguous) - a real gap found against a real customer bundle:
-    modern sysstat's "Linux ... <date> ..." header line prints its date
-    in the CAPTURING system's own locale format (this bundle used ISO
-    YYYY-MM-DD; other systems may use MM/DD/YYYY or other orderings),
-    and relying on that alone meant every row in an otherwise perfectly
-    valid, fully-parseable sar file was silently dropped whenever that
-    locale format wasn't one of the (previously only one) recognized
-    patterns - with NO error surfaced, since "zero SAR data" and "sar
-    wasn't captured at all" look identical to a caller. The header
-    line's own embedded date is still tried FIRST inside
-    _parse_sar_text() (more precise for the rare multi-block-per-file
-    case); the filename-derived date is the fallback that makes an
-    unrecognized locale format non-fatal instead of silently zeroing
-    out that entire file's data.
+    own filename is checked for either the long "saYYYYMMDD"/
+    "sarYYYYMMDD" spool-rotation convention, or the bare 2-digit
+    "saDD"/"sarDD" day-of-month convention that stock/default sysstat
+    cron jobs actually produce (both real, confirmed against real
+    customer bundles - see _extract_date_from_sar_filename()), tried
+    FIRST as a locale-independent, largely unambiguous source. This
+    matters because modern sysstat's "Linux ... <date> ..." header line
+    prints its date in the CAPTURING system's own locale format - real
+    customer bundles have been found using ISO YYYY-MM-DD, MM/DD/YYYY,
+    and MM/DD/YY (2-digit year - the POSIX/"C"-locale default, arguably
+    the single most common real-world case), and relying on the header
+    date alone meant every row in an otherwise perfectly valid, fully
+    parseable sar file was silently dropped whenever that locale format
+    wasn't one of the recognized patterns - with NO error surfaced,
+    since "zero SAR data" and "sar wasn't captured at all" look
+    identical to a caller. The header line's own embedded date is still
+    tried FIRST inside _parse_sar_text() (more precise for the rare
+    multi-block-per-file case); the filename-derived date is the
+    fallback that makes an unrecognized locale format non-fatal instead
+    of silently zeroing out that entire file's data.
+
+    A mid-collection reboot leaves a "LINUX RESTART" marker line in the
+    sar data (see _SAR_RESTART_RE) - handled explicitly so it can't
+    silently truncate the rest of that table's data, and surfaced back
+    as its own "restart_events" fact (a reboot timestamp corroborated
+    directly by sar/sadc, independent of last -F/journal/dmesg evidence
+    elsewhere in the bundle). A sysstat spool file captured moments
+    after a fresh reboot can hold nothing BUT this marker (confirmed
+    against a real RHEL 8 sosreport) - "no_samples_reason" distinguishes
+    that specific, genuinely-informative case from an ordinary "no sar
+    data in this bundle at all".
+
+    A raw BINARY sadc spool file (var/log/sa/saDD - sysstat's own live,
+    continuously-updated data store, as opposed to the once-per-day
+    TEXT/XML renders sa2's cron job produces from it) is deliberately
+    NEVER hand-decoded here, even though it's easy to positively
+    recognize by filename convention plus binary content (confirmed
+    against a real 63KB customer file - readable "Linux"/kernel-release/
+    "x86_64" header strings sit amid otherwise-opaque binary bytes).
+    sysstat's on-disk binary record layout is version-specific and only
+    reliably read by a MATCHING major version of sar/sadf - guessing at
+    it would risk silently producing WRONG performance numbers, which is
+    worse for a root-cause investigation than reporting no data at all.
+    Real-world implication worth calling out explicitly rather than
+    leaving unexplained: sadc keeps collecting real interval samples
+    into this binary spool continuously all day, while the human-
+    readable text/XML render is typically only (re)generated once,
+    overnight - so a bundle captured mid-day, especially soon after a
+    reboot, can have a FULLY POPULATED binary spool sitting right next
+    to an all-but-empty text/XML rendering of the very same day (exactly
+    the real scenario this was found against). Surfaced as
+    "binary_only_spool_files" with actionable guidance (ask for
+    `sar -A -f <file>` or `sadf -x -- -A -f <file>` run ON the original
+    system) specifically when no other usable sar evidence exists, so
+    this doesn't look identical to "sysstat wasn't installed at all".
     """
     if kind == "sosreport":
         candidates = find_inventory(inventory, "sos_commands/sar/", "var/log/sa/")
@@ -1638,10 +1803,23 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
     if not candidates and root.name.lower() in ("sar", "sa"):
         candidates = [it["path"] for it in inventory if "/" not in it["path"]]
 
-    candidates = [p for p in candidates if classify_file_readability(root / p)[0] != "skip"]
+    readable_candidates = [p for p in candidates if classify_file_readability(root / p)[0] != "skip"]
+    # Every candidate that got filtered OUT above (binary/unreadable) AND
+    # matches sysstat's own spool-file naming convention is confidently a
+    # raw sadc binary spool, not just some other unrelated unreadable
+    # file that happened to live in a "sar"-named directory - see
+    # _looks_like_sar_spool_filename()'s docstring and this function's
+    # own docstring above for why that distinction (and NOT attempting
+    # to decode it) matters.
+    binary_spool_candidates = sorted({
+        p for p in candidates
+        if p not in readable_candidates and _looks_like_sar_spool_filename(p.rsplit("/", 1)[-1])
+    })
+    candidates = readable_candidates
 
     fallback_date = capture_dt.date() if capture_dt else None
     all_series = defaultdict(list)
+    all_restart_events = set()
     files_parsed = []
     # 40MB read cap (not the 3MB most other get_text() calls in this file
     # use for a snippet/summary read) - a real gap found against a real
@@ -1664,18 +1842,53 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
             if basename.lower().endswith(ext):
                 basename = basename[:-len(ext)]
                 break
-        filename_date = _extract_date_from_sar_filename(basename)
-        parsed = _parse_sar_text(text, fallback_date, filename_date=filename_date)
+        filename_date = _extract_date_from_sar_filename(basename, reference_date=fallback_date)
+        parsed, restart_events = _parse_sar_text(text, fallback_date, filename_date=filename_date)
+        all_restart_events.update(restart_events)
         if any(parsed.values()):
             files_parsed.append(relp)
             for group, rows in parsed.items():
                 all_series[group].extend(rows)
+        elif restart_events and relp not in files_parsed:
+            # This file had NO usable metric-group data (e.g. a fresh
+            # sysstat spool file captured moments after a reboot, before
+            # any real interval has elapsed - confirmed against a real
+            # RHEL 8 sosreport where "sar18" held nothing but the restart
+            # marker itself) but DID positively confirm it was found and
+            # read - counted as "parsed" so the caller can tell this
+            # genuinely-empty-of-samples case apart from "no sar data in
+            # this bundle at all" (see the restart_events-based summary
+            # note below).
+            files_parsed.append(relp)
 
     if not files_parsed:
+        if binary_spool_candidates:
+            # Nothing usable was found in TEXT/XML form, but real binary
+            # sadc spool data exists (see docstring above) - worth a
+            # distinct, actionable result instead of the bare {} used
+            # when there's genuinely no sar evidence of any kind.
+            return {
+                "files_parsed": [],
+                "metric_groups_found": [],
+                "sample_points": {},
+                "summary": {},
+                "series": {},
+                "vm_timezone": vm_tz,
+                "restart_events": [],
+                "binary_only_spool_files": binary_spool_candidates,
+                "no_samples_reason": (
+                    f"{len(binary_spool_candidates)} raw sysstat binary spool file(s) found "
+                    f"({', '.join(binary_spool_candidates[:3])}{', ...' if len(binary_spool_candidates) > 3 else ''}) "
+                    f"that hold real performance data sadc already collected, but can't be safely decoded without "
+                    f"the matching `sar`/`sadf` version from the original system - ask for the output of "
+                    f"`sar -A -f <file>` or `sadf -x -- -A -f <file>` run there for the actual numbers."
+                ),
+            }
         return {}
 
     for group in all_series:
         all_series[group].sort(key=lambda r: r["ts"])
+    restart_events_sorted = sorted(all_restart_events)
 
     summary = {}
     cpu_rows = all_series.get("cpu", [])
@@ -1729,6 +1942,31 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
             summary["busiest_iface"] = busiest_iface
             summary["busiest_iface_rxkbps_avg"] = round(sum(vals) / len(vals), 2)
 
+    no_samples_reason = None
+    if restart_events_sorted and not all_series:
+        # Set only when sar data was genuinely found and read but held NO
+        # usable samples at all (see the elif branch above) - lets the
+        # digest tell "sysstat was just barely restarted, nothing to show
+        # yet" apart from "no sar data in this bundle" without treating
+        # both as the identical empty-looking result they'd otherwise be.
+        no_samples_reason = (
+            f"sar data was found and read, but held no interval samples - only a system restart marker "
+            f"at {restart_events_sorted[0]}. The box likely rebooted shortly before this bundle was captured."
+        )
+        if binary_spool_candidates:
+            # Real scenario this was found against: the once-a-day text/
+            # XML render only ever captured the reboot marker, but
+            # sadc's own binary spool (see docstring above) kept
+            # collecting real interval samples all day regardless - worth
+            # saying explicitly rather than leaving the impression that
+            # NO performance data exists for this system at all.
+            no_samples_reason += (
+                f" However, {len(binary_spool_candidates)} raw sysstat binary spool file(s) "
+                f"({', '.join(binary_spool_candidates[:3])}{', ...' if len(binary_spool_candidates) > 3 else ''}) "
+                f"show real samples WERE being collected - ask for `sar -A -f <file>` or "
+                f"`sadf -x -- -A -f <file>` run on the original system to see them."
+            )
+
     return {
         "files_parsed": files_parsed,
         "metric_groups_found": sorted(all_series.keys()),
@@ -1736,6 +1974,13 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
         "summary": summary,
         "series": {g: rows[:2000] for g, rows in all_series.items()},
         "vm_timezone": vm_tz,
+        "restart_events": restart_events_sorted,
+        # Present whenever a binary spool sibling exists alongside
+        # whatever text/XML data WAS usable (see docstring above) - even
+        # a fully-populated result can still be missing coverage for a
+        # later, not-yet-rendered part of the same day.
+        "binary_only_spool_files": binary_spool_candidates,
+        "no_samples_reason": no_samples_reason,
     }
 
 
@@ -2200,6 +2445,48 @@ def check_system_info(root, kind, inventory):
                 sec = [s for s in extract_supportconfig_section(t, *subs) if s.strip() and not s.startswith("#")]
                 if sec:
                     info[name] = " ".join(sec).strip()[:300]
+        # basic-environment.txt does NOT always carry a dedicated
+        # "/bin/hostname" section - confirmed against a real, freshly
+        # captured SLES15 supportconfig bundle where that section is
+        # simply absent (only /bin/date, /bin/uname -a, and
+        # /etc/os-release appear there). Without a fallback, info["hostname"]
+        # silently stays unset, which is a real, live redaction gap: this
+        # analysis never learns the box's real hostname, so
+        # collect_known_hostnames() (backend/ai/redaction.py) has nothing
+        # to redact - even though the SAME hostname routinely appears
+        # verbatim in messages.txt/boot.txt/shell_history.txt/etc. and
+        # gets quoted straight into the AI prompt. systemd.txt's
+        # "hostnamectl status" output ("Static hostname: <name>") is a
+        # second, independent place supportconfig always captures the
+        # short hostname, and is tried whenever the primary source found
+        # nothing.
+        if not info.get("hostname"):
+            for relp in find_inventory(inventory, "systemd.txt", "systemd-status.txt"):
+                t = get_text(root, relp, 300000)
+                sec = extract_supportconfig_section(t, "hostnamectl")
+                sec_text = "\n".join(sec)
+                m = re.search(r"Static hostname:\s*(\S+)", sec_text)
+                if m:
+                    info["hostname"] = m.group(1).strip()[:300]
+                    break
+        # supportconfig's own summary.xml carries the FULL FQDN
+        # (<hostname>...</hostname>) in a dedicated, structured field -
+        # confirmed against the same real bundle to hold the complete
+        # "shorthost.<random-cloud-subdomain>.<domain>" form. This is
+        # captured as a DISTINCT fact (not merged into "hostname" above)
+        # because collect_known_hostnames() needs both the short label
+        # and the full FQDN as separate known strings: redacting only the
+        # short label would still leave the (potentially just as
+        # identifying) random cloud-subdomain suffix exposed verbatim in
+        # any report that happens to quote the full FQDN.
+        for relp in find_inventory(inventory, "summary.xml"):
+            t = get_text(root, relp, 50000)
+            m = re.search(r"<hostname>([^<]+)</hostname>", t)
+            if m:
+                fqdn = m.group(1).strip()
+                if fqdn and fqdn.lower() != "localhost":
+                    info["hostname_fqdn"] = fqdn[:300]
+                break
     return info
 
 
@@ -2846,7 +3133,7 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
     lines.append("")
 
     sar = facts.get("sar_performance", {}) or {}
-    if _section_on("sar") and (sar.get("summary") or sar.get("metric_groups_found")):
+    if _section_on("sar") and (sar.get("summary") or sar.get("metric_groups_found") or sar.get("restart_events") or sar.get("no_samples_reason") or sar.get("binary_only_spool_files")):
         lines.append("## 📊 Performance (SAR)")
         vm_tz = sar.get("vm_timezone")
         if vm_tz:
@@ -2854,6 +3141,8 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
         else:
             lines.append("_The analyzed host's timezone could not be determined from this bundle - timestamps below are shown exactly as `sar` printed them (VM-local wall clock, zone unknown). Confirm the VM's zone with the customer before correlating against externally-reported incident times._")
         lines.append("")
+        if sar.get("no_samples_reason"):
+            lines.append(f"- ℹ️ **{sar['no_samples_reason']}**")
         s = sar["summary"]
         if s.get("cpu_pct_used_avg") is not None:
             lines.append(f"- **CPU used:** avg {s['cpu_pct_used_avg']}%, peak {s['cpu_pct_used_peak']}% (at `{s.get('cpu_pct_used_peak_ts','?')}`)")
@@ -2867,8 +3156,19 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
             lines.append(f"- **Disk transactions/sec:** avg {s['disk_tps_avg']}, peak {s['disk_tps_peak']}")
         if s.get("busiest_iface"):
             lines.append(f"- **Busiest network interface:** {s['busiest_iface']} (avg {s['busiest_iface_rxkbps_avg']} kB/s received)")
-        lines.append(f"- **Data points parsed:** {sum(sar.get('sample_points', {}).values())} across {len(sar.get('files_parsed', []))} file(s); metric groups found: {', '.join(sar.get('metric_groups_found', [])) or 'none'}")
-        lines.append("- _Full time series available in `facts.json` → `sar_performance.series` for graphing (CPU/memory/disk/network/load, each timestamped in VM-local time)._")
+        if sar.get("restart_events"):
+            lines.append(f"- 🔄 **System restart(s) noted directly by sar/sadc:** {', '.join(sar['restart_events'])} — an independent corroboration of reboot timing alongside any `last -F`/journal/dmesg evidence elsewhere in this report.")
+        if sar.get("metric_groups_found"):
+            lines.append(f"- **Data points parsed:** {sum(sar.get('sample_points', {}).values())} across {len(sar.get('files_parsed', []))} file(s); metric groups found: {', '.join(sar.get('metric_groups_found', [])) or 'none'}")
+            lines.append("- _Full time series available in `facts.json` → `sar_performance.series` for graphing (CPU/memory/disk/network/load, each timestamped in VM-local time)._")
+        if sar.get("binary_only_spool_files") and not sar.get("no_samples_reason"):
+            # Only shown standalone when NOT already folded into
+            # no_samples_reason above (that already covers this same
+            # information with more context in the fully-empty case) -
+            # this is the "some text data parsed fine, but a binary
+            # sibling covering a different time range is still
+            # un-rendered" case.
+            lines.append(f"- ℹ️ **{len(sar['binary_only_spool_files'])} additional raw sysstat binary spool file(s) found** that couldn't be decoded directly (`{', '.join(sar['binary_only_spool_files'][:3])}`{', ...' if len(sar['binary_only_spool_files']) > 3 else ''}) - ask for `sar -A -f <file>` output from the original system if this analysis needs a time range not already covered above.")
         lines.append("")
 
     crash = facts.get("crash_analysis", {}) or {}

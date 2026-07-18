@@ -301,6 +301,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 
 .alert { padding: 12px 14px; border-radius: 6px; margin-top: 12px; font-size: 13px; white-space: pre-line; }
 .alert-error { background: rgba(255, 84, 112, 0.1); border: 1px solid rgba(255, 84, 112, 0.35); color: #ffb3c0; }
+.alert-info { background: rgba(111, 207, 151, 0.1); border: 1px solid rgba(111, 207, 151, 0.35); color: var(--info); }
 
 .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 18px; }
 .summary-card {
@@ -496,6 +497,24 @@ select option:disabled { color: #4a5163; font-style: italic; }
 /* Performance (SAR) sub-tab: dependency-free canvas charts, one card per
    metric group, consistent with the project's zero-external-dependency
    philosophy (own markdown renderer, own everything). */
+.chart-range-toolbar {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 10px 0 16px;
+}
+.chart-range-toolbar .field-row { margin: 0; min-width: 190px; }
+.chart-range-toolbar label { font-size: 11px; color: var(--text-muted); display: block; margin-bottom: 3px; }
+.chart-range-toolbar input[type="datetime-local"] {
+  width: 100%; background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: 5px; color: var(--text); padding: 6px 8px; font-size: 12.5px;
+}
+#perfRangeNote { margin-left: auto; }
 .chart-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
@@ -507,11 +526,19 @@ select option:disabled { color: #4a5163; font-style: italic; }
   border-radius: 8px;
   padding: 14px 16px;
 }
+.chart-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .chart-card h4 { margin: 0 0 4px; font-size: 13.5px; }
 .chart-card .chart-stats { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
+.btn-expand-chart {
+  background: transparent; border: 1px solid var(--border); color: var(--text-muted);
+  border-radius: 5px; padding: 2px 7px; font-size: 13px; cursor: pointer; line-height: 1.4;
+  flex-shrink: 0;
+}
+.btn-expand-chart:hover { color: var(--accent); border-color: var(--accent-dim); }
 .chart-canvas-wrap { position: relative; }
 .chart-card canvas { width: 100%; height: 160px; display: block; cursor: crosshair; }
-.chart-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 11.5px; color: var(--text-muted); }
+.chart-canvas-wrap-lg canvas { width: 100%; height: 440px; display: block; cursor: crosshair; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 11.5px; color: var(--text-muted); max-height: 90px; overflow-y: auto; }
 .chart-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
 .chart-tooltip {
   position: absolute;
@@ -530,6 +557,11 @@ select option:disabled { color: #4a5163; font-style: italic; }
 }
 .chart-tooltip .tt-time { color: var(--text-muted); font-family: Consolas, monospace; margin-bottom: 2px; }
 .chart-tooltip .tt-row .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+
+/* Click-to-expand chart detail modal */
+.modal-card-chart { width: min(92vw, 980px); max-width: 92vw; }
+.modal-chart-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.modal-chart-head h3 { margin: 0; font-size: 15px; }
 
 /* Interactive AI follow-up chat, below the generated report */
 .chat-section {

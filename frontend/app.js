@@ -18,6 +18,8 @@ const state = {
   terminalProgressCount: 0, // number of progress lines already mirrored into the activity terminal for the current job
   ollamaLogCount: 0,        // same idea, for Ollama's own subprocess log lines
   ollamaPollTimer: null,
+  sarData: null,   // raw /api/jobs/:id/sar_series payload for the currently loaded job - kept client-side so the time-range picker can re-render charts instantly without re-fetching
+  sarRange: { from: null, to: null }, // epoch-ms bounds (null = unbounded) currently applied to the Performance charts
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1329,6 +1331,18 @@ function seriesPoints(rows, valueKey, filter) {
     .filter((p) => Number.isFinite(p.t));
 }
 
+// Same as seriesPoints(), plus an optional client-side [fromMs, toMs]
+// time-range clip (either bound may be null/undefined for "unbounded") -
+// this is what lets the Performance tab's date/time range picker
+// re-render already-fetched chart data instantly on every change,
+// without a round-trip back to the server (the full series for the
+// whole bundle was already downloaded once by loadSarSeries()).
+function seriesPointsRanged(rows, valueKey, fromMs, toMs, filter) {
+  return seriesPoints(rows, valueKey, filter).filter(
+    (p) => (fromMs == null || p.t >= fromMs) && (toMs == null || p.t <= toMs)
+  );
+}
+
 // Full HH:MM:SS (vs. the axis labels' HH:MM) for the hover tooltip's time
 // line - same "treat as UTC" convention as drawLineChart's fmtT, so it
 // matches the VM-local wall clock printed by `sar` on the analyzed host.
@@ -1343,24 +1357,23 @@ function formatChartValue(v) {
   return Number.isFinite(v) ? String(Math.round(v * 100) / 100) : String(v);
 }
 
-function buildChartCard(title, statsText, namedSeries) {
-  const card = document.createElement("div");
-  card.className = "chart-card";
-  const legend = namedSeries
+function buildLegendHtml(namedSeries) {
+  return namedSeries
     .map((s, i) => `<span><span class="swatch" style="background:${s.color || CHART_COLORS[i % CHART_COLORS.length]}"></span>${escapeHtml(s.label)}</span>`)
     .join("");
-  card.innerHTML = `<h4>${escapeHtml(title)}</h4><div class="chart-stats">${escapeHtml(statsText)}</div><div class="chart-canvas-wrap"><canvas></canvas><div class="chart-tooltip hidden"></div></div><div class="chart-legend">${legend}</div>`;
-  const canvas = card.querySelector("canvas");
-  const tooltip = card.querySelector(".chart-tooltip");
-  // Read back by activateTab()'s redraw-on-activate fix, since the very
-  // first draw below can happen while the Performance tab (and therefore
-  // this canvas's real width) is still hidden - see drawLineChart's comment.
-  canvas._namedSeries = namedSeries;
-  requestAnimationFrame(() => drawLineChart(canvas, namedSeries));
+}
 
+// Wires the shared hover-crosshair/tooltip behavior onto any chart
+// canvas (a per-card canvas, or the single reusable modal canvas) - the
+// series to draw is resolved lazily via getNamedSeries() rather than a
+// fixed value, since the SAME modal canvas gets reused across many
+// different charts over its lifetime (see openChartModal()). Returns
+// hideHover so a caller can also invoke it directly (e.g. when closing
+// the modal, to leave its canvas in a clean redrawn state next time).
+function attachChartHover(canvas, tooltip, getNamedSeries) {
   const hideHover = () => {
     tooltip.classList.add("hidden");
-    drawLineChart(canvas, namedSeries);
+    drawLineChart(canvas, getNamedSeries());
   };
   canvas.addEventListener("mousemove", (ev) => {
     const layout = canvas._chartLayout;
@@ -1373,7 +1386,7 @@ function buildChartCard(title, statsText, namedSeries) {
       return;
     }
     const hoverT = layout.xMin + ((mx - layout.padL) / layout.plotW) * (layout.xMax - layout.xMin);
-    const info = drawLineChart(canvas, namedSeries, hoverT);
+    const info = drawLineChart(canvas, getNamedSeries(), hoverT);
     if (!info || !info.items.length) {
       tooltip.classList.add("hidden");
       return;
@@ -1396,7 +1409,390 @@ function buildChartCard(title, statsText, namedSeries) {
     tooltip.style.top = `${Math.max(0, top)}px`;
   });
   canvas.addEventListener("mouseleave", hideHover);
+  return hideHover;
+}
+
+// Opens the click-to-expand detail view (v4.11.0) for any chart card -
+// same series, drawn much larger with the identical hover/tooltip
+// behavior, for a closer look than a ~160px-tall grid card allows.
+function openChartModal(title, statsText, namedSeries) {
+  const overlay = $("chartModalOverlay");
+  $("chartModalTitle").textContent = title;
+  $("chartModalStats").textContent = statsText;
+  $("chartModalLegend").innerHTML = buildLegendHtml(namedSeries);
+  const canvas = $("chartModalCanvas");
+  canvas._namedSeries = namedSeries;
+  overlay.classList.remove("hidden");
+  requestAnimationFrame(() => drawLineChart(canvas, namedSeries));
+}
+
+// One-time wiring for the single reusable chart-detail modal - hover
+// behavior, close affordances (✕ button, click outside, Escape key),
+// and a resize redraw since the modal's canvas width depends on
+// viewport size like any other chart canvas.
+function initChartModal() {
+  const overlay = $("chartModalOverlay");
+  const canvas = $("chartModalCanvas");
+  const tooltip = $("chartModalTooltip");
+  attachChartHover(canvas, tooltip, () => canvas._namedSeries || []);
+  const close = () => {
+    overlay.classList.add("hidden");
+    canvas._namedSeries = null;
+  };
+  $("chartModalClose").addEventListener("click", close);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !overlay.classList.contains("hidden")) close();
+  });
+  window.addEventListener("resize", () => {
+    if (!overlay.classList.contains("hidden") && canvas._namedSeries) drawLineChart(canvas, canvas._namedSeries);
+  });
+}
+
+function buildChartCard(title, statsText, namedSeries) {
+  const card = document.createElement("div");
+  card.className = "chart-card";
+  const legend = buildLegendHtml(namedSeries);
+  card.innerHTML =
+    `<div class="chart-card-head"><h4>${escapeHtml(title)}</h4><button type="button" class="btn-expand-chart" title="Expand for a larger, more detailed view">⛶ Expand</button></div>` +
+    `<div class="chart-stats">${escapeHtml(statsText)}</div><div class="chart-canvas-wrap"><canvas></canvas><div class="chart-tooltip hidden"></div></div><div class="chart-legend">${legend}</div>`;
+  const canvas = card.querySelector("canvas");
+  const tooltip = card.querySelector(".chart-tooltip");
+  // Read back by activateTab()'s redraw-on-activate fix, since the very
+  // first draw below can happen while the Performance tab (and therefore
+  // this canvas's real width) is still hidden - see drawLineChart's comment.
+  canvas._namedSeries = namedSeries;
+  requestAnimationFrame(() => drawLineChart(canvas, namedSeries));
+  attachChartHover(canvas, tooltip, () => namedSeries);
+  card.querySelector(".btn-expand-chart").addEventListener("click", () => openChartModal(title, statsText, namedSeries));
   return card;
+}
+
+// --------------------------------------------------------------------------
+// Performance (SAR) charts: per-metric-group card builders. Deliberately
+// organized by table type (matching how `sar`'s own manpage documents
+// each one) rather than one fully generic "chart every numeric column"
+// pass - a real `sar -A` capture has ~40 distinct column names across
+// CPU/memory/disk/network/load/swap/paging, and a naive dump of all of
+// them would produce dozens of near-duplicate single-line charts with
+// no organizing structure. Each builder takes the raw rows for its
+// metric group plus the currently-applied [fromMs, toMs] range (either
+// may be null for "unbounded") and returns an array of
+// {title, stats, named} card specs - named being the namedSeries array
+// buildChartCard()/openChartModal() already expect.
+// --------------------------------------------------------------------------
+
+function buildCpuCardSpecs(rows, fromMs, toMs) {
+  const specs = [];
+  const overall = rows.filter((r) => r.CPU === "all" || r.CPU === undefined);
+
+  const used = overall.filter((r) => typeof r["%idle"] === "number").map((r) => ({ ts: r.ts, used: 100 - r["%idle"] }));
+  const usedPts = seriesPointsRanged(used, "used", fromMs, toMs);
+  if (usedPts.length) {
+    specs.push({ title: "📊 CPU used - overall (%)", stats: `${usedPts.length} samples`, named: [{ label: "% used", points: usedPts, color: CHART_COLORS[0] }] });
+  }
+
+  // %usr/%sys/%iowait/%steal/%nice - sysstat's own CPU-time breakdown;
+  // whichever of these columns this capture actually has (varies by
+  // sysstat version/switches) is charted, others are simply absent.
+  const breakdownCols = [["%usr", "user"], ["%sys", "system"], ["%iowait", "iowait"], ["%steal", "steal"], ["%nice", "nice"]];
+  const breakdownNamed = breakdownCols
+    .map(([col, label], i) => ({ label: `${label} (${col})`, points: seriesPointsRanged(overall, col, fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] }))
+    .filter((s) => s.points.length);
+  if (breakdownNamed.length) {
+    specs.push({ title: "📊 CPU breakdown (%)", stats: `${overall.length} samples · ${breakdownNamed.length} component(s)`, named: breakdownNamed });
+  }
+
+  // Per-core rows only exist when the capture used `-P ALL` - one line
+  // per logical CPU (up to however many the box has, e.g. 64 on a real
+  // customer system) for the deepest possible view of core imbalance.
+  const perCore = rows.filter((r) => r.CPU !== undefined && r.CPU !== "all");
+  if (perCore.length) {
+    const cores = Array.from(new Set(perCore.map((r) => r.CPU))).sort((a, b) => (Number(a) - Number(b)) || String(a).localeCompare(String(b)));
+    const named = cores
+      .map((core, i) => {
+        const coreRows = perCore
+          .filter((r) => r.CPU === core)
+          .map((r) => ({ ts: r.ts, used: typeof r["%idle"] === "number" ? 100 - r["%idle"] : undefined }));
+        return { label: `CPU${core}`, points: seriesPointsRanged(coreRows, "used", fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] };
+      })
+      .filter((s) => s.points.length);
+    if (named.length) {
+      specs.push({ title: `📊 CPU used by core (%)`, stats: `${named.length} core(s) - per-core (-P ALL) breakdown`, named });
+    }
+  }
+  return specs;
+}
+
+function buildMemoryCardSpecs(rows, fromMs, toMs) {
+  const specs = [];
+  const pctPts = seriesPointsRanged(rows, "%memused", fromMs, toMs);
+  if (pctPts.length) {
+    specs.push({ title: "🧠 Memory used (%)", stats: `${pctPts.length} samples`, named: [{ label: "%memused", points: pctPts, color: CHART_COLORS[2] }] });
+  }
+
+  // kbmemused/kbcached/kbbuffers/kbcommit are printed in KB by sar;
+  // divided by 1024 here so the chart reads in the friendlier MB unit
+  // at real-world multi-GB scale.
+  const mbCols = [["kbmemused", "used"], ["kbcached", "cached"], ["kbbuffers", "buffers"], ["kbcommit", "committed"]];
+  const mbRows = rows.map((r) => {
+    const out = { ts: r.ts };
+    for (const [col] of mbCols) if (typeof r[col] === "number") out[col] = r[col] / 1024;
+    return out;
+  });
+  const mbNamed = mbCols
+    .map(([col, label], i) => ({ label: `${label} (MB)`, points: seriesPointsRanged(mbRows, col, fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] }))
+    .filter((s) => s.points.length);
+  if (mbNamed.length) {
+    specs.push({ title: "🧠 Memory used / cached / buffers (MB)", stats: `${rows.length} samples`, named: mbNamed });
+  }
+
+  const commitPts = seriesPointsRanged(rows, "%commit", fromMs, toMs);
+  if (commitPts.length) {
+    specs.push({ title: "🧠 Memory commit (%)", stats: `${commitPts.length} samples`, named: [{ label: "%commit", points: commitPts, color: CHART_COLORS[4] }] });
+  }
+  return specs;
+}
+
+// sysstat has renamed disk throughput columns across major versions
+// (bread/s+bwrtn/s -> rd_sec/s+wr_sec/s -> rkB/s+wkB/s) - see
+// _SAR_HEADER_HINTS in analyzer_core.py for the same version-drift
+// story on the analysis side. Tried in the order most-modern-first;
+// whichever pair this capture actually has is what gets charted.
+const _DISK_THROUGHPUT_COL_PAIRS = [["rkB/s", "wkB/s"], ["bread/s", "bwrtn/s"], ["rd_sec/s", "wr_sec/s"]];
+
+function buildDiskCardSpecs(rows, fromMs, toMs) {
+  const specs = [];
+  const hasDev = rows.some((r) => r.DEV !== undefined);
+  const throughputPair = _DISK_THROUGHPUT_COL_PAIRS.find(([r]) => rows.some((row) => typeof row[r] === "number"));
+
+  if (hasDev) {
+    const byDev = {};
+    rows.forEach((r) => {
+      if (r.DEV) (byDev[r.DEV] = byDev[r.DEV] || []).push(r);
+    });
+    // Generous cap - a real box rarely has more than a dozen block
+    // devices worth separately charting; guards against a pathological
+    // capture with hundreds of LVM/multipath sub-devices.
+    const devs = Object.keys(byDev).slice(0, 12);
+    const tpsNamed = devs
+      .map((d, i) => ({ label: d, points: seriesPointsRanged(byDev[d], "tps", fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] }))
+      .filter((s) => s.points.length);
+    if (tpsNamed.length) {
+      specs.push({ title: "💽 Disk transactions/sec (by device)", stats: `${devs.length} device(s)`, named: tpsNamed });
+    }
+    if (throughputPair) {
+      const [readCol, writeCol] = throughputPair;
+      const named = devs
+        .flatMap((d, i) => [
+          { label: `${d} read`, points: seriesPointsRanged(byDev[d], readCol, fromMs, toMs), color: CHART_COLORS[(i * 2) % CHART_COLORS.length] },
+          { label: `${d} write`, points: seriesPointsRanged(byDev[d], writeCol, fromMs, toMs), color: CHART_COLORS[(i * 2 + 1) % CHART_COLORS.length] },
+        ])
+        .filter((s) => s.points.length);
+      if (named.length) {
+        specs.push({ title: `💽 Disk throughput (${readCol} / ${writeCol}, by device)`, stats: `${devs.length} device(s)`, named });
+      }
+    }
+  } else {
+    const tpsPts = seriesPointsRanged(rows, "tps", fromMs, toMs);
+    if (tpsPts.length) {
+      specs.push({ title: "💽 Disk transactions/sec", stats: `${tpsPts.length} samples`, named: [{ label: "tps", points: tpsPts, color: CHART_COLORS[1] }] });
+    }
+    if (throughputPair) {
+      const [readCol, writeCol] = throughputPair;
+      const named = [
+        { label: readCol, points: seriesPointsRanged(rows, readCol, fromMs, toMs), color: CHART_COLORS[0] },
+        { label: writeCol, points: seriesPointsRanged(rows, writeCol, fromMs, toMs), color: CHART_COLORS[3] },
+      ].filter((s) => s.points.length);
+      if (named.length) {
+        specs.push({ title: `💽 Disk throughput (${readCol} / ${writeCol})`, stats: `${rows.length} samples`, named });
+      }
+    }
+  }
+  return specs;
+}
+
+function buildNetworkCardSpecs(rows, fromMs, toMs) {
+  const specs = [];
+  const byIface = {};
+  rows.forEach((r) => {
+    if (r.IFACE) (byIface[r.IFACE] = byIface[r.IFACE] || []).push(r);
+  });
+  const ifaces = Object.keys(byIface).slice(0, 10);
+  const mk = (col, labelSuffix) =>
+    ifaces
+      .map((iface, i) => ({ label: `${iface} ${labelSuffix}`, points: seriesPointsRanged(byIface[iface], col, fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] }))
+      .filter((s) => s.points.length);
+
+  const rx = mk("rxkB/s", "rx");
+  if (rx.length) specs.push({ title: "🌐 Network received (kB/s)", stats: `${ifaces.length} interface(s)`, named: rx });
+  const tx = mk("txkB/s", "tx");
+  if (tx.length) specs.push({ title: "🌐 Network transmitted (kB/s)", stats: `${ifaces.length} interface(s)`, named: tx });
+  const pktNamed = [...mk("rxpck/s", "rx pkt/s"), ...mk("txpck/s", "tx pkt/s")];
+  if (pktNamed.length) specs.push({ title: "🌐 Network packets/sec", stats: `${ifaces.length} interface(s)`, named: pktNamed });
+  return specs;
+}
+
+function buildLoadCardSpecs(rows, fromMs, toMs) {
+  const specs = [];
+  const avgCols = [["ldavg-1", "1 min"], ["ldavg-5", "5 min"], ["ldavg-15", "15 min"]];
+  const avgNamed = avgCols
+    .map(([col, label], i) => ({ label, points: seriesPointsRanged(rows, col, fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] }))
+    .filter((s) => s.points.length);
+  if (avgNamed.length) specs.push({ title: "⚖️ Load average", stats: `${rows.length} samples`, named: avgNamed });
+
+  const qCols = [["runq-sz", "run queue size"], ["plist-sz", "process count"]];
+  const qNamed = qCols
+    .map(([col, label], i) => ({ label, points: seriesPointsRanged(rows, col, fromMs, toMs), color: CHART_COLORS[(i + 3) % CHART_COLORS.length] }))
+    .filter((s) => s.points.length);
+  if (qNamed.length) specs.push({ title: "⚖️ Run queue / process count", stats: `${rows.length} samples`, named: qNamed });
+  return specs;
+}
+
+function buildSwapCardSpecs(rows, fromMs, toMs) {
+  const specs = [];
+  const pctPts = seriesPointsRanged(rows, "%swpused", fromMs, toMs);
+  if (pctPts.length) specs.push({ title: "💤 Swap used (%)", stats: `${pctPts.length} samples`, named: [{ label: "%swpused", points: pctPts, color: CHART_COLORS[5] }] });
+
+  const mbCols = [["kbswpfree", "free"], ["kbswpused", "used"]];
+  const mbRows = rows.map((r) => {
+    const out = { ts: r.ts };
+    for (const [col] of mbCols) if (typeof r[col] === "number") out[col] = r[col] / 1024;
+    return out;
+  });
+  const mbNamed = mbCols
+    .map(([col, label], i) => ({ label: `${label} (MB)`, points: seriesPointsRanged(mbRows, col, fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] }))
+    .filter((s) => s.points.length);
+  if (mbNamed.length) specs.push({ title: "💤 Swap free / used (MB)", stats: `${rows.length} samples`, named: mbNamed });
+  return specs;
+}
+
+function buildPagingCardSpecs(rows, fromMs, toMs) {
+  const specs = [];
+  const cols = [["pgpgin/s", "page in"], ["pgpgout/s", "page out"], ["fault/s", "fault"], ["majflt/s", "major fault"]];
+  const named = cols
+    .map(([col, label], i) => ({ label, points: seriesPointsRanged(rows, col, fromMs, toMs), color: CHART_COLORS[i % CHART_COLORS.length] }))
+    .filter((s) => s.points.length);
+  if (named.length) specs.push({ title: "📄 Paging activity (per sec)", stats: `${rows.length} samples`, named });
+  return specs;
+}
+
+// Order here drives the on-screen card order too - CPU/memory/disk first
+// (the three an RCA investigation reaches for most), then network/load/
+// swap/paging.
+const SAR_GROUP_BUILDERS = [
+  ["cpu", buildCpuCardSpecs],
+  ["memory", buildMemoryCardSpecs],
+  ["disk_io", buildDiskCardSpecs],
+  ["network", buildNetworkCardSpecs],
+  ["load", buildLoadCardSpecs],
+  ["swap", buildSwapCardSpecs],
+  ["paging", buildPagingCardSpecs],
+];
+
+// Scans every metric group's full (unfiltered) series for its overall
+// min/max timestamp - used to pre-fill the range pickers with the
+// bundle's actual captured span, and to restore that span on "Full
+// range".
+function computeSarTimeBounds(sar) {
+  let min = Infinity, max = -Infinity;
+  const series = sar.series || {};
+  Object.values(series).forEach((rows) => {
+    rows.forEach((r) => {
+      const t = Date.parse(r.ts && r.ts.endsWith("Z") ? r.ts : `${r.ts}Z`);
+      if (Number.isFinite(t)) {
+        if (t < min) min = t;
+        if (t > max) max = t;
+      }
+    });
+  });
+  return Number.isFinite(min) && Number.isFinite(max) ? { min, max } : null;
+}
+
+// datetime-local inputs have no timezone of their own - formatting with
+// UTC getters (not local getters) keeps this consistent with the
+// project-wide convention (see seriesPoints() above) of treating every
+// VM-local wall-clock timestamp AS IF it were UTC purely for a stable,
+// timezone-independent numeric axis.
+function epochToLocalInputValue(t) {
+  const d = new Date(t);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+// Inverse of epochToLocalInputValue() - parses a datetime-local input's
+// value by hand (rather than `new Date(value)`, which would apply the
+// BROWSER's own local timezone to a string with no offset) so a typed/
+// picked range boundary lines up exactly with the same "treat as UTC"
+// axis every chart point already uses.
+function inputValueToEpoch(v) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(v || "");
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s] = m;
+  return Date.UTC(+y, +mo - 1, +d, +h, +mi, +(s || 0));
+}
+
+// Pure render pass over the already-fetched state.sarData, filtered to
+// state.sarRange - called on initial load AND every time the range
+// picker changes, with no server round-trip (the full series was
+// already downloaded once).
+function renderPerfCharts() {
+  const sar = state.sarData;
+  if (!sar) return;
+  const grid = $("chartGrid");
+  grid.innerHTML = "";
+  const series = sar.series || {};
+  const { from, to } = state.sarRange || {};
+  let cardCount = 0;
+  for (const [group, builder] of SAR_GROUP_BUILDERS) {
+    const rows = series[group];
+    if (!rows || !rows.length) continue;
+    for (const spec of builder(rows, from, to)) {
+      grid.appendChild(buildChartCard(spec.title, spec.stats, spec.named));
+      cardCount += 1;
+    }
+  }
+  const note = $("perfRangeNote");
+  if (!cardCount) {
+    note.textContent = "No chart-able samples in the selected range — try \"Full range\".";
+  } else if (from != null || to != null) {
+    note.textContent = `Showing ${cardCount} chart(s) filtered to the selected range.`;
+  } else {
+    note.textContent = `Showing ${cardCount} chart(s) across the full captured range.`;
+  }
+}
+
+// One-time wiring for the range-picker toolbar (Apply/Full/Zoom-to-peak)
+// - called once from the DOMContentLoaded handler, not per job load;
+// state.sarData/state.sarRange carry the per-job data these handlers
+// act on.
+function initPerfToolbar() {
+  $("btnPerfRangeApply").addEventListener("click", () => {
+    state.sarRange = { from: inputValueToEpoch($("perfRangeFrom").value), to: inputValueToEpoch($("perfRangeTo").value) };
+    renderPerfCharts();
+  });
+  $("btnPerfRangeFull").addEventListener("click", () => {
+    state.sarRange = { from: null, to: null };
+    const bounds = state.sarData && computeSarTimeBounds(state.sarData);
+    if (bounds) {
+      $("perfRangeFrom").value = epochToLocalInputValue(bounds.min);
+      $("perfRangeTo").value = epochToLocalInputValue(bounds.max);
+    }
+    renderPerfCharts();
+  });
+  $("btnPerfRangePeak").addEventListener("click", (ev) => {
+    const peakTs = ev.currentTarget.dataset.peakTs;
+    if (!peakTs) return;
+    const t = Date.parse(peakTs.endsWith("Z") ? peakTs : `${peakTs}Z`);
+    if (!Number.isFinite(t)) return;
+    const pad = 30 * 60 * 1000; // ±30 minutes around the peak CPU sample
+    state.sarRange = { from: t - pad, to: t + pad };
+    $("perfRangeFrom").value = epochToLocalInputValue(t - pad);
+    $("perfRangeTo").value = epochToLocalInputValue(t + pad);
+    renderPerfCharts();
+  });
 }
 
 async function loadSarSeries(jobId) {
@@ -1406,14 +1802,32 @@ async function loadSarSeries(jobId) {
   } catch {
     sar = {};
   }
+  state.sarData = sar;
+  state.sarRange = { from: null, to: null };
+
   const groups = sar.metric_groups_found || [];
   if (!groups.length) {
-    $("perfPlaceholder").classList.remove("hidden");
+    // no_samples_reason (v4.11.0) distinguishes "sar data was found and
+    // read, but held nothing but a system-restart marker" (a real case -
+    // a sysstat spool file captured moments after a fresh reboot) from
+    // plain "no sar data in this bundle at all" - worth telling apart
+    // rather than showing the same generic message either way.
+    const ph = $("perfPlaceholder");
+    if (sar.no_samples_reason) {
+      ph.textContent = `ℹ️ ${sar.no_samples_reason}`;
+    } else if (sar.restart_events && sar.restart_events.length) {
+      ph.textContent = `No SAR performance charts to show, but sar/sadc directly recorded a system restart at ${sar.restart_events.join(", ")}.`;
+    } else {
+      ph.textContent = "No SAR performance data was found in this bundle (sysstat/sar wasn't captured, or this bundle predates the incident window). Everything else in this analysis is unaffected.";
+    }
+    ph.classList.remove("hidden");
     $("perfContent").classList.add("hidden");
+    $("chartRangeToolbar").classList.add("hidden");
     return;
   }
   $("perfPlaceholder").classList.add("hidden");
   $("perfContent").classList.remove("hidden");
+  $("chartRangeToolbar").classList.remove("hidden");
 
   const tz = sar.vm_timezone;
   $("perfTzNote").textContent = tz
@@ -1428,51 +1842,37 @@ async function loadSarSeries(jobId) {
   if (s.busiest_iface) bits.push(`Busiest NIC: ${s.busiest_iface} (${s.busiest_iface_rxkbps_avg} kB/s avg rx)`);
   $("perfSummaryNote").textContent = bits.join("  ·  ");
 
-  const grid = $("chartGrid");
-  grid.innerHTML = "";
-  const series = sar.series || {};
+  // Un-rendered binary sadc spool siblings (v4.11.0) - real performance
+  // data sadc already collected but couldn't be safely decoded (see
+  // check_sar_performance()'s docstring in analyzer_core.py). Shown as
+  // a standalone callout here (rather than folded into perfSummaryNote)
+  // since it's actionable guidance, not just another stat.
+  const spoolNote = $("perfBinarySpoolNote");
+  if (sar.binary_only_spool_files && sar.binary_only_spool_files.length) {
+    const files = sar.binary_only_spool_files;
+    spoolNote.textContent = `ℹ️ ${files.length} additional raw sysstat binary spool file(s) found that couldn't be decoded directly (${files.slice(0, 3).join(", ")}${files.length > 3 ? ", ..." : ""}) - these hold real interval data sadc already collected. Ask for sar -A -f <file> or sadf -x -- -A -f <file> output from the original system to see it.`;
+    spoolNote.classList.remove("hidden");
+  } else {
+    spoolNote.classList.add("hidden");
+  }
 
-  if (series.cpu) {
-    const rows = series.cpu.filter((r) => (r.CPU === "all" || r.CPU === undefined));
-    const used = rows.filter((r) => typeof r["%idle"] === "number").map((r) => ({ ts: r.ts, used: 100 - r["%idle"] }));
-    grid.appendChild(buildChartCard("📊 CPU used (%)", `${used.length} samples`, [
-      { label: "% used", points: seriesPoints(used, "used"), color: CHART_COLORS[0] },
-    ]));
-    const iowait = seriesPoints(rows, "%iowait");
-    if (iowait.length) {
-      grid.appendChild(buildChartCard("⏳ I/O wait (%)", `${iowait.length} samples`, [
-        { label: "%iowait", points: iowait, color: CHART_COLORS[3] },
-      ]));
-    }
+  // Pre-fill the range pickers with the bundle's actual captured span,
+  // so the user sees exactly what's available before narrowing it.
+  const bounds = computeSarTimeBounds(sar);
+  if (bounds) {
+    $("perfRangeFrom").value = epochToLocalInputValue(bounds.min);
+    $("perfRangeTo").value = epochToLocalInputValue(bounds.max);
+  } else {
+    $("perfRangeFrom").value = "";
+    $("perfRangeTo").value = "";
   }
-  if (series.memory) {
-    grid.appendChild(buildChartCard("🧠 Memory used (%)", `${series.memory.length} samples`, [
-      { label: "%memused", points: seriesPoints(series.memory, "%memused"), color: CHART_COLORS[2] },
-    ]));
-  }
-  if (series.disk_io) {
-    grid.appendChild(buildChartCard("💽 Disk transactions/sec", `${series.disk_io.length} samples`, [
-      { label: "tps", points: seriesPoints(series.disk_io, "tps"), color: CHART_COLORS[1] },
-    ]));
-  }
-  if (series.load) {
-    grid.appendChild(buildChartCard("⚖️ Load average (1 min)", `${series.load.length} samples`, [
-      { label: "ldavg-1", points: seriesPoints(series.load, "ldavg-1"), color: CHART_COLORS[4] },
-    ]));
-  }
-  if (series.network) {
-    const byIface = {};
-    series.network.forEach((r) => {
-      if (typeof r["rxkB/s"] !== "number" || !r.IFACE) return;
-      (byIface[r.IFACE] = byIface[r.IFACE] || []).push(r);
-    });
-    const namedSeries = Object.keys(byIface)
-      .slice(0, 6)
-      .map((iface, i) => ({ label: iface, points: seriesPoints(byIface[iface], "rxkB/s"), color: CHART_COLORS[i % CHART_COLORS.length] }));
-    if (namedSeries.length) {
-      grid.appendChild(buildChartCard("🌐 Network received (kB/s)", `${Object.keys(byIface).length} interface(s)`, namedSeries));
-    }
-  }
+
+  const peakBtn = $("btnPerfRangePeak");
+  const peakTs = s.cpu_pct_used_peak_ts;
+  peakBtn.classList.toggle("hidden", !peakTs);
+  peakBtn.dataset.peakTs = peakTs || "";
+
+  renderPerfCharts();
 }
 
 // --------------------------------------------------------------------------
@@ -2081,6 +2481,8 @@ document.addEventListener("DOMContentLoaded", () => {
   initAiProviders();
   initWhoami();
   initSystemInfo();
+  initPerfToolbar();
+  initChartModal();
   loadRecentJobs();
   updatePlaceholders();
 

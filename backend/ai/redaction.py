@@ -85,6 +85,11 @@ def collect_known_hostnames(facts):
     about out of the job's facts, so redact_text() can replace exact
     occurrences of them. Sourced from:
     - facts.system_info.hostname (sosreport/supportconfig - single host)
+    - facts.system_info.hostname_fqdn (v4.11.0 - supportconfig's
+      summary.xml <hostname> tag, the FULL FQDN including the
+      customer's/cloud provider's own subdomain - see below for why this
+      is tracked SEPARATELY from the short "hostname" field rather than
+      just replacing it)
     - facts.cluster_health.nodes_detected (crm_report - list of nodes)
     - facts.detected_hostnames_from_logs (v4.9.2 - engine-side
       sniff_syslog_hostnames(): a generic, content-based fallback that
@@ -114,6 +119,9 @@ def collect_known_hostnames(facts):
         first_token = hostname.split()[0] if hostname.split() else None
         if first_token:
             names.add(first_token)
+    fqdn = system_info.get("hostname_fqdn")
+    if fqdn:
+        names.add(fqdn.strip())
     cluster_health = (facts or {}).get("cluster_health") or {}
     for node in cluster_health.get("nodes_detected") or []:
         if node:
@@ -121,7 +129,19 @@ def collect_known_hostnames(facts):
     for node in (facts or {}).get("detected_hostnames_from_logs") or []:
         if node:
             names.add(node)
-    return sorted(n for n in names if len(n) >= 2)  # skip anything too short to safely match
+    # Longest-first (ties broken alphabetically only for determinism) -
+    # NOT plain alphabetical, which was a real bug: a short hostname like
+    # "SLES15SP6" sorts alphabetically BEFORE its own longer FQDN form
+    # "SLES15SP6.<random-subdomain>.contoso.com" (a strict prefix always
+    # sorts first). redact_text() below applies these substitutions in
+    # order, so the short form would be replaced with HOST-1 first,
+    # leaving "HOST-1.<random-subdomain>.contoso.com" behind - the FQDN
+    # pattern then finds nothing left to match (its own text no longer
+    # exists verbatim), silently leaving the customer's real, unique
+    # cloud-subdomain suffix exposed. Sorting longest-first guarantees
+    # the full FQDN is matched and replaced as one token BEFORE its own
+    # short-hostname substring is ever considered.
+    return sorted((n for n in names if len(n) >= 2), key=lambda n: (-len(n), n))
 
 
 def redact_text(text, hostnames=None):

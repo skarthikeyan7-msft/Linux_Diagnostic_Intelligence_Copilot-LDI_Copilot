@@ -268,6 +268,21 @@
           <div id="perfContent" class="hidden">
             <p class="muted small" id="perfTzNote"></p>
             <p class="muted small" id="perfSummaryNote"></p>
+            <p class="alert alert-info hidden" id="perfBinarySpoolNote"></p>
+            <div class="chart-range-toolbar" id="chartRangeToolbar">
+              <div class="field-row">
+                <label for="perfRangeFrom">From</label>
+                <input type="datetime-local" id="perfRangeFrom" step="1">
+              </div>
+              <div class="field-row">
+                <label for="perfRangeTo">To</label>
+                <input type="datetime-local" id="perfRangeTo" step="1">
+              </div>
+              <button id="btnPerfRangeApply" class="btn btn-primary btn-sm">Apply range</button>
+              <button id="btnPerfRangeFull" class="btn btn-ghost btn-sm">Full range</button>
+              <button id="btnPerfRangePeak" class="btn btn-ghost btn-sm hidden" title="Zoom to ±30 minutes around the peak CPU sample">🎯 Zoom to CPU peak</button>
+              <span class="muted small" id="perfRangeNote"></span>
+            </div>
             <div class="chart-grid" id="chartGrid"></div>
           </div>
         </div>
@@ -333,6 +348,22 @@
         <button id="confirmModalCancel" class="btn btn-ghost">Cancel</button>
         <button id="confirmModalConfirm" class="btn btn-primary">Confirm</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Click-to-expand detail view for any Performance (SAR) chart card -->
+  <div id="chartModalOverlay" class="modal-overlay hidden">
+    <div class="modal-card modal-card-chart">
+      <div class="modal-chart-head">
+        <h3 id="chartModalTitle"></h3>
+        <button id="chartModalClose" class="btn btn-ghost btn-sm">✕</button>
+      </div>
+      <p class="muted small" id="chartModalStats"></p>
+      <div class="chart-canvas-wrap chart-canvas-wrap-lg">
+        <canvas id="chartModalCanvas"></canvas>
+        <div class="chart-tooltip hidden" id="chartModalTooltip"></div>
+      </div>
+      <div class="chart-legend" id="chartModalLegend"></div>
     </div>
   </div>
 </div>
