@@ -75,7 +75,7 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.14.1"
+__version__ = "4.14.2"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -234,6 +234,20 @@ SOS_CATEGORY_RULES = [
     ("sos_commands/docker", "virtualization"),
     ("sos_commands/podman", "virtualization"),
     ("sos_commands/kubernetes", "virtualization"),
+    # Most-specific first: a real chronological cluster LOG file (matched
+    # here regardless of which directory it lives under) must win over
+    # the broader "var/log/pacemaker"/"var/log/cluster" directory rules
+    # below, or it silently lands in "cluster_ha" - a category NOT in
+    # LOG_LIKE_CATEGORIES, so a --start/--end/--around time window would
+    # never apply to it at all despite it being exactly the kind of
+    # chronological evidence a time window is meant to scope. This is a
+    # real gap found investigating a live customer bug report: a
+    # sosreport's own var/log/pacemaker/pacemaker.log is a genuine
+    # rotating log (identical in nature to sos_commands/logs/journalctl),
+    # not a point-in-time snapshot.
+    ("pacemaker.log", "cluster_ha_logs"),
+    ("corosync.log", "cluster_ha_logs"),
+    ("ha-log", "cluster_ha_logs"),
     ("sos_commands/pacemaker", "cluster_ha"),
     ("sos_commands/corosync", "cluster_ha"),
     ("sos_commands/cluster", "cluster_ha"),
@@ -362,6 +376,59 @@ CRM_REPORT_CATEGORY_RULES = [
     ("sysinfo.txt", "system_info"),
     ("rpm", "packages_updates"),
     ("packages", "packages_updates"),
+]
+
+# Fallback rule set for any bundle detect_type() could NOT confidently
+# classify as sosreport/supportconfig/crm_report (kind="unknown" - e.g. a
+# raw copy of /var/log, or an archive with an unrecognized layout). Before
+# this existed, categorize() fell back to an EMPTY rule list for
+# kind="unknown" (see CATEGORY_RULES_BY_KIND.get(kind, ...) below), which
+# meant literally every file - including genuinely chronological logs
+# like var/log/messages or var/log/pacemaker/pacemaker.log - landed in the
+# catch-all "other" category. Since "other" is not in LOG_LIKE_CATEGORIES,
+# scan_file() unconditionally treated every file as a point-in-time
+# snapshot exempt from time-window gating, silently disabling the
+# --start/--end/--around time-window feature (and its "Center on a
+# specific time ± window" UI option) for this entire class of input - a
+# real gap found investigating a live customer bug report where an
+# analysis scoped to a ±120 minute window still surfaced pacemaker.log
+# evidence from months earlier. Deliberately mirrors the well-established
+# sosreport path conventions below (the most common real-world shape a
+# raw /var/log copy or unrecognized archive will actually have), ordered
+# most-specific-first exactly like CRM_REPORT_CATEGORY_RULES.
+GENERIC_CATEGORY_RULES = [
+    ("pacemaker.log", "cluster_ha_logs"),
+    ("corosync.log", "cluster_ha_logs"),
+    ("ha-log", "cluster_ha_logs"),
+    ("var/log/pacemaker", "cluster_ha"),
+    ("var/log/cluster", "cluster_ha"),
+    ("cib.xml", "cluster_ha"),
+    ("crm_mon", "cluster_ha"),
+    ("corosync.conf", "cluster_ha"),
+    ("var/log/journal", "logs_journal"),
+    ("journalctl", "logs_journal"),
+    ("var/log/messages", "logs_messages"),
+    ("var/log/syslog", "logs_messages"),
+    ("var/log/boot.log", "logs_messages"),
+    ("var/log/kern.log", "kernel_boot"),
+    ("var/log/dmesg", "kernel_boot"),
+    ("dmesg", "kernel_boot"),
+    ("var/log/audit", "logs_audit"),
+    ("var/log/secure", "logs_audit"),
+    ("var/log/auth.log", "logs_audit"),
+    ("var/log/maillog", "mail"),
+    ("var/log/mail.log", "mail"),
+    ("var/log/cron", "cron"),
+    ("var/spool/cron", "cron"),
+    ("var/crash", "core_dumps"),
+    ("vmcore", "core_dumps"),
+    ("etc/passwd", "users_auth"),
+    ("etc/group", "users_auth"),
+    ("etc/shadow", "users_auth"),
+    ("etc/fstab", "storage_filesystem"),
+    ("etc/hosts", "dns"),
+    ("etc/resolv.conf", "dns"),
+    ("etc/", "config_etc"),
 ]
 
 CATEGORY_RULES_BY_KIND = {
@@ -1053,7 +1120,11 @@ def detect_crm_report_nodes(inventory):
 
 
 def categorize(relpath_lower: str, kind: str) -> str:
-    rules = CATEGORY_RULES_BY_KIND.get(kind, [])
+    # kind="unknown" (or any future kind not yet in CATEGORY_RULES_BY_KIND)
+    # falls back to GENERIC_CATEGORY_RULES rather than an empty list - see
+    # that list's own docstring comment for the real time-window-gating
+    # bug this closes.
+    rules = CATEGORY_RULES_BY_KIND.get(kind, GENERIC_CATEGORY_RULES)
     for needle, cat in rules:
         if needle in relpath_lower:
             return cat
@@ -3311,7 +3382,7 @@ def check_package_drift(root, kind, inventory, capture_dt=None):
     return result
 
 
-def check_systemd_cascade(root, kind, inventory):
+def check_systemd_cascade(root, kind, inventory, window_start=None, window_end=None):
     """Best-effort service-failure *cascade* reconstruction: instead of
     just listing every currently-failed unit independently (already done
     by check_failed_services), looks for boot/journal-log evidence of one
@@ -3321,7 +3392,18 @@ def check_systemd_cascade(root, kind, inventory):
     multi-unit failures are a strong signal of a shared root cause (e.g.
     a mount or network-online target failing takes a whole dependent
     chain down with it) rather than N independent problems.
-    """
+
+    window_start/window_end (v4.14.2) - the same --start/--end/--around
+    time-window values run_analysis() already threads through scan_file()
+    for ordinary findings. Before this existed, this function read its
+    source files directly via get_text() and extracted EVERY dated event
+    in them unconditionally - a real gap found investigating a live
+    customer bug report, where a scan explicitly scoped to a narrow
+    ±120-minute window still returned cascade events months outside it.
+    A window is intentionally NOT required for events with no parseable
+    timestamp: those never join a cascade cluster anyway (see the
+    "untimed" bucket below), so gating them out here would only lose
+    information without changing correctness."""
     result = {}
     if kind == "sosreport":
         sources = find_inventory(inventory, "var/log/messages", "sos_commands/logs/journalctl", "var/log/syslog")
@@ -3341,6 +3423,8 @@ def check_systemd_cascade(root, kind, inventory):
             if "dependency failed for" not in low and "triggering onfailure" not in low and not _UNIT_FAILED_RESULT_RE.search(line):
                 continue
             ts = parse_timestamp(line, year_hint)
+            if ts and ((window_start and ts < window_start) or (window_end and ts > window_end)):
+                continue  # positively outside the requested analysis window
             m1 = _DEP_FAILED_RE.search(line)
             if m1:
                 events.append({"ts": ts, "subject": m1.group(1).strip(), "kind": "dependency_failed"})
@@ -3356,6 +3440,7 @@ def check_systemd_cascade(root, kind, inventory):
     if not events:
         return result
     result["cascade_events_found"] = len(events)
+
 
     timed = sorted([e for e in events if e["ts"]], key=lambda e: e["ts"])
     clusters, current = [], []
@@ -3635,6 +3720,10 @@ _HOSTNAME_SNIFF_MIN_OCCURRENCES = 3     # a real host's identifier repeats on ne
 # to start from - a one-off coincidental token match doesn't repeat this way.
 _HOSTNAME_SNIFF_MAX_CANDIDATES = 10
 _HOSTNAME_SNIFF_EXCLUDE = {"localhost", "localhost.localdomain"}
+# Sampling-priority hints (see sniff_syslog_hostnames()'s _priority()) so the
+# bounded _HOSTNAME_SNIFF_MAX_FILES budget is spent on the files most likely
+# to carry an HA-cluster hostname FIRST, ahead of unrelated large logs.
+_HOSTNAME_SNIFF_CLUSTER_HINTS = ("pacemaker", "corosync", "cluster", "ha-log", "sbd", "cib")
 
 # Classic rsyslog "traditional" line format (the near-universal default) is
 # "<Mon> <DD> <HH:MM:SS> <hostname> <program>[<pid>]: <message>" - or the
@@ -3681,7 +3770,14 @@ def _find_hostname_siblings(confirmed_hostnames, sampled_text):
         prefix, _digits = m.group(1), m.group(2)
         if not prefix:
             continue
-        sibling_re = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(prefix) + r"(\d+)(?![A-Za-z0-9_-])")
+        # Alphanumeric-only boundary (v4.14.2) - see redact_text()'s own
+        # boundary comment in backend/ai/redaction.py for the full
+        # rationale (a real leak found via a live customer bundle: an
+        # underscore/hyphen-delimited context, e.g. supportconfig's own
+        # "scc_<hostname>_<timestamp>" capture-directory convention or an
+        # Azure disk resource literally named "<hostname>-datadisk-002",
+        # was never recognized as containing the hostname at all).
+        sibling_re = re.compile(r"(?<![A-Za-z0-9])" + re.escape(prefix) + r"(\d+)(?![A-Za-z0-9])")
         for sm in sibling_re.finditer(sampled_text):
             candidate = prefix + sm.group(1)
             if candidate != host:
@@ -3741,11 +3837,24 @@ def sniff_syslog_hostnames(root, inventory):
     files_sampled = 0
 
     def _priority(item):
-        # Prefer paths that look log-ish, then larger files first (more
+        # Prefer HA-cluster-relevant paths FIRST, regardless of size -
+        # a real gap found investigating a live customer bug report: a
+        # raw /var/log tree commonly holds several large, unrelated logs
+        # (a big audit.log, a huge journal export, per-application logs,
+        # ...) that could otherwise fully consume the bounded
+        # _HOSTNAME_SNIFF_MAX_FILES sample before ever reaching the
+        # smaller/rotated pacemaker.log or corosync.log - exactly the
+        # files most likely to carry the identifier that most needs
+        # redacting in an HA-cluster investigation. Within each tier,
+        # still prefer log-ish paths, then larger files first (more
         # lines sampled per file = higher chance of hitting the pattern
         # at all, and a substantial ongoing log is more likely to be
         # genuinely representative than a tiny one-off snapshot file).
-        return (0 if "log" in item["path"].lower() else 1, -item["size"])
+        path_lower = item["path"].lower()
+        is_cluster_relevant = any(hint in path_lower for hint in _HOSTNAME_SNIFF_CLUSTER_HINTS)
+        is_log_like = "log" in path_lower
+        tier = 0 if is_cluster_relevant else (1 if is_log_like else 2)
+        return (tier, -item["size"])
 
     for item in sorted(inventory, key=_priority):
         if files_sampled >= _HOSTNAME_SNIFF_MAX_FILES:
@@ -3965,7 +4074,7 @@ def check_cluster_health(root, kind, inventory):
     return result
 
 
-def run_structured_checks(root, kind, inventory, links=None):
+def run_structured_checks(root, kind, inventory, links=None, start_dt=None, end_dt=None):
     facts = {}
     full_dt = None
     try:
@@ -4057,7 +4166,7 @@ def run_structured_checks(root, kind, inventory, links=None):
     except Exception as e:
         facts["package_drift_error"] = str(e)
     try:
-        facts["systemd_cascade"] = check_systemd_cascade(root, kind, inventory)
+        facts["systemd_cascade"] = check_systemd_cascade(root, kind, inventory, window_start=start_dt, window_end=end_dt)
     except Exception as e:
         facts["systemd_cascade_error"] = str(e)
     try:
@@ -5080,7 +5189,7 @@ def run_analysis(input_path, output_dir=None, min_severity="WARNING", top_per_ca
     report(f"  {len(inventory)} files found")
 
     report("Running structured fact-checks...")
-    facts = run_structured_checks(root, kind, inventory, links=links)
+    facts = run_structured_checks(root, kind, inventory, links=links, start_dt=start_dt, end_dt=end_dt)
 
     year_hint = facts.get("capture_year") or datetime.utcnow().year
     window_active = start_dt is not None or end_dt is not None

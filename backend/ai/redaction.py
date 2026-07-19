@@ -167,17 +167,43 @@ def redact_text(text, hostnames=None):
 
     # Hostnames first (longer, more specific strings) so a hostname
     # that happens to contain digits isn't partially eaten by a later
-    # pass. Boundary excludes only [A-Za-z0-9_-] (NOT "."), so a known
-    # short hostname is still matched when it appears as the leading
-    # label of a longer FQDN (e.g. known host "ue2op1dbsp01" is matched
-    # inside "ue2op1dbsp01.corp.contoso.com", not just as a standalone
-    # token) - a real gap fixed in v4.9.1: the previous boundary treated
-    # "." as "still part of the same identifier", which silently
-    # skipped every FQDN-qualified occurrence of an otherwise-known
-    # hostname.
+    # pass. Boundary excludes only [A-Za-z0-9] (NOT "." / "_" / "-"), so
+    # a known short hostname is still matched:
+    #   - as the leading label of a longer FQDN (e.g. known host
+    #     "ue2op1dbsp01" is matched inside "ue2op1dbsp01.corp.contoso.com",
+    #     not just as a standalone token) - fixed in v4.9.1: the boundary
+    #     used to treat "." as "still part of the same identifier", which
+    #     silently skipped every FQDN-qualified occurrence.
+    #   - when delimited by "_" or "-" rather than whitespace/punctuation -
+    #     a real, LIVE leak found investigating a real customer bundle
+    #     (v4.14.2): SUSE's own supportconfig convention names the entire
+    #     capture directory "scc_<hostname>_<capture-timestamp>" (e.g.
+    #     "scc_ue2op1dbsp01_<timestamp>"), and that directory name is
+    #     itself echoed verbatim into the digest (title, source-path
+    #     citations, and any evidence line quoting a command's own
+    #     logged invocation path, e.g. hwinfo's "--log=/var/log/scc_
+    #     <hostname>_<timestamp>/hwinfo.log"). The OLD boundary excluded
+    #     "_"/"-" from "outside the identifier", so it refused to match
+    #     "ue2op1dbsp01" with an underscore immediately before AND after
+    #     it - the exact shape of that directory name - leaving the real
+    #     hostname sitting unredacted in a report that had otherwise
+    #     correctly identified and redacted every other occurrence of it.
+    #     The same shape recurs in cloud metadata (an Azure disk resource
+    #     literally named "<hostname>-datadisk-002-...") and shell/env
+    #     dumps ("LOG=/var/log/scc_<hostname>_<timestamp>"). Restricting
+    #     the boundary to alphanumerics only still fully preserves the
+    #     ORIGINAL purpose of having a boundary at all: it still refuses
+    #     to match a short hostname as a bare substring of a longer,
+    #     unrelated alphanumeric token (e.g. host "op1" still won't match
+    #     inside "loop123", and host "ue2op1dbsp01" still won't match a
+    #     same-prefix-but-different-suffix token like "ue2op1dbsp010") -
+    #     underscore/hyphen are unambiguous word-delimiters in virtually
+    #     every real naming convention this tool encounters, never part
+    #     of the identifier itself the way a letter or digit is.
+    _NON_BOUNDARY = r"[A-Za-z0-9]"
     for i, host in enumerate(hostnames or [], start=1):
         token = f"HOST-{i}"
-        pattern = re.compile(r"(?<![A-Za-z0-9_-])" + re.escape(host) + r"(?![A-Za-z0-9_-])")
+        pattern = re.compile(r"(?<!" + _NON_BOUNDARY + r")" + re.escape(host) + r"(?!" + _NON_BOUNDARY + r")")
         new_result, count = pattern.subn(token, result)
         if count:
             legend.append({"token": token, "original": host})
