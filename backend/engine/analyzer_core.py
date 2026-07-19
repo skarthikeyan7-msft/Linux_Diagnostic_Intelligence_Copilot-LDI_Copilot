@@ -64,6 +64,7 @@ import platform
 import queue as queue_mod
 import re
 import stat
+import struct
 import sys
 import tarfile
 import time
@@ -74,7 +75,7 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.13.0"
+__version__ = "4.14.0"
 
 # --------------------------------------------------------------------------
 # Severity model
@@ -2357,15 +2358,609 @@ def check_sar_performance(root, kind, inventory, capture_dt=None, vm_tz=None):
     }
 
 
+# --------------------------------------------------------------------------
+# v4.14.0: vmcore (kernel crash dump) deep analysis - reads the binary
+# vmcore's OWN header/notes directly, with zero dependency on the `crash`
+# or `gdb` tools (which additionally need a matching vmlinux+debuginfo for
+# the EXACT kernel that crashed - rarely on hand during an initial triage
+# pass). This intentionally only extracts what's genuinely available
+# without symbol resolution: kernel/OS identification, crash timestamp,
+# per-CPU register state at capture time, and dump completeness/format
+# metadata - plus, when kdump's own companion dmesg text file is present
+# alongside the vmcore (the common case on RHEL/SUSE - both share the same
+# upstream kdump initscripts/dracut module that auto-generates one), the
+# actual panic backtrace text, which is far more valuable than anything
+# derivable from the binary alone.
+#
+# Every VM can be running a different kernel/OS - this is handled by NEVER
+# hardcoding a specific kernel/header version's exact layout: every field
+# read past the fixed v1 core is gated behind the vmcore's own
+# self-reported header_version (fields were added incrementally in real
+# makedumpfile history: vmcoreinfo in v3+, ELF notes in v4+, 64-bit
+# pfn/mapnr in v6+), and register DECODING (turning raw bytes into named
+# RIP/RSP/... registers) is architecture-gated - only x86_64 is decoded
+# today (the only architecture verified against a real file); other
+# architectures still get honest structural facts (note count, byte size)
+# without pretending to decode registers whose layout hasn't been
+# verified.
+# --------------------------------------------------------------------------
+_KDUMP_SIGNATURE = b"KDUMP   "
+_DISKDUMP_SIGNATURE = b"DISKDUMP"  # pre-kdump "diskdump"/netdump-era core - same header struct, older tooling
+_ELF_MAGIC = b"\x7fELF"
+
+# makedumpfile's own documented `-d`/dump_level bit meanings (page
+# categories EXCLUDED from the dump to shrink it) - sourced from
+# makedumpfile's man page / --help text, cross-checked against the real
+# customer vmcore's own dump_level=31 (=1+2+4+8+16, i.e. every bit below
+# set) which matches RHEL's long-standing default kdump.conf preset.
+_DUMP_LEVEL_BITS = [
+    (1, "zero pages"), (2, "non-private cache pages"), (4, "private cache pages"),
+    (8, "user-process data pages"), (16, "free pages"), (32, "hwpoison pages"),
+]
+
+# Compressed-page flags (page_desc_t.flags) - makedumpfile diskdump_mod.h.
+_PAGE_COMPRESSION_FLAGS = [
+    (0x1, "zlib"), (0x2, "lzo"), (0x4, "snappy"), (0x20, "zstd"),
+]
+
+# x86_64 elf_prstatus (linux/elfcore.h) general-register order/offset -
+# verified directly against a real vmcore's real NT_PRSTATUS notes
+# (produced plausible kernel-space RIP/RSP/CS values, not garbage).
+# pr_reg begins at byte 112: 12 (pr_info) + 4 (pr_cursig+pad) + 8
+# (pr_sigpend) + 8 (pr_sighold) + 16 (pid/ppid/pgrp/sid) + 64 (4x timeval)
+# = 112, followed by 27 unsigned longs.
+_PRSTATUS_PR_PID_OFFSET = 32
+_PRSTATUS_PR_REG_OFFSET = 112
+_PRSTATUS_X86_64_GREGS = [
+    "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10", "r9", "r8",
+    "rax", "rcx", "rdx", "rsi", "rdi", "orig_rax", "rip", "cs", "eflags",
+    "rsp", "ss", "fs_base", "gs_base", "ds", "es", "fs", "gs",
+]
+
+# Kernel-release string -> OS flavor/debuginfo resolution. Ordered most-
+# specific first. Every convention below is each vendor's own documented,
+# standardized package-naming/versioning scheme (not guessed) - RHEL's
+# ".elN[_M]" EUS/z-stream suffix, Fedora's ".fcN", Amazon Linux's
+# ".amznN", SUSE's "-<flavor>" kernel-flavor suffix, and Ubuntu/Debian's
+# "-<abi>-<flavor>" convention. Only ONE real example (RHEL 8.10 EUS,
+# "4.18.0-553.144.1.el8_10.x86_64") has been verified directly against a
+# real vmcore this session; the others follow the same public, documented
+# conventions but are marked "medium" confidence rather than "high" until
+# verified the same way - deliberately honest rather than overclaiming.
+_KREL_RHEL_EUS_RE = re.compile(r"^(?P<kver>.+)\.el(?P<major>\d+)_(?P<minor>\d+)\.(?P<arch>\w+)$")
+_KREL_RHEL_RE = re.compile(r"^(?P<kver>.+)\.el(?P<major>\d+)\.(?P<arch>\w+)$")
+_KREL_FEDORA_RE = re.compile(r"^(?P<kver>.+)\.fc(?P<rel>\d+)\.(?P<arch>\w+)$")
+_KREL_AMAZON_RE = re.compile(r"^(?P<kver>.+)\.amzn(?P<major>\d+)\.(?P<arch>\w+)$")
+_KREL_SUSE_RE = re.compile(r"^(?P<kver>\d+\.\d+\.\d+)-(?P<build>[\d.]+)-(?P<flavor>default|preempt|azure|kvmsmall|smp|pae)$")
+_KREL_UBUNTU_RE = re.compile(r"^(?P<kver>\d+\.\d+\.\d+)-(?P<abi>\d+)-(?P<flavor>generic|lowlatency|aws|azure|gcp|oracle|kvm)$")
+_KREL_DEBIAN_RE = re.compile(r"^(?P<kver>\d+\.\d+\.\d+)-(?P<abi>\d+)-(?P<flavor>amd64|arm64|686-pae|i386)$")
+_KREL_MAINLINE_RE = re.compile(r"^(?P<kver>\d+\.\d+(?:\.\d+)?)(?:-(?P<rc>rc\d+))?$")
+
+
+def identify_os_flavor(kernel_release, os_release_hint=None):
+    """Best-effort maps a `uname -r`-style kernel release string (as
+    embedded in the vmcore's own VMCOREINFO OSRELEASE field) to the exact
+    debuginfo package name, install command, vmlinux path convention, and
+    repo/channel guidance needed to do FULL symbolic analysis with `crash`
+    or `gdb` - directly resolving the "which dependencies do I need"
+    question, without requiring the analyst to already know their distro's
+    packaging conventions. `os_release_hint` (this bundle's own already-
+    extracted /etc/os-release text, when available) is used only to refine
+    the human-readable distro NAME - never the package-name math itself,
+    since RHEL/CentOS Stream/Rocky Linux/AlmaLinux all share the identical
+    ".elN" kernel-release convention and are only distinguishable via
+    os-release, not the kernel string alone."""
+    if not kernel_release:
+        return {"distro_family": "unknown", "confidence": "none",
+                "notes": ["No kernel release string available to identify from."]}
+
+    krel = kernel_release.strip()
+    os_hint_low = (os_release_hint or "").lower()
+
+    m = _KREL_RHEL_EUS_RE.match(krel) or _KREL_RHEL_RE.match(krel)
+    if m:
+        g = m.groupdict()
+        major = g["major"]
+        arch = g["arch"]
+        eus_note = f" (EUS/z-stream update {g['minor']})" if "minor" in g and g.get("minor") else ""
+        distro_name = "RHEL-family (RHEL / CentOS Stream / Rocky Linux / AlmaLinux)"
+        if "red hat" in os_hint_low:
+            distro_name = "Red Hat Enterprise Linux"
+        elif "rocky" in os_hint_low:
+            distro_name = "Rocky Linux"
+        elif "alma" in os_hint_low:
+            distro_name = "AlmaLinux"
+        elif "centos" in os_hint_low:
+            distro_name = "CentOS Stream"
+        return {
+            "distro_family": "rhel", "distro_guess": distro_name + eus_note,
+            "major_version": major, "arch": arch, "confidence": "high",
+            "package_manager": "dnf" if int(major) >= 8 else "yum",
+            "debuginfo_package": f"kernel-debuginfo-{krel}",
+            "debuginfo_common_package": f"kernel-debuginfo-common-{arch}-{krel}",
+            "debuginfo_install_cmd": f"{'dnf' if int(major) >= 8 else 'yum'} debuginfo-install kernel-{krel}",
+            "vmlinux_path": f"/usr/lib/debug/lib/modules/{krel}/vmlinux",
+            "repo_hint": ("Red Hat CDN debug repos (rhel-{0}-{1}-baseos-debug-rpms / "
+                          "-appstream-debug-rpms), enabled via `subscription-manager repos "
+                          "--enable=...`, or https://access.redhat.com/downloads (needs an "
+                          "active RHEL subscription). Rocky Linux/AlmaLinux/CentOS Stream "
+                          "publish their own free debuginfo mirrors instead.").format(major, arch),
+            "notes": ["Verified directly against a real RHEL 8.10 EUS vmcore this session."],
+        }
+
+    m = _KREL_FEDORA_RE.match(krel)
+    if m:
+        g = m.groupdict()
+        return {
+            "distro_family": "fedora", "distro_guess": f"Fedora {g['rel']}",
+            "arch": g["arch"], "confidence": "medium", "package_manager": "dnf",
+            "debuginfo_package": f"kernel-debuginfo-{krel}",
+            "debuginfo_install_cmd": f"dnf debuginfo-install kernel-{krel}",
+            "vmlinux_path": f"/usr/lib/debug/lib/modules/{krel}/vmlinux",
+            "repo_hint": "Fedora's public debuginfo repos (enabled by default, no subscription needed).",
+            "notes": ["Pattern-matched (Fedora's documented \".fcN\" convention) - not yet verified against a real Fedora vmcore."],
+        }
+
+    m = _KREL_AMAZON_RE.match(krel)
+    if m:
+        g = m.groupdict()
+        return {
+            "distro_family": "amazon_linux", "distro_guess": f"Amazon Linux {g['major']}",
+            "arch": g["arch"], "confidence": "medium", "package_manager": "yum/dnf",
+            "debuginfo_package": f"kernel-debuginfo-{krel}",
+            "debuginfo_install_cmd": f"yum debuginfo-install kernel-{krel}",
+            "vmlinux_path": f"/usr/lib/debug/lib/modules/{krel}/vmlinux",
+            "repo_hint": "Amazon Linux's own debuginfo repo (amzn2-core-debuginfo / al2023 equivalent).",
+            "notes": ["Pattern-matched (Amazon Linux's documented \".amznN\" convention) - not yet verified against a real Amazon Linux vmcore."],
+        }
+
+    m = _KREL_SUSE_RE.match(krel)
+    if m:
+        g = m.groupdict()
+        distro_name = "SUSE Linux Enterprise Server / openSUSE"
+        for label in ("suse linux enterprise server", "sles", "opensuse"):
+            if label in os_hint_low:
+                distro_name = os_release_hint.strip().splitlines()[0][:120] if os_release_hint else distro_name
+                break
+        return {
+            "distro_family": "suse", "distro_guess": distro_name, "flavor": g["flavor"],
+            "confidence": "medium", "package_manager": "zypper",
+            "debuginfo_package": f"kernel-{g['flavor']}-debuginfo-{g['kver']}-{g['build']}",
+            "debuginfo_install_cmd": f"zypper install kernel-{g['flavor']}-debuginfo-{g['kver']}-{g['build']}",
+            "vmlinux_path": f"/usr/lib/debug/boot/vmlinux-{g['kver']}-{g['build']}-{g['flavor']}.debug",
+            "repo_hint": ("SUSE Customer Center (SCC) Debuginfo module/channel matching your "
+                          "exact SLE product + service pack (enable via SUSEConnect or the SCC "
+                          "web UI), or openSUSE's debuginfo OBS repos for openSUSE."),
+            "notes": ["Pattern-matched (SUSE's documented kernel-flavor suffix convention) - "
+                      "not yet verified against a real SUSE vmcore. Exact SP is NOT reliably "
+                      "derivable from the kernel string alone - cross-check os_release."],
+        }
+
+    m = _KREL_UBUNTU_RE.match(krel)
+    if m:
+        g = m.groupdict()
+        return {
+            "distro_family": "ubuntu", "distro_guess": "Ubuntu", "flavor": g["flavor"],
+            "confidence": "medium", "package_manager": "apt",
+            "debuginfo_package": f"linux-image-{krel}-dbgsym",
+            "debuginfo_install_cmd": f"apt install linux-image-{krel}-dbgsym  # after enabling ddebs.ubuntu.com",
+            "vmlinux_path": f"/usr/lib/debug/boot/vmlinux-{krel}",
+            "repo_hint": "Ubuntu's ddebs.ubuntu.com archive - needs a one-time repo+keyring setup (see wiki.ubuntu.com/Debug Symbol Packages).",
+            "notes": ["Pattern-matched (Ubuntu's documented \"-<abi>-<flavor>\" convention) - not yet verified against a real Ubuntu vmcore."],
+        }
+
+    m = _KREL_DEBIAN_RE.match(krel)
+    if m:
+        g = m.groupdict()
+        return {
+            "distro_family": "debian", "distro_guess": "Debian", "arch": g["flavor"],
+            "confidence": "medium", "package_manager": "apt",
+            "debuginfo_package": f"linux-image-{krel}-dbg",
+            "debuginfo_install_cmd": f"apt install linux-image-{krel}-dbg  # from Debian's debug archive",
+            "vmlinux_path": f"/usr/lib/debug/boot/vmlinux-{krel}",
+            "repo_hint": "Debian's debug archive (debug.mirrors.debian.org).",
+            "notes": ["Pattern-matched (Debian's documented \"-<abi>-<arch>\" convention) - not yet verified against a real Debian vmcore."],
+        }
+
+    m = _KREL_MAINLINE_RE.match(krel)
+    if m:
+        return {
+            "distro_family": "mainline", "distro_guess": "Vanilla/mainline kernel.org build",
+            "confidence": "low",
+            "notes": ["No vendor suffix recognized - this looks like a self-built or "
+                      "kernel.org-mainline kernel. There is usually no prebuilt debuginfo "
+                      "package; you likely need to rebuild the IDENTICAL kernel source+config "
+                      "(with CONFIG_DEBUG_INFO=y) to get a matching vmlinux."],
+        }
+
+    return {
+        "distro_family": "unknown", "confidence": "none",
+        "notes": [f"Kernel release string '{krel}' didn't match any known vendor convention. "
+                  "Cross-check /etc/os-release or /etc/*-release captured elsewhere in this "
+                  "bundle, and consult the OS vendor's own kernel-debuginfo documentation."],
+    }
+
+
+def _parse_elf_notes(buf):
+    """Generic ELF PT_NOTE segment parser (Elf64 note entry format: namesz/
+    descsz/type as 3 uint32 LE, name padded to 4-byte alignment, descriptor
+    padded to 4-byte alignment) - shared by both the KDUMP-embedded notes
+    region and a raw-ELF-format vmcore's own PT_NOTE program header."""
+    out = []
+    off = 0
+    n = len(buf)
+    while off + 12 <= n:
+        try:
+            namesz, descsz, ntype = struct.unpack_from("<III", buf, off)
+        except struct.error:
+            break
+        off += 12
+        if namesz == 0 and descsz == 0:
+            break
+        name = buf[off:off + namesz]
+        off += (namesz + 3) & ~3
+        desc = buf[off:off + descsz]
+        off += (descsz + 3) & ~3
+        out.append((name.rstrip(b"\x00"), ntype, desc))
+        if off > n:
+            break
+    return out
+
+
+def _decode_x86_64_prstatus(desc):
+    """Decodes one NT_PRSTATUS note descriptor's general-purpose register
+    set for x86_64 - see _PRSTATUS_PR_REG_OFFSET/_PRSTATUS_X86_64_GREGS
+    above for the verified offset/order. Returns None if desc is too short
+    to safely contain the full register block (defensive - never reads
+    past what's actually present)."""
+    need = _PRSTATUS_PR_REG_OFFSET + len(_PRSTATUS_X86_64_GREGS) * 8
+    if len(desc) < need:
+        return None
+    pid = struct.unpack_from("<i", desc, _PRSTATUS_PR_PID_OFFSET)[0] if len(desc) >= _PRSTATUS_PR_PID_OFFSET + 4 else None
+    regs = struct.unpack_from(f"<{len(_PRSTATUS_X86_64_GREGS)}Q", desc, _PRSTATUS_PR_REG_OFFSET)
+    return {"pid": pid, **dict(zip(_PRSTATUS_X86_64_GREGS, regs))}
+
+
+def _parse_vmcoreinfo_text(blob):
+    """Splits a VMCOREINFO NOTE/blob's text into a flat dict on the first
+    '=' per line (its own native format - confirmed directly against a
+    real vmcore's real VMCOREINFO: 'OSRELEASE=...', 'SYMBOL(x)=...', one
+    per line, no other structure)."""
+    info = {}
+    for line in blob.decode("utf-8", errors="replace").splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            info[k.strip()] = v.strip()
+    return info
+
+
+def _parse_kdump_flattened_vmcore(fpath, signature):
+    """Parses the makedumpfile/kdump flattened vmcore format (`KDUMP   ` or
+    the older `DISKDUMP` signature - IDENTICAL header struct either way,
+    only the tooling generation differs) directly from raw bytes. Every
+    field beyond the fixed v1 core is gated by the file's own
+    header_version, so a vmcore from an older or newer kdump/makedumpfile
+    release than the one this was built against still parses whatever it
+    genuinely contains, honestly, rather than assuming today's full v6
+    layout applies everywhere. Never needs `crash`/`gdb`/a matching
+    vmlinux - this is pure container-format parsing, not symbol
+    resolution."""
+    result = {"format": "kdump_flattened" if signature == _KDUMP_SIGNATURE else "legacy_diskdump",
+              "warnings": []}
+    try:
+        with open(fpath, "rb") as f:
+            head = f.read(512)
+            off = 8
+            (header_version,) = struct.unpack_from("<i", head, off); off += 4
+            result["header_version"] = header_version
+            sysname, nodename, release, version, machine, domainname = struct.unpack_from(
+                "<65s65s65s65s65s65s", head, off)
+            off += 390
+
+            def cstr(b):
+                return b.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+
+            result["kernel_release"] = cstr(release) or None
+            result["hostname"] = cstr(nodename) or None
+            result["architecture"] = cstr(machine) or None
+            result["os_sysname"] = cstr(sysname) or None
+            result["kernel_build_version"] = cstr(version) or None
+
+            off += (-off) % 8  # struct timeval is 8-byte aligned (verified against a real file)
+            tv_sec, _tv_usec = struct.unpack_from("<qq", head, off); off += 16
+            if tv_sec > 0:
+                try:
+                    result["crash_timestamp_utc"] = datetime.utcfromtimestamp(tv_sec).isoformat() + "Z"
+                except (OverflowError, OSError, ValueError):
+                    result["warnings"].append("timestamp field present but out of range - not decoded")
+
+            (status, block_size, sub_hdr_size, bitmap_blocks, max_mapnr32, total_ram_blocks,
+             device_blocks, written_blocks, current_cpu, nr_cpus) = struct.unpack_from(
+                "<IiiIIIIIii", head, off)
+            off += 40
+            result["dump_status_flags"] = status
+            result["nr_cpus"] = nr_cpus
+            result["block_size"] = block_size
+
+            if block_size <= 0 or block_size > 1 << 20:
+                result["warnings"].append(f"implausible block_size ({block_size}) - header may be corrupt or in an unrecognized variant")
+                return result
+
+            if header_version >= 3 and sub_hdr_size > 0:
+                sub_off = block_size
+                sub_len = sub_hdr_size * block_size
+                f.seek(sub_off)
+                sub = f.read(min(sub_len, 4096))
+                phys_base, dump_level, split, start_pfn, end_pfn = struct.unpack_from("<Qiiqq", sub, 0)
+                result["phys_base"] = phys_base
+                result["dump_level"] = dump_level
+                result["dump_level_excludes"] = [label for bit, label in _DUMP_LEVEL_BITS if dump_level & bit]
+                # Computed via calcsize() rather than a hardcoded literal
+                # (a hand-counted "24" here previously drifted 8 bytes out
+                # of alignment with the preceding struct.unpack_from call
+                # above, which actually consumes 32 bytes - Q+i+i+q+q = 
+                # 8+4+4+8+8 - silently corrupting every subsequent
+                # vmcoreinfo/note offset read; caught by testing directly
+                # against a real vmcore rather than trusting the arithmetic).
+                soff = struct.calcsize("<Qiiqq")
+                if header_version >= 3:
+                    offset_vmcoreinfo, size_vmcoreinfo = struct.unpack_from("<qQ", sub, soff)
+                    soff += 16
+                    if header_version >= 4:
+                        offset_note, size_note = struct.unpack_from("<qQ", sub, soff)
+                        soff += 16
+                    else:
+                        offset_note, size_note = 0, 0
+                    if 0 < size_vmcoreinfo < 5_000_000 and offset_vmcoreinfo > 0:
+                        f.seek(offset_vmcoreinfo)
+                        vmcoreinfo_raw = f.read(size_vmcoreinfo)
+                        vmcoreinfo = _parse_vmcoreinfo_text(vmcoreinfo_raw)
+                        result["vmcoreinfo_found"] = True
+                        result["vmcoreinfo_lines_count"] = len(vmcoreinfo)
+                        if not result.get("kernel_release") and vmcoreinfo.get("OSRELEASE"):
+                            result["kernel_release"] = vmcoreinfo["OSRELEASE"]
+                        if vmcoreinfo.get("PAGESIZE"):
+                            result["pagesize"] = vmcoreinfo["PAGESIZE"]
+                    else:
+                        result["vmcoreinfo_found"] = False
+                    if 0 < size_note < 5_000_000 and offset_note > 0:
+                        f.seek(offset_note)
+                        notes_raw = f.read(size_note)
+                        notes = _parse_elf_notes(notes_raw)
+                        prstatus_notes = [desc for (name, ntype, desc) in notes if ntype == 1]
+                        result["notes_found"] = True
+                        result["prstatus_cpu_count"] = len(prstatus_notes)
+                        arch = (result.get("architecture") or "").lower()
+                        if arch == "x86_64":
+                            all_decoded = []
+                            for i, desc in enumerate(prstatus_notes):
+                                dec = _decode_x86_64_prstatus(desc)
+                                if dec is not None:
+                                    all_decoded.append((i, dec))
+                            rip_counts = Counter(dec["rip"] for _i, dec in all_decoded)
+                            result["register_decode_supported"] = True
+                            result["register_samples"] = [
+                                {"cpu_index": i, "pid": dec["pid"],
+                                 "rip": f"0x{dec['rip']:016x}", "rsp": f"0x{dec['rsp']:016x}",
+                                 "cs": f"0x{dec['cs']:x}", "eflags": f"0x{dec['eflags']:x}"}
+                                for i, dec in all_decoded[:16]  # bounded preview - full set rarely needed beyond a sanity check
+                            ]
+                            result["all_cpus_share_rip"] = len(rip_counts) == 1 if rip_counts else None
+                            if result["all_cpus_share_rip"]:
+                                result["warnings"].append(
+                                    "All sampled CPUs show the IDENTICAL RIP - consistent with "
+                                    "every CPU being parked in the same NMI/IPI 'freeze' handler "
+                                    "during dump capture, not each CPU's own independent fault "
+                                    "location. Identify the ACTUAL faulting/triggering CPU from "
+                                    "the dmesg panic line ('CPU: N') instead of these registers.")
+                            elif rip_counts:
+                                # The common real-world shape (confirmed
+                                # directly against a real vmcore): N-1
+                                # CPUs share one "parked in the IPI-freeze
+                                # handler" RIP while exactly the CPU that
+                                # was actually running at panic time shows
+                                # a DIFFERENT RIP (and a non-zero pid) -
+                                # that CPU is the single most actionable
+                                # register-derived fact in the whole dump,
+                                # so it's surfaced explicitly rather than
+                                # left for a human to spot inside a 64-
+                                # entry sample list. majority_rip is
+                                # whichever RIP most CPUs share (the
+                                # "frozen" location), not assumed to be
+                                # index 0's value.
+                                majority_rip, majority_count = rip_counts.most_common(1)[0]
+                                outliers = [
+                                    {"cpu_index": i, "pid": dec["pid"],
+                                     "rip": f"0x{dec['rip']:016x}", "rsp": f"0x{dec['rsp']:016x}",
+                                     "cs": f"0x{dec['cs']:x}", "eflags": f"0x{dec['eflags']:x}"}
+                                    for i, dec in all_decoded if dec["rip"] != majority_rip
+                                ]
+                                if outliers and majority_count > len(all_decoded) // 2:
+                                    result["outlier_cpus"] = outliers[:10]
+                                    result["warnings"].append(
+                                        f"{majority_count}/{len(all_decoded)} CPUs share one RIP "
+                                        "(parked in the IPI/NMI 'freeze' handler during capture) "
+                                        f"while {len(outliers)} CPU(s) do not - see outlier_cpus "
+                                        "for the likely actual faulting/triggering CPU(s) and "
+                                        "their PID at capture time (cross-check against the "
+                                        "dmesg panic line's own 'CPU: N' for confirmation).")
+                        else:
+                            result["register_decode_supported"] = False
+                            result["warnings"].append(
+                                f"Register decode not implemented for architecture '{arch or 'unknown'}' "
+                                "(only x86_64 verified so far) - CPU count/note presence still reported.")
+                    else:
+                        result["notes_found"] = False
+                else:
+                    result["warnings"].append(f"header_version={header_version} predates VMCOREINFO support (added in v3) - kernel/OS identified from utsname only.")
+            else:
+                result["warnings"].append(f"header_version={header_version} has no (or empty) sub-header - limited metadata available.")
+
+            # Best-effort single-page compression sniff (informational -
+            # confirms whether THIS dump's page data is actually
+            # compressed, and with what, without decompressing the whole
+            # multi-hundred-MB body).
+            if header_version >= 3 and "phys_base" in result:
+                bitmap_off = block_size * (1 + sub_hdr_size)
+                bitmap_len = bitmap_blocks * block_size
+                page_data_start = bitmap_off + bitmap_len
+                try:
+                    f.seek(page_data_start)
+                    probe = f.read(24)
+                    if len(probe) == 24:
+                        _off, _size, flags, _pflags = struct.unpack_from("<QIIQ", probe, 0)
+                        comp_labels = [label for bit, label in _PAGE_COMPRESSION_FLAGS if flags & bit]
+                        result["first_page_compression"] = ", ".join(comp_labels) if comp_labels else "none (raw)"
+                except OSError:
+                    pass
+    except OSError as e:
+        result["warnings"].append(f"could not read vmcore file: {e}")
+    return result
+
+
+def _parse_elf_format_vmcore(fpath):
+    """Best-effort fallback for a raw ELF-format core (produced by e.g.
+    `makedumpfile -E`, `virsh dump --format=elf`, or a hypervisor-level
+    memory dump) rather than the makedumpfile flattened KDUMP format. Far
+    less structured than the flattened format - no VMCOREINFO offset
+    table to rely on, so vmcoreinfo is located by CONTENT (scanning notes
+    for one whose descriptor starts with the literal text "OSRELEASE=",
+    which is how the kernel always begins its vmcoreinfo buffer - a
+    content-based check rather than assuming an unverified note-type
+    number). Clearly labeled as lower-confidence than the flattened-format
+    path, which is independently confirmed against a real file."""
+    result = {"format": "raw_elf", "warnings": ["Raw ELF-format core - only partial metadata "
+                                                 "extraction is implemented for this format; "
+                                                 "prefer the makedumpfile/kdump flattened format when a choice is available."]}
+    try:
+        with open(fpath, "rb") as f:
+            ehdr = f.read(64)
+            if len(ehdr) < 64:
+                result["warnings"].append("file too small to be a valid ELF core")
+                return result
+            ei_class = ehdr[4]  # 1=32-bit, 2=64-bit
+            is64 = ei_class == 2
+            e_machine = struct.unpack_from("<H", ehdr, 18)[0]
+            arch_map = {0x3E: "x86_64", 0xB7: "aarch64", 0x15: "ppc64", 0x16: "s390x"}
+            result["architecture"] = arch_map.get(e_machine, f"e_machine=0x{e_machine:x}")
+            if not is64:
+                result["warnings"].append("32-bit ELF core - not parsed further (no verified real-world 32-bit sample)")
+                return result
+            e_phoff, = struct.unpack_from("<Q", ehdr, 32)
+            e_phentsize, e_phnum = struct.unpack_from("<HH", ehdr, 54)
+            f.seek(e_phoff)
+            phdrs = f.read(e_phentsize * e_phnum)
+            note_segments = []
+            for i in range(e_phnum):
+                base = i * e_phentsize
+                if base + 56 > len(phdrs):
+                    break
+                p_type, _flags, p_offset, _vaddr, _paddr, p_filesz = struct.unpack_from("<IIQQQQ", phdrs, base)
+                if p_type == 4:  # PT_NOTE
+                    note_segments.append((p_offset, p_filesz))
+            all_notes = []
+            for p_offset, p_filesz in note_segments:
+                if p_filesz <= 0 or p_filesz > 50_000_000:
+                    continue
+                f.seek(p_offset)
+                all_notes.extend(_parse_elf_notes(f.read(p_filesz)))
+            prstatus_notes = [desc for (name, ntype, desc) in all_notes if ntype == 1]
+            result["notes_found"] = bool(all_notes)
+            result["prstatus_cpu_count"] = len(prstatus_notes)
+            vmcoreinfo_desc = next((desc for (_name, _ntype, desc) in all_notes
+                                    if desc.startswith(b"OSRELEASE=")), None)
+            if vmcoreinfo_desc:
+                vmcoreinfo = _parse_vmcoreinfo_text(vmcoreinfo_desc)
+                result["vmcoreinfo_found"] = True
+                result["kernel_release"] = vmcoreinfo.get("OSRELEASE")
+            else:
+                result["vmcoreinfo_found"] = False
+            if result["architecture"] == "x86_64" and prstatus_notes:
+                samples = []
+                rips = set()
+                for i, desc in enumerate(prstatus_notes[:16]):
+                    dec = _decode_x86_64_prstatus(desc)
+                    if dec:
+                        rips.add(dec["rip"])
+                        samples.append({"cpu_index": i, "rip": f"0x{dec['rip']:016x}", "rsp": f"0x{dec['rsp']:016x}"})
+                result["register_decode_supported"] = True
+                result["register_samples"] = samples
+                result["all_cpus_share_rip"] = len(rips) == 1 if rips else None
+    except OSError as e:
+        result["warnings"].append(f"could not read ELF core file: {e}")
+    return result
+
+
+def analyze_vmcore_file(fpath):
+    """Entry point: sniffs the vmcore's own magic bytes and dispatches to
+    the matching parser. Returns a plain dict of extracted facts - never
+    raises; a genuinely unrecognized/corrupt file yields format:
+    "unrecognized" plus a clear reason instead of an exception bubbling
+    into the wider analysis run."""
+    try:
+        with open(fpath, "rb") as f:
+            head = f.read(8)
+    except OSError as e:
+        return {"format": "unreadable", "warnings": [str(e)]}
+    if head in (_KDUMP_SIGNATURE, _DISKDUMP_SIGNATURE):
+        return _parse_kdump_flattened_vmcore(fpath, head)
+    if head[:4] == _ELF_MAGIC:
+        return _parse_elf_format_vmcore(fpath)
+    return {"format": "unrecognized",
+            "warnings": [f"First 8 bytes ({head!r}) don't match a known vmcore format "
+                         "(makedumpfile KDUMP/DISKDUMP flattened header, or raw ELF core)."]}
+
+
+# Companion-file discovery: kdump's own dracut module (shared upstream
+# code across RHEL/CentOS/Rocky/Alma/SUSE - all package the same kdump
+# initscripts, only Ubuntu's separate kdump-tools reimplementation may
+# differ) auto-runs `makedumpfile --dump-dmesg` as the LAST step of saving
+# a crash dump, writing an already-decoded plain-text dmesg log right next
+# to the vmcore. Confirmed directly against a real capture: the exact
+# filename "vmcore-dmesg.txt" sitting in the identical directory as
+# "vmcore" itself. Matched generically (not just that exact literal name)
+# to be robust to naming variance across kdump versions/distros.
+_VMCORE_DMESG_COMPANION_RE = re.compile(r"dmesg", re.IGNORECASE)
+_SYSRQ_TEST_CRASH_RE = re.compile(r"sysrq[- ]?triggered crash|SysRq\s*:\s*Trigger a crash", re.IGNORECASE)
+_PANIC_START_RE = re.compile(r"Kernel panic|^\s*\S*\s*Oops:|general protection fault", re.IGNORECASE | re.MULTILINE)
+
+
+def _find_vmcore_companions(inventory, vmcore_relpath):
+    """Finds sibling files in the SAME directory as a vmcore whose name
+    suggests they're a kdump-produced text companion (dmesg-style log) -
+    the highest-value, zero-risk source of crash evidence, since it's
+    kdump's OWN human-readable rendering, not a re-derivation."""
+    vmcore_dir = vmcore_relpath.rsplit("/", 1)[0] if "/" in vmcore_relpath else ""
+    out = []
+    for it in inventory:
+        p = it["path"]
+        p_dir = p.rsplit("/", 1)[0] if "/" in p else ""
+        if p_dir != vmcore_dir or p == vmcore_relpath:
+            continue
+        base = p.rsplit("/", 1)[-1].lower()
+        if _VMCORE_DMESG_COMPANION_RE.search(base) and base.endswith((".txt", ".log")):
+            out.append(p)
+    return out
+
+
 def check_crash_analysis(root, kind, inventory):
     """Correlates whatever crash/coredump *evidence* is realistically
-    available inside a sosreport/supportconfig/crm_report bundle. Bundles
-    essentially never contain the actual (huge) core file, and even if
-    they did, symbolizing a raw core requires gdb plus matching debug
-    symbols for the exact kernel/binary build - infeasible in this
-    tool's own runtime. What IS realistic and genuinely useful: ABRT's
-    own already-human-readable backtrace captured at crash time, kdump/
-    kexec configuration, and vmcore presence/size (existence only).
+    available inside a sosreport/supportconfig/crm_report bundle - or a
+    bare standalone vmcore upload. Bundles essentially never contain the
+    actual (huge) core file's FULL symbolic analysis, since properly
+    symbolizing a raw core with `crash`/gdb needs a matching vmlinux +
+    debuginfo for the EXACT kernel build that crashed, which is rarely on
+    hand during an initial triage pass. What IS realistic and genuinely
+    useful, and everything this function extracts without any external
+    tool: ABRT's own already-human-readable backtrace, kdump/kexec
+    configuration, kdump's OWN already-decoded companion dmesg text log
+    when present (the single highest-value, lowest-risk source - see
+    _find_vmcore_companions()), and (v4.14.0) the vmcore binary's OWN
+    header/notes - kernel/OS identification (working across ANY Linux
+    flavor/kernel version via identify_os_flavor()'s vendor-convention
+    pattern matching, never hardcoded to one), crash timestamp, and per-
+    CPU register state at capture time - all read directly, with zero
+    dependency on crash/gdb/vmlinux.
     """
     result = {}
 
@@ -2394,10 +2989,89 @@ def check_crash_analysis(root, kind, inventory):
     if abrt_reports:
         result["abrt_reports"] = abrt_reports
 
+    # Exact-basename match (v4.14.0 fix) - the previous substring check
+    # ("vmcore" in path) also matched kdump's OWN "vmcore-dmesg.txt" text
+    # companion (see below), wrongly listing a 45KB human-readable log as
+    # if it were itself a multi-hundred-MB binary core dump. "vmcore",
+    # "vmcore.1", "vmcore2" etc. (seen on systems with multiple/indexed
+    # crash captures) still match; "vmcore-dmesg.txt"/"vmcore.log" no
+    # longer do.
+    _vmcore_basename_re = re.compile(r"^vmcore\.?\d*$", re.IGNORECASE)
     vmcores = [{"path": it["path"], "size": it["size"], "size_human": human_size(it["size"])}
-               for it in inventory if "vmcore" in it["path"].lower() and it["size"] > 0]
+               for it in inventory
+               if it["size"] > 0 and _vmcore_basename_re.match(it["path"].rsplit("/", 1)[-1])]
     if vmcores:
         result["vmcore_files"] = vmcores
+
+        # Light-weight, bounded os-release lookup purely to REFINE the
+        # human-readable distro name identify_os_flavor() reports (RHEL
+        # vs Rocky vs Alma vs CentOS Stream all share the identical
+        # kernel-release convention and are only distinguishable this
+        # way) - never used for the package-name math itself.
+        os_release_text = ""
+        if kind == "sosreport":
+            for relp in find_inventory(inventory, "etc/os-release", "etc/redhat-release", "etc/system-release"):
+                os_release_text = get_text(root, relp, 4000)
+                if os_release_text.strip():
+                    break
+        elif kind == "supportconfig":
+            for relp in find_inventory(inventory, "basic-environment.txt"):
+                t = get_text(root, relp, 300000)
+                sec = extract_supportconfig_section(t, "os-release", "suse-release")
+                if sec:
+                    os_release_text = "\n".join(sec)
+                    break
+
+        vmcore_analyses = []
+        for v in vmcores[:5]:  # bounded - multiple vmcores in one bundle is rare, but never unbounded work
+            full_path = root / v["path"]
+            analysis = analyze_vmcore_file(full_path)
+            analysis["path"] = v["path"]
+            analysis["size_human"] = v["size_human"]
+            if analysis.get("kernel_release"):
+                analysis["os_flavor"] = identify_os_flavor(analysis["kernel_release"], os_release_text)
+            companions = _find_vmcore_companions(inventory, v["path"])
+            if companions:
+                # Content-based selection (consistent with this project's
+                # established preference elsewhere - e.g. compression
+                # sniffing by magic bytes, not extension): try EVERY
+                # companion for an actual panic/oops marker and pick the
+                # first one that has it, rather than just companions[0].
+                # Confirmed necessary by testing against a real capture
+                # with TWO companions side by side - kdump's own
+                # "kexec-dmesg.log" (the CRASH kernel's OWN boot log,
+                # sorts alphabetically first, never contains the original
+                # panic) and "vmcore-dmesg.txt" (the ORIGINAL system's
+                # actual panic backtrace) - picking purely by inventory
+                # order silently surfaced the wrong, less useful file.
+                chosen_relp, chosen_text, chosen_panic_m = None, "", None
+                for cand_relp in companions:
+                    cand_text = get_text(root, cand_relp, 2_000_000)
+                    cand_m = _PANIC_START_RE.search(cand_text)
+                    if cand_m:
+                        chosen_relp, chosen_text, chosen_panic_m = cand_relp, cand_text, cand_m
+                        break
+                if chosen_relp is None:  # none had an explicit marker - fall back to the first companion's tail
+                    chosen_relp = companions[0]
+                    chosen_text = get_text(root, chosen_relp, 2_000_000)
+                comp_entry = {"path": chosen_relp}
+                if len(companions) > 1:
+                    comp_entry["other_companions"] = [c for c in companions if c != chosen_relp]
+                sysrq_m = _SYSRQ_TEST_CRASH_RE.search(chosen_text)
+                comp_entry["is_sysrq_test_crash"] = bool(sysrq_m)
+                if chosen_panic_m:
+                    comp_entry["panic_excerpt"] = chosen_text[chosen_panic_m.start():chosen_panic_m.start() + 4000].strip()
+                else:
+                    # Defensive fallback for a companion file that doesn't
+                    # contain an obvious panic/oops marker anywhere -
+                    # still surface the tail, since that's almost always
+                    # where the actionable content is in a boot+runtime
+                    # dmesg capture.
+                    tail_lines = [ln for ln in chosen_text.splitlines() if ln.strip()][-80:]
+                    comp_entry["tail_lines"] = "\n".join(tail_lines)[:4000]
+                analysis["dmesg_companion"] = comp_entry
+            vmcore_analyses.append(analysis)
+        result["vmcore_analysis"] = vmcore_analyses
 
     kdump_text = ""
     if kind == "sosreport":
@@ -3670,6 +4344,59 @@ def build_digest(kind, root, input_path, inventory, findings_list, facts, timeli
                 lines.append(f"  - `{exe}` crashed ({reason}) at {when} — see `{r['dir']}/backtrace`")
         if crash.get("vmcore_files"):
             lines.append(f"- ⚠️ **Kernel crash dump (vmcore) present:** " + ", ".join(f"{v['path']} ({v['size_human']})" for v in crash["vmcore_files"][:5]))
+        for va in crash.get("vmcore_analysis", []) or []:
+            fmt = va.get("format", "unrecognized")
+            if fmt == "unrecognized" or fmt == "unreadable":
+                lines.append(f"  - `{va.get('path')}`: format not recognized ({'; '.join(va.get('warnings', []))})")
+                continue
+            lines.append(f"  - **`{va.get('path')}` ({fmt}{', header v' + str(va['header_version']) if va.get('header_version') is not None else ''}):**")
+            if va.get("kernel_release"):
+                lines.append(f"    - Kernel: `{va['kernel_release']}` on `{va.get('architecture', '?')}`" + (f", host `{va['hostname']}`" if va.get("hostname") else ""))
+            if va.get("crash_timestamp_utc"):
+                lines.append(f"    - Crash captured at: **{va['crash_timestamp_utc']}**")
+            if va.get("nr_cpus"):
+                lines.append(f"    - CPUs: {va['nr_cpus']}" + (f" ({va['prstatus_cpu_count']} register snapshots captured)" if va.get("prstatus_cpu_count") else ""))
+            if va.get("dump_level_excludes"):
+                lines.append(f"    - Dump excludes: {', '.join(va['dump_level_excludes'])} (level {va.get('dump_level')}) — smaller file, but some page categories aren't present")
+            comp = va.get("dmesg_companion")
+            if comp:
+                if comp.get("is_sysrq_test_crash"):
+                    lines.append(f"    - 🧪 **This was a manually-triggered TEST crash** (`sysrq-trigger`), not an organic kernel failure — confirmed from `{comp['path']}`. Common practice to validate kdump capture itself; treat accordingly, not as a production bug.")
+                if comp.get("panic_excerpt"):
+                    lines.append(f"    - 📋 **Panic excerpt from `{comp['path']}`:**")
+                    lines.append("      ```")
+                    for ln in comp["panic_excerpt"].splitlines()[:40]:
+                        lines.append(f"      {ln}")
+                    lines.append("      ```")
+                elif comp.get("tail_lines"):
+                    lines.append(f"    - 📋 **Last lines of `{comp['path']}`** (no explicit panic/oops marker found):")
+                    lines.append("      ```")
+                    for ln in comp["tail_lines"].splitlines()[:40]:
+                        lines.append(f"      {ln}")
+                    lines.append("      ```")
+            else:
+                lines.append("    - ℹ️ No companion dmesg text log (e.g. `vmcore-dmesg.txt`) found alongside this vmcore — only binary-header metadata is available. If re-collecting, kdump normally writes one automatically in the same directory.")
+            if va.get("all_cpus_share_rip"):
+                lines.append("    - ⚠️ All sampled CPUs' registers show the identical RIP — that's expected NMI/IPI-freeze behavior during capture, not each CPU's own fault site. Use the dmesg panic line's own `CPU: N` to identify the actual faulting/triggering CPU.")
+            if va.get("outlier_cpus"):
+                lines.append(f"    - 🎯 **Likely faulting/triggering CPU(s) identified from register state:** {len(va['outlier_cpus'])} CPU(s) show a DIFFERENT RIP than the rest (who are all parked in the same IPI/NMI freeze handler) — the single most actionable register fact in this dump:")
+                for oc in va["outlier_cpus"][:5]:
+                    lines.append(f"      - CPU index {oc['cpu_index']}, PID {oc['pid']}, RIP `{oc['rip']}`, RSP `{oc['rsp']}` — cross-check against dmesg's own `CPU: {oc['cpu_index']}` line and `ps`/process listing for PID {oc['pid']}")
+            flavor = va.get("os_flavor")
+            if flavor and flavor.get("distro_family") not in (None, "unknown"):
+                lines.append(f"    - **Dependency resolution ({flavor.get('confidence')} confidence):** {flavor.get('distro_guess', '?')}")
+                if flavor.get("debuginfo_install_cmd"):
+                    lines.append(f"      - Install matching debug symbols: `{flavor['debuginfo_install_cmd']}`")
+                if flavor.get("vmlinux_path"):
+                    lines.append(f"      - Expected vmlinux path: `{flavor['vmlinux_path']}`")
+                if flavor.get("repo_hint"):
+                    lines.append(f"      - Repo/channel: {flavor['repo_hint']}")
+                lines.append(f"      - Then analyze with: `crash {flavor.get('vmlinux_path', '<vmlinux>')} {va.get('path')}`")
+            elif flavor:
+                for note in flavor.get("notes", []):
+                    lines.append(f"    - ℹ️ {note}")
+            for w in va.get("warnings", []):
+                lines.append(f"    - ℹ️ {w}")
         if "kdump_configured" in crash:
             lines.append(f"- **kdump configured:** {'yes' if crash['kdump_configured'] else 'no'}" + (f" (path: {crash['kdump_path']})" if crash.get("kdump_path") else ""))
         if crash.get("kernel_oops_signature_count"):
