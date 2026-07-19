@@ -75,7 +75,7 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
-__version__ = "4.14.0"
+__version__ = "4.14.1"
 
 # --------------------------------------------------------------------------
 # Severity model

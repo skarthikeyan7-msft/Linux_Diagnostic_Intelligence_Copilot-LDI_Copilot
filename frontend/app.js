@@ -661,26 +661,51 @@ function showProgressError(msg) {
 
 function pollJob() {
   clearInterval(state.pollTimer);
+  // Re-entrancy guard: setInterval schedules its NEXT tick 800ms after
+  // the PREVIOUS tick STARTED, not after its async callback finishes -
+  // under heavy load (a large bundle's parallel scan competing for
+  // CPU/memory can make a single status-check fetch take longer than
+  // 800ms), overlapping ticks can pile up. Without this guard, two
+  // overlapping ticks could both observe status "done" and both call
+  // loadResults() concurrently for the same job - confirmed as the real
+  // cause of a real, reported bug: the "Redacted details" panel would
+  // correctly appear (shown live via the auto-chained AI generation's
+  // SSE stream) then vanish and never come back. A second, redundant
+  // loadResults() call's own synchronous renderRedactionCallout(null)
+  // reset (early in that function, before its own awaits) can fire
+  // AFTER the first call's/the live SSE stream's correct render,
+  // wiping it - and nothing re-shows it afterward, since the SSE stream
+  // only emits its one 'redaction' event near the very start. Skipping
+  // (not queuing) an overlapping tick is correct here: the NEXT tick
+  // 800ms later will simply re-check current status, so no state is
+  // lost by skipping one.
+  let tickInFlight = false;
   state.pollTimer = setInterval(async () => {
-    let resp;
+    if (tickInFlight) return;
+    tickInFlight = true;
     try {
-      resp = await fetch(`/api/jobs/${state.jobId}`);
-    } catch (err) {
-      return; // transient network hiccup - keep polling
-    }
-    if (!resp.ok) return;
-    const job = await resp.json();
-    renderProgressLog(job.progress);
-    if (job.progress.length > state.terminalProgressCount) {
-      job.progress.slice(state.terminalProgressCount).forEach((line) => logTerminal(line, "info"));
-      state.terminalProgressCount = job.progress.length;
-    }
-    if (job.status === "done") {
-      clearInterval(state.pollTimer);
-      await loadResults();
-    } else if (job.status === "error") {
-      clearInterval(state.pollTimer);
-      showProgressError(job.error || "Analysis failed for an unknown reason.");
+      let resp;
+      try {
+        resp = await fetch(`/api/jobs/${state.jobId}`);
+      } catch (err) {
+        return; // transient network hiccup - keep polling
+      }
+      if (!resp.ok) return;
+      const job = await resp.json();
+      renderProgressLog(job.progress);
+      if (job.progress.length > state.terminalProgressCount) {
+        job.progress.slice(state.terminalProgressCount).forEach((line) => logTerminal(line, "info"));
+        state.terminalProgressCount = job.progress.length;
+      }
+      if (job.status === "done") {
+        clearInterval(state.pollTimer);
+        await loadResults();
+      } else if (job.status === "error") {
+        clearInterval(state.pollTimer);
+        showProgressError(job.error || "Analysis failed for an unknown reason.");
+      }
+    } finally {
+      tickInFlight = false;
     }
   }, 800);
 }
@@ -691,7 +716,18 @@ function renderProgressLog(lines) {
   el.scrollTop = el.scrollHeight;
 }
 
+// Monotonic call counter used by loadResults() below purely as a
+// staleness guard (defense-in-depth alongside the pollJob() re-entrancy
+// fix above) - protects against ANY future caller invoking loadResults()
+// concurrently (e.g. two rapid "Recent analyses" clicks) from having an
+// older, still-in-flight call's later renders clobber a newer call's
+// already-rendered state. Each call captures its own token and checks it
+// hasn't been superseded before performing any DOM writes; a superseded
+// (stale) call abandons the rest of its own rendering instead of racing.
+let loadResultsCallToken = 0;
+
 async function loadResults(jobIdOverride) {
+  const myToken = ++loadResultsCallToken;
   const jobId = jobIdOverride || state.jobId;
   state.jobId = jobId;
   const [jobResp, digestResp, findingsResp, timelineResp, factsResp] = await Promise.all([
@@ -706,6 +742,7 @@ async function loadResults(jobIdOverride) {
   const findings = await findingsResp.json();
   const timeline = await timelineResp.json();
   const facts = await factsResp.json();
+  if (myToken !== loadResultsCallToken) return; // superseded by a newer loadResults() call while these fetches were in flight
 
   state.jobResult = { job, digest, findings, timeline, facts };
 
@@ -746,6 +783,7 @@ async function loadResults(jobIdOverride) {
   $("chatThread").innerHTML = "";
   renderRedactionCallout(null);
   const existingReport = await fetch(`/api/jobs/${jobId}/ai_report`).then((r) => r.text()).catch(() => "");
+  if (myToken !== loadResultsCallToken) return; // superseded while fetching the existing report - a newer call already owns the AI tab now
   if (existingReport) {
     $("aiRender").innerHTML = markdownToHtml(existingReport);
     $("btnDownloadReport").classList.remove("hidden");
@@ -753,6 +791,7 @@ async function loadResults(jobIdOverride) {
     $("chatSection").classList.remove("hidden");
     await restoreChatHistory(jobId);
     const existingRedaction = await fetch(`/api/jobs/${jobId}/redaction`).then((r) => r.json()).catch(() => null);
+    if (myToken !== loadResultsCallToken) return; // superseded while fetching redaction info
     renderRedactionCallout(existingRedaction);
   } else {
     $("btnSynthesize").textContent = "Generate log analysis";

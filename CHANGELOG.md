@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.14.1] - 2026-07-19
+
+### Fixed
+- **A real race condition in the Results page's job-completion polling** that could make the "🔒 Redacted details" panel appear correctly when AI generation starts, then silently vanish and never come back. Root cause: `setInterval` schedules its next tick 800ms after the *previous tick started*, not after its async callback *finished* - under heavy load (a large bundle's parallel scan competing for CPU/memory can make a single status-check request take longer than 800ms, exactly the shape of a slow, memory-constrained run), overlapping ticks could pile up and both observe the job as newly "done," each independently calling the results-loading function. That function's own reset step (clearing the redaction panel before checking whether a report already exists) from a second, redundant call could then fire *after* the first call's - or the live AI-generation stream's - correct render, wiping it with nothing left to show it again afterward.
+  - Fixed with a re-entrancy guard on the polling tick (an already-in-flight tick is skipped rather than allowed to overlap) plus a defense-in-depth staleness token on the results-loading function itself, so any future concurrent call to it (e.g. two rapid "Recent analyses" clicks) can no longer have an older call's late renders clobber a newer call's already-rendered state.
+  - Verified with a deterministic Node.js simulation forcing the exact overlap condition (a status-check request slower than the poll interval): the old logic reliably produced two concurrent calls for a single job-completion event; the fix reliably produces exactly one.
+
 ## [4.14.0] - 2026-07-19
 
 ### Added
