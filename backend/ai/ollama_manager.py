@@ -332,11 +332,109 @@ def _run_streaming(cmd, cwd=None, shell=False, input_text=None):
         yield False, f"Command exited with code {code}: {' '.join(cmd) if isinstance(cmd, list) else cmd}"
 
 
+def _run_capture(cmd, shell=False, timeout=20):
+    """Runs `cmd` to completion (not streamed - for quick, non-interactive
+    checks like 'apt-get update'), returning (returncode, combined output).
+    Never raises; a timeout or launch failure is reported as a nonzero
+    "synthetic" return code with a descriptive message instead."""
+    try:
+        proc = subprocess.run(
+            cmd, shell=shell, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        return proc.returncode, proc.stdout
+    except subprocess.TimeoutExpired:
+        return -1, f"timed out after {timeout}s"
+    except (FileNotFoundError, OSError) as e:
+        return -1, str(e)
+
+
+# Ollama's own official Linux installer (verified directly against its
+# real source - ollama/ollama on GitHub, scripts/install.sh - rather than
+# guessed) requires curl/awk/grep/sed/tee/xargs (base tools, virtually
+# always already present) AND, for every current release, `zstd` to
+# extract the modern .tar.zst release asset it downloads - a tool that is
+# routinely MISSING on minimal/container Linux base images and freshly
+# provisioned VMs, and one Ollama's own installer only reports as an
+# error rather than installing itself. This is the exact, real gap this
+# closes: proactively detect and auto-install whatever's missing, via
+# whichever package manager is actually on the system, BEFORE handing off
+# to Ollama's installer - so the common case (just missing zstd) resolves
+# itself with zero manual steps instead of a dead-end error message.
+_OLLAMA_LINUX_INSTALLER_DEPS = ["curl", "awk", "grep", "sed", "tee", "xargs", "zstd"]
+
+# (package_manager_binary, update_cmd_or_None, install_cmd_template) -
+# checked in this order (most to least common on a general-purpose
+# server distro first); update_cmd runs once, best-effort, before the
+# install (only apt-get strictly needs a fresh index on a freshly
+# provisioned image - the others resolve from an already-current local
+# cache/database without one).
+_LINUX_PKG_MANAGERS = [
+    ("apt-get", ["apt-get", "update", "-qq"], ["apt-get", "install", "-y"]),
+    ("dnf", None, ["dnf", "install", "-y"]),
+    ("yum", None, ["yum", "install", "-y"]),
+    ("zypper", None, ["zypper", "--non-interactive", "install"]),
+    ("pacman", None, ["pacman", "-S", "--noconfirm"]),
+    ("apk", ["apk", "update"], ["apk", "add"]),
+]
+
+
+def _ensure_ollama_linux_deps():
+    """Generator yielding (ok, line) progress lines while checking for and
+    auto-installing any of Ollama's own installer's system-level
+    dependencies that are missing (see _OLLAMA_LINUX_INSTALLER_DEPS above)
+    - called right before running Ollama's install.sh on Linux. Yields
+    True (no failure) even when nothing needed installing, or when
+    installation genuinely can't proceed (e.g. no supported package
+    manager, no sudo) - the caller treats this as best-effort and always
+    still attempts Ollama's own installer afterward, which will surface
+    its own clear error if a dependency is still genuinely missing."""
+    missing = [tool for tool in _OLLAMA_LINUX_INSTALLER_DEPS if not shutil.which(tool)]
+    if not missing:
+        yield True, "All of Ollama installer's system dependencies (curl/awk/grep/sed/tee/xargs/zstd) are already present."
+        return
+    yield True, f"Ollama's installer needs the following tool(s) not currently on PATH: {', '.join(missing)}. Attempting to install automatically…"
+
+    sudo_prefix = []
+    if getattr(os, "geteuid", lambda: 0)() != 0:
+        if shutil.which("sudo"):
+            sudo_prefix = ["sudo"]
+        else:
+            yield True, "Not running as root and 'sudo' isn't available - can't auto-install these. Continuing anyway; Ollama's own installer will report clearly if something is still missing."
+            return
+
+    for name, update_cmd, install_cmd_tpl in _LINUX_PKG_MANAGERS:
+        if not shutil.which(name):
+            continue
+        if update_cmd is not None:
+            yield True, f"Refreshing {name}'s package index…"
+            _run_capture(sudo_prefix + update_cmd, timeout=60)  # best-effort - a stale/offline index still lets install proceed for already-cached packages
+        full_cmd = sudo_prefix + install_cmd_tpl + missing
+        yield True, f"Detected {name} - running: {' '.join(full_cmd)}"
+        ok_all = True
+        for ok, line in _run_streaming(full_cmd):
+            yield ok, line
+            if not ok:
+                ok_all = False
+        still_missing = [tool for tool in missing if not shutil.which(tool)]
+        if ok_all and not still_missing:
+            yield True, "Dependencies installed successfully."
+        elif still_missing:
+            yield True, f"{', '.join(still_missing)} still not found on PATH after the install attempt - continuing anyway; Ollama's own installer will report clearly if this is still a problem."
+        return
+
+    yield True, "No supported package manager found (checked apt-get/dnf/yum/zypper/pacman/apk) - continuing anyway; install " + ", ".join(missing) + " manually if Ollama's own installer below reports it's still missing."
+
+
 def install_ollama_stream():
     """Generator yielding (ok: bool, line: str) progress lines while
     installing Ollama for the detected OS via its OWN official install
     path - this module never bundles or hosts the Ollama binary itself:
-    - Linux: the official install script (curl -fsSL https://ollama.com/install.sh | sh)
+    - Linux: _ensure_ollama_linux_deps() first auto-resolves the
+      installer's OWN system-level dependencies (curl/awk/grep/sed/tee/
+      xargs/zstd - most commonly just zstd, missing on many minimal/
+      container images), then the official install script (curl -fsSL
+      https://ollama.com/install.sh | sh)
     - macOS: Homebrew (`brew install ollama`) if available, else a
       manual-download pointer (a .dmg/GUI app install can't be safely
       driven headlessly from here)
@@ -356,6 +454,15 @@ def install_ollama_stream():
         if not (shutil.which("curl") and shutil.which("sh")):
             yield False, "Neither 'curl' nor 'sh' is available to run Ollama's official installer. Install curl (e.g. `sudo dnf install curl` / `sudo apt install curl`) and try again, or install Ollama manually from https://ollama.com/download/linux."
             return
+        # v4.14.2: proactively resolve Ollama's installer's OWN system
+        # dependencies (curl/awk/grep/sed/tee/xargs/zstd - verified
+        # against its real source, see _ensure_ollama_linux_deps()'s
+        # docstring) before running it - closes a real, reported gap
+        # where a missing `zstd` (routinely absent on minimal/container
+        # Linux images) made the installer fail with a manual-install
+        # instruction instead of this project resolving it automatically.
+        for ok, line in _ensure_ollama_linux_deps():
+            yield ok, line
         yield True, "Running Ollama's official installer (curl -fsSL https://ollama.com/install.sh | sh) - this needs internet access and may take a few minutes…"
         ok_all = True
         for ok, line in _run_streaming("curl -fsSL https://ollama.com/install.sh | sh", shell=True):

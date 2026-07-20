@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.14.3] - 2026-07-20
+
+### Fixed
+- **Ollama installation would fail on Linux with `ERROR: This version requires zstd for extraction...` and stop there**, requiring the user to manually run `sudo apt-get install zstd` (or the dnf/pacman equivalent) themselves and try again. Fetched Ollama's own real install script source directly from GitHub (`ollama/ollama`, `scripts/install.sh`) to confirm its exact Linux dependency list rather than guessing: `curl`/`awk`/`grep`/`sed`/`tee`/`xargs` (base tools, virtually always already present) plus, for every current release, `zstd` specifically to extract the modern `.tar.zst` release asset - a tool routinely missing on minimal/container Linux images and freshly provisioned VMs, which Ollama's own installer only ever reports as an error rather than resolving itself.
+  - Both places this project shells out to Ollama's installer - `run.sh` (the CLI launcher's interactive "Install Ollama now?" prompt) and the browser UI's Ollama "Start"/install button (`backend/ai/ollama_manager.py`) - now proactively detect any of these missing tools and auto-install them via whichever package manager is actually on the system (apt-get/dnf/yum/zypper/pacman/apk, tried in that order, with `sudo` only when not already running as root) **before** handing off to Ollama's own installer. The common case (just missing `zstd`) now resolves itself with zero manual steps.
+  - Deliberately best-effort and non-blocking throughout: if nothing can be auto-installed (no supported package manager found, no `sudo` available when needed, or the install command itself fails), this logs exactly why and still proceeds to run Ollama's own installer anyway - which will surface its own clear, specific error if a dependency turns out to still genuinely be missing, rather than this project silently swallowing the problem or blocking the rest of the install flow.
+  - Verified with 24 new regression checks against the Python implementation (`ollama_manager.py`, entirely mocked - no real system package manager is ever invoked by the test suite itself) covering the fast path (nothing missing), package-manager priority order, the no-sudo/no-package-manager/install-still-failed graceful-degradation paths, and end-to-end integration with `install_ollama_stream()`'s Linux branch - plus a real (not mocked) functional smoke test of the equivalent bash logic in `run.sh`, using a throwaway fake `apt-get`+`sudo` on `PATH` to confirm the full detect → install → re-verify → report cycle actually works when executed for real, not just in Python-mocked isolation.
+
 ## [4.14.2] - 2026-07-19
 
 ### Fixed

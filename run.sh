@@ -84,6 +84,7 @@ _install_ollama() {
   case "$(uname -s)" in
     Linux)
       if command -v curl >/dev/null 2>&1; then
+        _ensure_ollama_linux_deps
         echo "Running Ollama's official installer (curl -fsSL https://ollama.com/install.sh | sh)..."
         curl -fsSL https://ollama.com/install.sh | sh
       else
@@ -110,6 +111,83 @@ _install_ollama() {
       return 1
       ;;
   esac
+}
+
+# Ollama's own official Linux installer (verified directly against its
+# real source - ollama/ollama on GitHub, scripts/install.sh - rather than
+# guessed) requires curl/awk/grep/sed/tee/xargs (base tools, virtually
+# always already present) AND, for every current release, `zstd` to
+# extract the modern .tar.zst release asset it downloads - a tool that
+# is routinely MISSING on minimal/container Linux base images and
+# freshly provisioned VMs, and one Ollama's own installer only reports
+# as an error rather than installing itself (the exact real-world gap
+# this closes: "ERROR: This version requires zstd for extraction..."
+# with no automatic recovery). Proactively detects and auto-installs
+# whatever's missing via whichever package manager is actually on the
+# system, BEFORE handing off to Ollama's installer - best-effort: if
+# nothing can be auto-installed (no supported package manager, no sudo
+# when needed), this just logs why and continues anyway, so Ollama's
+# own installer still gets a chance to run and report its own clear
+# error if a dependency turns out to still be missing.
+_ensure_ollama_linux_deps() {
+  local missing=()
+  for tool in curl awk grep sed tee xargs zstd; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+  echo "Ollama's installer needs the following tool(s), not currently on PATH: ${missing[*]}. Attempting to install automatically..."
+
+  local sudo_cmd=()
+  if [[ "$(id -u)" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo_cmd=(sudo)
+    else
+      echo "Not running as root and 'sudo' isn't available - can't auto-install ${missing[*]}." >&2
+      echo "Continuing anyway; Ollama's own installer below will report clearly if this is still a problem." >&2
+      return 0
+    fi
+  fi
+
+  local pkg_mgr="" install_cmd=()
+  if command -v apt-get >/dev/null 2>&1; then
+    pkg_mgr="apt-get"
+    "${sudo_cmd[@]}" apt-get update -qq || true
+    install_cmd=("${sudo_cmd[@]}" apt-get install -y "${missing[@]}")
+  elif command -v dnf >/dev/null 2>&1; then
+    pkg_mgr="dnf"; install_cmd=("${sudo_cmd[@]}" dnf install -y "${missing[@]}")
+  elif command -v yum >/dev/null 2>&1; then
+    pkg_mgr="yum"; install_cmd=("${sudo_cmd[@]}" yum install -y "${missing[@]}")
+  elif command -v zypper >/dev/null 2>&1; then
+    pkg_mgr="zypper"; install_cmd=("${sudo_cmd[@]}" zypper --non-interactive install "${missing[@]}")
+  elif command -v pacman >/dev/null 2>&1; then
+    pkg_mgr="pacman"; install_cmd=("${sudo_cmd[@]}" pacman -S --noconfirm "${missing[@]}")
+  elif command -v apk >/dev/null 2>&1; then
+    pkg_mgr="apk"
+    "${sudo_cmd[@]}" apk update || true
+    install_cmd=("${sudo_cmd[@]}" apk add "${missing[@]}")
+  else
+    echo "No supported package manager found (checked apt-get/dnf/yum/zypper/pacman/apk)." >&2
+    echo "Continuing anyway; install ${missing[*]} manually if Ollama's installer below reports it's still missing." >&2
+    return 0
+  fi
+
+  echo "Detected $pkg_mgr - running: ${install_cmd[*]}"
+  if "${install_cmd[@]}"; then
+    local still_missing=()
+    for tool in "${missing[@]}"; do
+      command -v "$tool" >/dev/null 2>&1 || still_missing+=("$tool")
+    done
+    if [[ ${#still_missing[@]} -gt 0 ]]; then
+      echo "${still_missing[*]} still not found on PATH after the install attempt - continuing anyway." >&2
+    else
+      echo "Dependencies installed successfully."
+    fi
+  else
+    echo "Automatic install of ${missing[*]} via $pkg_mgr failed - continuing anyway; Ollama's own installer below will report clearly if this is still a problem." >&2
+  fi
+  return 0
 }
 
 # Ollama is this project's default, fully-offline AI provider - most
